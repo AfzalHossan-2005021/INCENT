@@ -47,6 +47,8 @@ def generalized_procrustes_analysis(
     topk : int or None
         Number of target candidates kept per source row.
         If None, chosen automatically.
+        The per-row candidate count is further clipped by the row's effective
+        support so sharper transport rows keep fewer candidates.
     eps : float
         Small numerical constant.
 
@@ -182,7 +184,10 @@ def generalized_procrustes_analysis(
     for i in active_rows:
         cond = pi[i] / max(row_mass[i], eps)
 
-        cand = np.argsort(-cond)[:topk]
+        row_support = 1.0 / max(float(np.sum(cond ** 2)), eps)
+        row_topk = max(1, min(topk, int(np.ceil(row_support))))
+
+        cand = np.argsort(-cond)[:row_topk]
         cand = cand[cond[cand] > eps]
 
         if cand.size == 0:
