@@ -49,6 +49,8 @@ def generalized_procrustes_analysis(
         If None, chosen automatically.
         The per-row candidate count is further clipped by the row's effective
         support so sharper transport rows keep fewer candidates.
+        The retained pair is then weighted by its coupling confidence in the
+        final rigid fit.
     eps : float
         Small numerical constant.
 
@@ -180,6 +182,7 @@ def generalized_procrustes_analysis(
     all_real_cols = set()
     cand_cols_per_row = []
     real_costs_per_row = []
+    row_cond_per_row = []
 
     for i in active_rows:
         cond = pi[i] / max(row_mass[i], eps)
@@ -204,6 +207,7 @@ def generalized_procrustes_analysis(
 
         cand_cols_per_row.append(cand)
         real_costs_per_row.append(cost)
+        row_cond_per_row.append(cond)
         all_real_cols.update(cand.tolist())
 
     all_real_cols = np.array(sorted(all_real_cols), dtype=int)
@@ -241,7 +245,8 @@ def generalized_procrustes_analysis(
         i = int(active_rows[r])
         j = int(all_real_cols[c])
         pairs.append((i, j))
-        weights.append(row_mass[i])
+        # Confidence-weight the retained match so the strongest pairs dominate.
+        weights.append(row_mass[i] * float(row_cond_per_row[r][j]))
 
     # ------------------------------------------------------------------
     # 3) Final rigid fit on hard support only
