@@ -81,23 +81,21 @@ def hierarchical_pairwise_align(
         label_key=label_key,
         all_types=all_types,
     )
-    p_A, centroidsA, mu_exprA, mu_struct_localA, mu_struct_neighborhoodA = (
+    p_A, centroidsA, mu_exprA, mu_structA = (
         cache_A.masses,
         cache_A.centroids,
         cache_A.mu_expr,
-        cache_A.mu_struct_local,
-        cache_A.mu_struct_neighborhood,
+        cache_A.mu_struct,
     )
-    p_B, centroidsB, mu_exprB, mu_struct_localB, mu_struct_neighborhoodB = (
+    p_B, centroidsB, mu_exprB, mu_structB= (
         cache_B.masses,
         cache_B.centroids,
         cache_B.mu_expr,
-        cache_B.mu_struct_local,
-        cache_B.mu_struct_neighborhood,
+        cache_B.mu_struct
     )
     
     print("--- [HOT] Step 3: Compute Cluster Costs and Structures ---")
-    M_cluster = compute_cluster_feature_costs(mu_exprA, mu_struct_localA, mu_struct_neighborhoodA, mu_exprB, mu_struct_localB, mu_struct_neighborhoodB, delta=delta)
+    M_cluster = compute_cluster_feature_costs(mu_exprA, mu_structA, mu_exprB, mu_structB, delta=delta)
     C_A = compute_cluster_structural_matrix(centroidsA, 1.0 - w_graph, w_graph)
     C_B = compute_cluster_structural_matrix(centroidsB, 1.0 - w_graph, w_graph)
     

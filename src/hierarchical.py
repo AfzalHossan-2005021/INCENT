@@ -78,7 +78,7 @@ class SliceClusterCache:
     centroids: np.ndarray
     valid: np.ndarray
     mu_expr: np.ndarray
-    mu_struct_local: np.ndarray
+    mu_struct: np.ndarray
     mu_struct_neighborhood: np.ndarray
     cluster_hist: np.ndarray
     all_types: np.ndarray
@@ -181,30 +181,32 @@ def build_slice_cluster_cache(
     adjacency, _ = build_cluster_contact_graph(coords, labels, valid)
     mu_struct_neighborhood = compute_cluster_context_features(mu_struct_local, adjacency)
 
+    global_shape = compute_cluster_global_shape_features(coords, centroids)
+    mu_struct = np.concatenate([mu_struct_local, global_shape], axis=1)
+
+
     return SliceClusterCache(
         labels=np.asarray(labels),
         masses=masses,
         centroids=centroids,
         valid=valid,
         mu_expr=mu_expr,
-        mu_struct_local=mu_struct_local,
+        mu_struct=mu_struct,
         mu_struct_neighborhood=mu_struct_neighborhood,
         cluster_hist=cluster_hist,
         all_types=all_types,
     )
 
 
-def compute_cluster_feature_costs(mu_expr_A, mu_struct_local_A, mu_struct_neighborhood_A, mu_expr_B, mu_struct_local_B, mu_struct_neighborhood_B, delta=0.5):
+def compute_cluster_feature_costs(mu_expr_A, mu_struct_A, mu_expr_B, mu_struct_B, delta=0.5):
     """
     Compute inter-cluster cost matrix M_cluster between two slices.
     
     Args:
         mu_expr_A: np.ndarray (C_A, D) mean expression for slice A
-        mu_struct_local_A: np.ndarray (C_A, K) local structural features for slice A
-        mu_struct_neighborhood_A: np.ndarray (C_A, L) neighborhood structural features for slice A
+        mu_struct_A: np.ndarray (C_A, M) structural features for slice A
         mu_expr_B: np.ndarray (C_B, D) mean expression for slice B
-        mu_struct_local_B: np.ndarray (C_B, K) local structural features for slice B
-        mu_struct_neighborhood_B: np.ndarray (C_B, L) neighborhood structural features for slice B
+        mu_struct_B: np.ndarray (C_B, M) structural features for slice B
         delta: weight for structural distance (expression distance is 1 - delta)
     Returns:
         M_cluster: np.ndarray (C_A, C_B) cost matrix
@@ -217,16 +219,14 @@ def compute_cluster_feature_costs(mu_expr_A, mu_struct_local_A, mu_struct_neighb
     M_expr = cosine_distances(mu_expr_A, mu_expr_B)
             
     # Jensen-Shannon for nonnegative invariant structural descriptors
-    M_struct_local = np.zeros((mu_struct_local_A.shape[0], mu_struct_local_B.shape[0]))
-    M_struct_neighborhood = np.zeros((mu_struct_neighborhood_A.shape[0], mu_struct_neighborhood_B.shape[0]))
+    M_struct = np.zeros((mu_struct_A.shape[0], mu_struct_B.shape[0]))
     
-    for i in range(mu_struct_local_A.shape[0]):
-        for j in range(mu_struct_local_B.shape[0]):
+    for i in range(mu_struct_A.shape[0]):
+        for j in range(mu_struct_B.shape[0]):
             # The descriptors are normalized nonnegative summaries over cell-type-specific structure.
-            M_struct_local[i, j] = safe_jensenshannon(mu_struct_local_A[i], mu_struct_local_B[j])
-            M_struct_neighborhood[i, j] = safe_jensenshannon(mu_struct_neighborhood_A[i], mu_struct_neighborhood_B[j])
+            M_struct[i, j] = safe_jensenshannon(mu_struct_A[i], mu_struct_B[j])
     
-    M_cluster = (1.0 - delta) * M_expr + delta * M_struct_local
+    M_cluster = (1.0 - delta) * M_expr + delta * M_struct
 
     return M_cluster
 
