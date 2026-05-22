@@ -31,6 +31,7 @@ def hierarchical_pairwise_align(
     alpha: float,
     beta: float,
     gamma: float,
+    delta: float = 0.5,
     reg_compact: float = 0.001,
     numItermax: int = 100000,
     use_gpu: bool = True,
@@ -96,7 +97,7 @@ def hierarchical_pairwise_align(
     )
     
     print("--- [HOT] Step 3: Compute Cluster Costs and Structures ---")
-    M_cluster = compute_cluster_feature_costs(mu_exprA, mu_struct_localA, mu_struct_neighborhoodA, mu_exprB, mu_struct_localB, mu_struct_neighborhoodB, beta=beta, gamma=gamma)
+    M_cluster = compute_cluster_feature_costs(mu_exprA, mu_struct_localA, mu_struct_neighborhoodA, mu_exprB, mu_struct_localB, mu_struct_neighborhoodB, delta=delta)
     C_A = compute_cluster_structural_matrix(centroidsA, 1.0 - w_graph, w_graph)
     C_B = compute_cluster_structural_matrix(centroidsB, 1.0 - w_graph, w_graph)
     

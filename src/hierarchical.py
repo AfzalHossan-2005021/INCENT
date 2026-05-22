@@ -194,7 +194,7 @@ def build_slice_cluster_cache(
     )
 
 
-def compute_cluster_feature_costs(mu_expr_A, mu_struct_local_A, mu_struct_neighborhood_A, mu_expr_B, mu_struct_local_B, mu_struct_neighborhood_B, beta=0.75, gamma=0.5):
+def compute_cluster_feature_costs(mu_expr_A, mu_struct_local_A, mu_struct_neighborhood_A, mu_expr_B, mu_struct_local_B, mu_struct_neighborhood_B, delta=0.5):
     """
     Compute inter-cluster cost matrix M_cluster between two slices.
     
@@ -205,14 +205,13 @@ def compute_cluster_feature_costs(mu_expr_A, mu_struct_local_A, mu_struct_neighb
         mu_expr_B: np.ndarray (C_B, D) mean expression for slice B
         mu_struct_local_B: np.ndarray (C_B, K) local structural features for slice B
         mu_struct_neighborhood_B: np.ndarray (C_B, L) neighborhood structural features for slice B
-        beta: weight for structural distance (expression distance is 1 - beta)
-        gamma: weight for neighborhood structural distance (expression distance is 1 - gamma)
+        delta: weight for structural distance (expression distance is 1 - delta)
     Returns:
         M_cluster: np.ndarray (C_A, C_B) cost matrix
     """
 
-    if(beta > 1.0 or beta < 0.0):
-        raise ValueError("Beta must be between 0 and 1.")
+    if(delta > 1.0 or delta < 0.0):
+        raise ValueError("Delta must be between 0 and 1.")
     
     # Cosine distance for continuous expression
     M_expr = cosine_distances(mu_expr_A, mu_expr_B)
@@ -227,7 +226,7 @@ def compute_cluster_feature_costs(mu_expr_A, mu_struct_local_A, mu_struct_neighb
             M_struct_local[i, j] = safe_jensenshannon(mu_struct_local_A[i], mu_struct_local_B[j])
             M_struct_neighborhood[i, j] = safe_jensenshannon(mu_struct_neighborhood_A[i], mu_struct_neighborhood_B[j])
     
-    M_cluster = (1.0 - beta - gamma) * M_expr + beta * M_struct_local + gamma * M_struct_neighborhood
+    M_cluster = (1.0 - delta) * M_expr + delta * M_struct_local
 
     return M_cluster
 
