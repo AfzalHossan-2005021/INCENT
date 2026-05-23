@@ -182,7 +182,7 @@ def build_slice_cluster_cache(
     mu_struct_neighborhood = compute_cluster_context_features(mu_struct_local, adjacency)
 
     global_shape = compute_cluster_global_shape_features(coords, centroids)
-    mu_struct = np.concatenate([mu_struct_local, global_shape], axis=1)
+    mu_struct = mu_struct_local
 
 
     return SliceClusterCache(
