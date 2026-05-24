@@ -553,7 +553,7 @@ def equal_area_ring_edges(max_radius, n_rings):
     return max_radius * np.sqrt(np.linspace(0.0, 1.0, int(n_rings) + 1))
 
 
-def collect_candidate_match_pairs(Pi_cluster, valid_A, valid_B, context_feat_A, context_feat_B):
+def collect_candidate_match_pairs(Pi_cluster, valid_A, valid_B):
     """
     Assemble transport-supported cluster pairs and their overall evidence.
 
@@ -568,9 +568,7 @@ def collect_candidate_match_pairs(Pi_cluster, valid_A, valid_B, context_feat_A, 
     The primary transport-derived score is the per-pair mutual-information
     contribution, which already combines pair specificity with matched mass.
     Log-enrichment is retained only as a secondary tie-break so that transport
-    evidence is not double-counted additively. The remaining evidence channel
-    comes from local niche context, keeping macro-section extraction grounded in
-    transport support plus local biology/topology only.
+    evidence is not double-counted additively.
     """
     log_enrichment = compute_pairwise_log_enrichment(Pi_cluster)
     mi_contrib = compute_pairwise_mutual_information_contribution(Pi_cluster)
@@ -592,7 +590,6 @@ def collect_candidate_match_pairs(Pi_cluster, valid_A, valid_B, context_feat_A, 
     matches = []
     mi_signal = []
     enrichment_signal = []
-    context_signal = []
     for idx in sorted_idx:
         u, v = np.unravel_index(idx, Pi_cluster.shape)
         if not (valid_A[u] and valid_B[v]):
@@ -602,30 +599,21 @@ def collect_candidate_match_pairs(Pi_cluster, valid_A, valid_B, context_feat_A, 
         mi_signal.append(float(mi_contrib[u, v]))
         enrichment_signal.append(float(log_enrichment[u, v]))
 
-        feat_A = context_feat_A[u]
-        feat_B = context_feat_B[v]
-        if feat_A.sum() <= 0 and feat_B.sum() <= 0:
-            context_signal.append(0.0)
-        else:
-            context_signal.append(float(-safe_jensenshannon(feat_A, feat_B)))
-
     mi_signal = np.asarray(mi_signal, dtype=np.float64)
     enrichment_signal = np.asarray(enrichment_signal, dtype=np.float64)
-    context_signal = np.asarray(context_signal, dtype=np.float64)
 
     mi_evidence = empirical_logit_evidence(mi_signal, larger_is_better=True)
-    context_evidence = empirical_logit_evidence(context_signal, larger_is_better=True)
 
     global_pair_evidence = {
-        pair: float(me + ce)
-        for pair, me, ce in zip(matches, mi_evidence, context_evidence)
+        pair: float(me)
+        for pair, me in zip(matches, mi_evidence)
     }
     global_pair_scores = np.array([global_pair_evidence[pair] for pair in matches], dtype=np.float64)
 
     diagnostics = {
         "num_positive_mass_pairs": int(np.sum(Pi_cluster > 0)),
         "num_enriched_pairs": int(np.sum(log_enrichment > 0)),
-        "transport_score_mode": "mi_plus_context_primary_enrichment_tiebreak",
+        "transport_score_mode": "mi_primary_enrichment_tiebreak",
     }
     return matches, enrichment_signal, global_pair_scores, global_pair_evidence, mi_contrib, log_enrichment, diagnostics
 
@@ -1397,9 +1385,7 @@ def extract_continuous_macro_section(
     matches, match_tiebreak_scores, global_pair_scores, global_pair_evidence, mi_contrib, log_enrichment, diagnostics = collect_candidate_match_pairs(
         Pi_cluster,
         valid_A,
-        valid_B,
-        context_feat_A,
-        context_feat_B,
+        valid_B
     )
     num_matches = len(matches)
     if num_matches == 0:
