@@ -181,17 +181,13 @@ def build_slice_cluster_cache(
     adjacency, _ = build_cluster_contact_graph(coords, labels, valid)
     mu_struct_neighborhood = compute_cluster_context_features(mu_struct_local, adjacency)
 
-    global_shape = compute_cluster_global_shape_features(coords, centroids)
-    mu_struct = mu_struct_local
-
-
     return SliceClusterCache(
         labels=np.asarray(labels),
         masses=masses,
         centroids=centroids,
         valid=valid,
         mu_expr=mu_expr,
-        mu_struct=mu_struct,
+        mu_struct=mu_struct_local,
         mu_struct_neighborhood=mu_struct_neighborhood,
         cluster_hist=cluster_hist,
         all_types=all_types,
@@ -456,36 +452,6 @@ def compute_graph_geodesics(edge_lengths):
     return distances
 
 
-def compute_cluster_cell_type_histograms(adata, labels, n_clusters, label_key="cell_type_annot", all_types=None):
-    """
-    Compute within-cluster cell-type compositions for biologically grounded matching.
-
-    These histograms act as coarse "microenvironment identities" that are much
-    more stable than raw centroid geometry and help separate nearby symmetric
-    compartments whose local molecular composition differs subtly.
-    """
-    cell_types = adata.obs[label_key].astype(str).to_numpy()
-    if all_types is None:
-        all_types = np.array(sorted(np.unique(cell_types)), dtype=str)
-    else:
-        all_types = np.array(all_types, dtype=str)
-
-    type_to_idx = {ct: i for i, ct in enumerate(all_types)}
-    hist = np.zeros((n_clusters, len(all_types)), dtype=np.float64)
-
-    for cluster_id in range(n_clusters):
-        mask = labels == cluster_id
-        if not np.any(mask):
-            continue
-        mapped = [type_to_idx[x] for x in cell_types[mask] if x in type_to_idx]
-        if not mapped:
-            continue
-        counts = np.bincount(mapped, minlength=len(all_types)).astype(np.float64)
-        hist[cluster_id] = counts / max(counts.sum(), 1.0)
-
-    return hist, all_types
-
-
 def compute_cluster_context_features(cluster_hist, adjacency):
     """
     Build cluster context descriptors from own composition and adjacent composition.
@@ -585,55 +551,6 @@ def equal_area_ring_edges(max_radius, n_rings):
     """
     max_radius = max(float(max_radius), 1e-12)
     return max_radius * np.sqrt(np.linspace(0.0, 1.0, int(n_rings) + 1))
-
-
-def compute_cluster_global_shape_features(coords, centroids, n_rings=6, harmonics=(0, 1, 2)):
-    """
-    Compute a cluster-centered, full-tissue morphology descriptor.
-
-    For each cluster centroid, the descriptor summarizes the distribution of all
-    tissue cells around that centroid using equal-area radial bins and
-    low-order angular harmonic magnitudes. This acts as a global morphology cue
-    that can distinguish practically symmetric regions whenever the overall
-    tissue support or crop boundaries break the symmetry.
-
-    The descriptor is rotation- and reflection-invariant because only harmonic
-    magnitudes are retained.
-    """
-    coords = np.asarray(coords, dtype=np.float64)
-    centroids = np.asarray(centroids, dtype=np.float64)
-    if coords.shape[0] == 0 or centroids.shape[0] == 0:
-        return np.zeros((centroids.shape[0], int(n_rings) * len(harmonics)), dtype=np.float64)
-
-    tissue_center = np.mean(coords, axis=0)
-    tissue_radius = np.percentile(np.linalg.norm(coords - tissue_center, axis=1), 99)
-    max_radius = max(2.0 * tissue_radius, 1e-12)
-    ring_edges = equal_area_ring_edges(max_radius, n_rings)
-
-    features = np.zeros((centroids.shape[0], int(n_rings) * len(harmonics)), dtype=np.float64)
-    for i, center in enumerate(centroids):
-        rel = coords - center
-        dist = np.linalg.norm(rel, axis=1)
-        ang = np.arctan2(rel[:, 1], rel[:, 0])
-        ring_idx = np.clip(np.digitize(dist, ring_edges[1:], right=True), 0, int(n_rings) - 1)
-
-        local = np.zeros((int(n_rings), len(harmonics)), dtype=np.float64)
-        for h_pos, m in enumerate(harmonics):
-            if m == 0:
-                mag = np.bincount(ring_idx, minlength=int(n_rings)).astype(np.float64)
-            else:
-                phase = float(m) * ang
-                real = np.bincount(ring_idx, weights=np.cos(phase), minlength=int(n_rings))
-                imag = np.bincount(ring_idx, weights=np.sin(phase), minlength=int(n_rings))
-                mag = np.hypot(real, imag)
-            local[:, h_pos] = mag
-
-        flat = local.reshape(-1)
-        if flat.sum() > 0:
-            flat /= flat.sum()
-        features[i] = flat
-
-    return features
 
 
 def collect_candidate_match_pairs(Pi_cluster, valid_A, valid_B, context_feat_A, context_feat_B):
