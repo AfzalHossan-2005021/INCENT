@@ -1,212 +1,696 @@
+"""
+Alignment quality metrics for INCENT.
+
+This module computes every alignment-quality metric required for a
+publication-grade benchmark of a partial/unbalanced ST transport plan:
+
+Per-pair quality metrics
+------------------------
+* Neighborhood JSD and gene-expression cosine objectives (mass-normalised
+  so unbalanced plans remain comparable to balanced ones).
+* Probabilistic cell-type matching.
+* Pairwise Alignment Accuracy (PAA) -- the canonical PASTE/PASTE2 metric.
+* Label-Transfer Adjusted Rand Index (LTARI).
+* Fraction Of Samples Closer Than the True Match (FOSCTTM).
+* Landmark Euclidean error (mean, median, RMSE) when ground-truth landmark
+  pairs are supplied.
+* Spatial Coherence Score (SCS) of transferred labels.
+
+Mass-conservation diagnostics
+-----------------------------
+* Total transported mass, kept-mass per side, birth/death mass,
+  normalised marginal entropies, and an effective-support overlap-fraction
+  estimator.
+
+Compactness / variance diagnostics
+----------------------------------
+* Forward/reverse spatial compactness and effective support (preserved from
+  the original module).
+
+All functions accept either a balanced (sum=1) or unbalanced (sum<=1) pi and
+behave gracefully when pi is sparse.
+
+The headline entry point is ``calculate_performance_metrics``, which now
+computes every metric the available data supports and prints them in a
+single, formatted table. The original return-dictionary keys are preserved,
+and ground-truth-dependent metrics are added when their inputs are passed.
+"""
+
+from __future__ import annotations
+
 import numpy as np
 import torch
 
+from typing import Optional, Sequence
+
+from scipy.spatial import cKDTree
+from sklearn.metrics import adjusted_rand_score
+from sklearn.metrics.pairwise import euclidean_distances
+
 from .utils import select_backend
-from .core import calculate_neighborhood_dissimilarity, calculate_gene_expression_cosine_distance, calculate_cell_type_mismatch
+from .core import (
+    calculate_neighborhood_dissimilarity,
+    calculate_gene_expression_cosine_distance,
+    calculate_cell_type_mismatch,
+)
 
 
-def calculate_neighborhood_similarity(js_dist_neighborhood, pi):
+# ============================================================================
+# Cost-based objectives (mass-normalised, unbalanced-safe)
+# ============================================================================
+
+def calculate_neighborhood_similarity(js_dist_neighborhood, pi, normalize_mass: bool = True):
     """
-    Calculate neighborhood similarity cost for a given alignment mapping.
-    
-    Uses element-wise multiplication: sum all weighted distances across the mapping.
-    Equivalent to INCENT.py's initial objective calculation for all dissimilarity types.
-    
-    Args:
-        js_dist_neighborhood: Jensen-Shannon distance matrix of neighborhood distributions.
-        pi: Alignment mapping matrix (either uniform G or optimal transport solution).
-    
-    Returns:
-        neighborhood_similarity: Weighted neighborhood dissimilarity cost.
+    Sum of element-wise JSD * pi, optionally normalised by total transported mass.
+
+    For unbalanced pi this raw sum is not comparable across methods because it
+    scales with total mass. Setting ``normalize_mass=True`` (recommended default
+    in the benchmark) divides by sum(pi) so the value is comparable.
     """
-    return np.sum(js_dist_neighborhood * pi)
+    total = float(np.sum(pi))
+    raw = float(np.sum(js_dist_neighborhood * pi))
+    if normalize_mass and total > 1e-12:
+        return raw / total
+    return raw
+
+
+def calculate_gene_expression_similarity(cosine_dist_gene_expr, pi, normalize_mass: bool = True):
+    """
+    Sum of element-wise cosine-distance * pi, optionally mass-normalised.
+    """
+    total = float(np.sum(pi))
+    raw = float(np.sum(cosine_dist_gene_expr * pi))
+    if normalize_mass and total > 1e-12:
+        return raw / total
+    return raw
 
 
 def cell_type_matching(cell_type_mismatch, pi_mat):
     """
-    Compute cell-type matching percentage from a pre-computed mismatch matrix.
-    
-    Args:
-        cell_type_mismatch: Binary mismatch matrix (1 = mismatch, 0 = match) from calculate_cell_type_mismatch().
-        pi_mat: Alignment mapping matrix (probabilistic transport plan).
-    
-    Returns:
-        Percentage of transported mass representing cell-type matches (0-100).
+    Fraction of transported mass that lands on the correct cell-type.
+
+    Returns a value in [0, 1]: 1.0 means every unit of transported mass
+    couples cells of the same type; 0.0 means every unit couples different
+    types. Computed as <(1 - mismatch), pi> / <1, pi>.
     """
-    M_match = 1 - cell_type_mismatch
-    expected_matches = np.sum(M_match * pi_mat)
-    total_mass = np.sum(pi_mat)
-    
+    M_match = 1.0 - cell_type_mismatch
+    expected_matches = float(np.sum(M_match * pi_mat))
+    total_mass = float(np.sum(pi_mat))
     if total_mass > 0:
-        return (expected_matches / total_mass)
+        return expected_matches / total_mass
     return 0.0
 
 
-def calculate_gene_expression_similarity(cosine_dist_gene_expr, pi):
+# ============================================================================
+# Pairwise Alignment Accuracy (PAA)
+# ============================================================================
+
+def pairwise_alignment_accuracy(
+    labels_A: Sequence,
+    labels_B: Sequence,
+    pi: np.ndarray,
+    weighted: bool = True,
+) -> float:
     """
-    Calculate gene expression similarity cost for a given alignment mapping.
-    
-    Uses element-wise multiplication: sum of weighted gene expression distances.
-    Matches INCENT.py's calculation for both initial and final objectives.
-    
-    Args:
-        cosine_dist_gene_expr: Cosine distance matrix of gene expression profiles.
-        pi: Alignment mapping matrix (either uniform G or optimal transport solution).
-    
-    Returns:
-        gene_expression_similarity: Weighted gene expression dissimilarity cost.
+    Canonical PAA metric (PASTE/PASTE2).
+
+    For each source cell, the predicted target label is the one receiving the
+    largest transported mass; the source is counted correct if its true label
+    equals the predicted target label. Sources with no transported mass are
+    skipped. Weighted mode (default) uses each source's row mass as its
+    contribution, matching PASTE2's canonical formulation under unbalanced
+    transport.
+
+    Returns
+    -------
+    accuracy in [0, 1].
     """
-    return np.sum(cosine_dist_gene_expr * pi)
+    labels_A = np.asarray(labels_A)
+    labels_B = np.asarray(labels_B)
+    pi = np.asarray(pi, dtype=np.float64)
+    if pi.shape != (labels_A.size, labels_B.size):
+        raise ValueError(
+            f"pi shape {pi.shape} does not match labels "
+            f"({labels_A.size}, {labels_B.size})"
+        )
+    row_mass = pi.sum(axis=1)
+    active = row_mass > 1e-12
+    if not active.any():
+        return 0.0
+    best_tgt = np.argmax(pi[active], axis=1)
+    pred_labels = labels_B[best_tgt]
+    true_labels = labels_A[active]
+    correct = (pred_labels == true_labels).astype(np.float64)
+    if weighted:
+        w = row_mass[active]
+        return float(np.sum(correct * w) / np.sum(w))
+    return float(np.mean(correct))
 
 
-def calculate_performance_metrics(final_pi, init_pi=None, js_dist_neighborhood=None, cosine_dist_gene_expr=None, 
-                               cell_type_mismatch=None, sliceA=None, sliceB=None, use_rep=None, radius=100.0, use_gpu=True):
+# ============================================================================
+# Label-Transfer Adjusted Rand Index (LTARI)
+# ============================================================================
+
+def label_transfer_ari(
+    labels_A: Sequence,
+    labels_B: Sequence,
+    pi: np.ndarray,
+) -> float:
     """
-    Calculate all similarity metrics for alignment quality assessment.
-    
-    **Note:** Neighborhood similarity uses element-wise multiplication (sum over all mapping entries).
-    This matches INCENT.py's initial objective calculation for all dissimilarity types (JSD/MSD/cosine).
-    For specialized metrics like INCENT.py's final JSD objective (argmax per row), compute separately.
-    
-    Args:
-        final_pi: Final optimal transport alignment mapping (required).
-        init_pi: Initial alignment mapping (optional). If None, uses uniform distribution.
-        js_dist_neighborhood: Jensen-Shannon distance matrix of neighborhood distributions (optional).
-                             If not provided and sliceA, sliceB, radius are given, will be calculated.
-        cosine_dist_gene_expr: Cosine distance matrix of gene expression profiles (optional).
-                              If not provided and sliceA, sliceB, use_rep are given, will be calculated.
-        sliceA: First slice for calculating missing distance matrices (optional).
-        sliceB: Second slice for calculating missing distance matrices (optional).
-        use_rep: Representation key for gene expression (optional, used with cosine_dist_gene_expr calculation).
-        radius: Radius for neighborhood calculation (optional, used with js_dist_neighborhood calculation).
-    
-    Returns:
-        Dictionary with keys: 'initial_obj_neighbor', 'initial_obj_gene', 
-                              'final_obj_neighbor', 'final_obj_gene',
-                              'initial_cell_type_match', 'final_cell_type_match'
-                              
-    Raises:
-        ValueError: If required parameters for distance calculation are missing.
+    Transfer target labels to source via pi, then compute ARI versus true
+    source labels. Sources with no transported mass are excluded.
     """
-    # Use uniform distribution if init_pi not provided
+    labels_A = np.asarray(labels_A)
+    labels_B = np.asarray(labels_B)
+    pi = np.asarray(pi, dtype=np.float64)
+    row_mass = pi.sum(axis=1)
+    active = row_mass > 1e-12
+    if not active.any():
+        return 0.0
+    pred = labels_B[np.argmax(pi[active], axis=1)]
+    return float(adjusted_rand_score(labels_A[active], pred))
+
+
+# ============================================================================
+# FOSCTTM
+# ============================================================================
+
+def foscttm(
+    coords_A_aligned: np.ndarray,
+    coords_B_aligned: np.ndarray,
+    true_matches: Optional[np.ndarray] = None,
+) -> float:
+    """
+    Fraction Of Samples Closer Than the True Match.
+
+    Given aligned coordinates (post-Procrustes) of two slices that share a
+    known one-to-one correspondence, return the average fraction of off-target
+    points closer to a query than its true partner. Lower is better; 0.5 is
+    random, 0 is perfect.
+
+    Parameters
+    ----------
+    coords_A_aligned, coords_B_aligned : (n, d) arrays in a shared frame.
+    true_matches : optional (n,) array mapping source index -> target index.
+        Defaults to identity (the two arrays are already paired by index).
+    """
+    A = np.asarray(coords_A_aligned, dtype=np.float64)
+    B = np.asarray(coords_B_aligned, dtype=np.float64)
+    n = A.shape[0]
+    if B.shape[0] != n:
+        raise ValueError("FOSCTTM requires equal-sized paired sets.")
+    if true_matches is None:
+        true_matches = np.arange(n)
+    D = euclidean_distances(A, B)
+    true_d = D[np.arange(n), true_matches]
+    frac_AB = np.mean(D < true_d[:, None], axis=1)
+    inv = np.argsort(true_matches)
+    Dt = D.T
+    true_d_BA = Dt[np.arange(n), inv]
+    frac_BA = np.mean(Dt < true_d_BA[:, None], axis=1)
+    return float(0.5 * (np.mean(frac_AB) + np.mean(frac_BA)))
+
+
+# ============================================================================
+# Landmark error
+# ============================================================================
+
+def landmark_error(
+    coords_A_aligned: np.ndarray,
+    coords_B_aligned: np.ndarray,
+    landmark_pairs: np.ndarray,
+    reduction: str = "mean",
+) -> float:
+    """
+    Mean / median / RMSE Euclidean distance between paired landmarks after
+    alignment.
+
+    Parameters
+    ----------
+    landmark_pairs : (K, 2) int array. Each row is (i_in_A, j_in_B).
+    reduction : 'mean' | 'median' | 'rmse'.
+    """
+    pairs = np.asarray(landmark_pairs)
+    if pairs.size == 0:
+        return float("nan")
+    A = np.asarray(coords_A_aligned)[pairs[:, 0]]
+    B = np.asarray(coords_B_aligned)[pairs[:, 1]]
+    d = np.linalg.norm(A - B, axis=1)
+    if reduction == "mean":
+        return float(np.mean(d))
+    if reduction == "median":
+        return float(np.median(d))
+    if reduction == "rmse":
+        return float(np.sqrt(np.mean(d ** 2)))
+    raise ValueError(reduction)
+
+
+# ============================================================================
+# Spatial Coherence Score
+# ============================================================================
+
+def spatial_coherence_score(
+    coords: np.ndarray,
+    labels: Sequence,
+    k: int = 6,
+) -> float:
+    """
+    Fraction of k-nearest neighbours sharing the same label.
+
+    A high SCS for transferred labels at the source positions indicates that
+    the alignment preserves spatial-domain structure.
+    """
+    coords = np.asarray(coords, dtype=np.float64)
+    labels = np.asarray(labels)
+    if coords.shape[0] < k + 1:
+        return float("nan")
+    tree = cKDTree(coords)
+    _, idx = tree.query(coords, k=k + 1)
+    neighbours = idx[:, 1:]
+    same = (labels[neighbours] == labels[:, None]).astype(np.float64)
+    return float(np.mean(same))
+
+
+# ============================================================================
+# Mass-conservation diagnostics
+# ============================================================================
+
+def mass_conservation_diagnostics(
+    pi: np.ndarray,
+    n_A: Optional[int] = None,
+    n_B: Optional[int] = None,
+    expected_mass: float = 1.0,
+) -> dict:
+    """
+    Diagnostics for unbalanced transport.
+
+    Returns the total transported mass, mass kept per side relative to its
+    expected share, birth / death mass (deficit on either side), and
+    normalised marginal entropies (1 = uniform marginal, 0 = degenerate).
+    """
+    pi = np.asarray(pi, dtype=np.float64)
+    if n_A is None:
+        n_A = pi.shape[0]
+    if n_B is None:
+        n_B = pi.shape[1]
+    total = float(pi.sum())
+    row_mass = pi.sum(axis=1)
+    col_mass = pi.sum(axis=0)
+    src_expected = expected_mass / max(n_A, 1)
+    tgt_expected = expected_mass / max(n_B, 1)
+    kept_src = float(np.minimum(row_mass, src_expected).sum())
+    kept_tgt = float(np.minimum(col_mass, tgt_expected).sum())
+    death_mass = float(max(expected_mass - row_mass.sum(), 0.0))
+    birth_mass = float(max(expected_mass - col_mass.sum(), 0.0))
+
+    def _norm_entropy(v):
+        v = np.asarray(v, dtype=np.float64)
+        s = v.sum()
+        if s <= 1e-12:
+            return 0.0
+        p = v / s
+        nz = p > 1e-12
+        h = -np.sum(p[nz] * np.log(p[nz]))
+        h_max = np.log(v.size) if v.size > 1 else 1.0
+        return float(h / h_max) if h_max > 0 else 0.0
+
+    return {
+        "total_mass": total,
+        "row_mass_sum": float(row_mass.sum()),
+        "col_mass_sum": float(col_mass.sum()),
+        "kept_src_fraction": kept_src,
+        "kept_tgt_fraction": kept_tgt,
+        "death_mass": death_mass,
+        "birth_mass": birth_mass,
+        "row_entropy_norm": _norm_entropy(row_mass),
+        "col_entropy_norm": _norm_entropy(col_mass),
+    }
+
+
+def estimated_overlap_fraction(pi: np.ndarray) -> float:
+    """
+    Estimate of the overlap-mass fraction (geometric mean of effective
+    per-side support / cell count, via Renyi-2 entropy).
+    """
+    pi = np.asarray(pi, dtype=np.float64)
+    n_A, n_B = pi.shape
+    row_mass = pi.sum(axis=1)
+    col_mass = pi.sum(axis=0)
+    eff_src = (row_mass.sum() ** 2) / max(float((row_mass ** 2).sum()), 1e-12)
+    eff_tgt = (col_mass.sum() ** 2) / max(float((col_mass ** 2).sum()), 1e-12)
+    frac_src = eff_src / max(n_A, 1)
+    frac_tgt = eff_tgt / max(n_B, 1)
+    return float(np.sqrt(max(frac_src, 0.0) * max(frac_tgt, 0.0)))
+
+
+# ============================================================================
+# Helper for the headline aggregator: optional coordinate alignment
+# ============================================================================
+
+def _post_procrustes_coords(sliceA, sliceB, pi):
+    """
+    Project A and B into a shared frame via the pi-induced Procrustes,
+    falling back to original obsm['spatial'] if visualize.stack_slices_pairwise
+    is unavailable or fails.
+    """
+    try:
+        from .visualize import stack_slices_pairwise
+        aligned = stack_slices_pairwise([sliceA, sliceB], [pi], output_params=False)
+        return (
+            np.asarray(aligned[0].obsm["spatial"]),
+            np.asarray(aligned[1].obsm["spatial"]),
+        )
+    except Exception:
+        return (
+            np.asarray(sliceA.obsm["spatial"]),
+            np.asarray(sliceB.obsm["spatial"]),
+        )
+
+
+# ============================================================================
+# Pretty printing helper
+# ============================================================================
+
+def _print_table(rows, title: str = "ALIGNMENT QUALITY METRICS", width: int = 92):
+    """
+    rows: iterable of (metric_label, initial_value, final_value, hint).
+    initial_value may be None to indicate "no initial value applicable".
+    hint is a short string appended at the end of the row (e.g. ' (lower=better)')
+    and may be ''.
+    """
+    bar = "=" * width
+    sub = "-" * width
+
+    def _fmt(v):
+        if v is None:
+            return f"{'-':>14}"
+        if isinstance(v, float) and np.isnan(v):
+            return f"{'nan':>14}"
+        try:
+            return f"{float(v):>14.6f}"
+        except Exception:
+            return f"{str(v):>14}"
+
+    print()
+    print(bar)
+    print(" " * ((width - len(title)) // 2) + title)
+    print(bar)
+    print(f"{'Metric':<48}{'Initial':>14}{'Final':>14}  {'Note'}")
+    print(sub)
+    for label, init_v, fin_v, hint in rows:
+        print(f"{label:<48}{_fmt(init_v)}{_fmt(fin_v)}  {hint}")
+    print(bar)
+    print()
+
+
+# ============================================================================
+# Headline aggregator
+# ============================================================================
+
+def calculate_performance_metrics(
+    final_pi,
+    init_pi=None,
+    js_dist_neighborhood=None,
+    cosine_dist_gene_expr=None,
+    cell_type_mismatch=None,
+    sliceA=None,
+    sliceB=None,
+    use_rep=None,
+    radius=100.0,
+    use_gpu=True,
+    normalize_mass: bool = True,
+    label_key: str = "cell_type_annot",
+    ground_truth_pairs: Optional[np.ndarray] = None,
+    landmark_pairs: Optional[np.ndarray] = None,
+    verbose: bool = True,
+):
+    """
+    Compute every alignment-quality metric the available inputs allow, print
+    a single formatted table, and return them in a dictionary.
+
+    Backward-compatible signature: every original keyword argument is
+    preserved, the original returned keys (``initial_obj_neighbor``,
+    ``final_obj_neighbor``, ``initial_obj_gene``, ``final_obj_gene``,
+    ``initial_cell_type_match``, ``final_cell_type_match``) are still
+    populated.
+
+    New optional inputs
+    -------------------
+    label_key : str
+        AnnData ``obs`` column to use as cell-type labels (defaults to
+        ``"cell_type_annot"``). Required for PAA / LTARI / SCS.
+    ground_truth_pairs : optional (K, 2) int array of (i_in_A, j_in_B)
+        one-to-one correspondences. Enables FOSCTTM (which uses every pair)
+        and landmark error (uses up to 50 random pairs).
+    landmark_pairs : optional (K, 2) int array of landmark pairs. If supplied,
+        used directly for landmark error; otherwise a 50-pair subsample of
+        ``ground_truth_pairs`` is used.
+    normalize_mass : whether to divide JSD/cosine costs by total transported
+        mass (default True). Set to False for back-compatible raw sums.
+
+    Output dictionary keys
+    ----------------------
+    Original keys:
+        ``initial_obj_neighbor``, ``final_obj_neighbor``,
+        ``initial_obj_gene``,     ``final_obj_gene``,
+        ``initial_cell_type_match``, ``final_cell_type_match``
+    Label-aware (added if labels available):
+        ``paa_celltype``, ``ltari_celltype``, ``scs_transferred``
+    Mass diagnostics:
+        ``mass_total_mass``, ``mass_kept_src_fraction``,
+        ``mass_kept_tgt_fraction``, ``mass_death_mass``,
+        ``mass_birth_mass``, ``mass_row_entropy_norm``,
+        ``mass_col_entropy_norm``, ``estimated_overlap_fraction``
+    Ground-truth-aware (added if ground_truth_pairs supplied):
+        ``foscttm``, ``landmark_mean_err``, ``landmark_median_err``,
+        ``landmark_rmse``
+    """
+    final_pi = np.asarray(final_pi)
     if init_pi is None:
         init_pi = np.ones(final_pi.shape) / (final_pi.shape[0] * final_pi.shape[1])
-    
-    # Calculate js_dist_neighborhood if not provided
+
+    # --- Compute supporting distance matrices on demand ------------------
     if js_dist_neighborhood is None:
         if sliceA is None or sliceB is None:
-            raise ValueError("sliceA and sliceB must be provided to calculate js_dist_neighborhood")
-        
-        # Calculate neighborhood dissimilarity using the provided slices and radius
+            raise ValueError("sliceA and sliceB must be provided to compute js_dist_neighborhood")
         use_gpu, nx = select_backend(use_gpu=use_gpu, gpu_verbose=False)
-        js_dist_neighborhood = calculate_neighborhood_dissimilarity(sliceA, sliceB, radius, nx=nx, data_type=np.float32, eps=1e-6)
-        
-        # Convert to numpy if necessary
+        js_dist_neighborhood = calculate_neighborhood_dissimilarity(
+            sliceA, sliceB, radius, nx=nx, data_type=np.float32, eps=1e-6
+        )
         if isinstance(js_dist_neighborhood, torch.Tensor):
             js_dist_neighborhood = js_dist_neighborhood.detach().cpu().numpy()
-    
-    # Calculate cosine_dist_gene_expr if not provided
     if cosine_dist_gene_expr is None:
         if sliceA is None or sliceB is None:
-            raise ValueError("sliceA and sliceB must be provided to calculate cosine_dist_gene_expr")
+            raise ValueError("sliceA and sliceB must be provided to compute cosine_dist_gene_expr")
         cosine_dist_gene_expr = calculate_gene_expression_cosine_distance(sliceA, sliceB, use_rep)
-
-    # Calculate cell-type matching metrics if slices are provided
     if cell_type_mismatch is None:
         if sliceA is None or sliceB is None:
-            raise ValueError("sliceA and sliceB must be provided to calculate cell_type_matching_percentage")
+            raise ValueError("sliceA and sliceB must be provided to compute cell_type_mismatch")
         cell_type_mismatch = calculate_cell_type_mismatch(sliceA, sliceB)
 
-    results = {}
-    
-    # Calculate neighborhood similarities
-    results['initial_obj_neighbor'] = calculate_neighborhood_similarity(js_dist_neighborhood, init_pi)
-    results['final_obj_neighbor'] = calculate_neighborhood_similarity(js_dist_neighborhood, final_pi)
-    
-    # Calculate gene expression similarities
-    results['initial_obj_gene'] = calculate_gene_expression_similarity(cosine_dist_gene_expr, init_pi)
-    results['final_obj_gene'] = calculate_gene_expression_similarity(cosine_dist_gene_expr, final_pi)
-    
-    # Calculate cell-type matching percentages
-    results['initial_cell_type_match'] = cell_type_matching(cell_type_mismatch, init_pi)
-    results['final_cell_type_match'] = cell_type_matching(cell_type_mismatch, final_pi)
+    results: dict = {}
 
-    # Display results in a formatted table
-    Title = "ALIGNMENT QUALITY METRICS"
-    print("\n" + "="*80)
-    print(" " * ((80 - len(Title)) // 2) + Title)
-    print("="*80)
-    print(f"{' Metric':<40} {'Initial':<12} {'Final':<12} {'Improvement':<12}")
-    print("-"*80)
-    print(f"{' Neighborhood Dissimilarity (JSD)':<40} {results['initial_obj_neighbor']:<12.6f} {results['final_obj_neighbor']:<12.6f} {(results['initial_obj_neighbor'] - results['final_obj_neighbor']) / results['initial_obj_neighbor'] * 100:>10.2f}%")
-    print(f"{' Gene Expression Dissimilarity (Cosine)':<40} {results['initial_obj_gene']:<12.6f} {results['final_obj_gene']:<12.6f} {(results['initial_obj_gene'] - results['final_obj_gene']) / results['initial_obj_gene'] * 100:>10.2f}%")
-    print(f"{' Cell-type Correspondence (%)':<40} {results['initial_cell_type_match']*100:<12.2f} {results['final_cell_type_match']*100:<12.2f} {(results['final_cell_type_match'] - results['initial_cell_type_match']) / results['initial_cell_type_match'] * 100:>10.2f}%")
-    print("="*80 + "\n")
+    # --- Cost-based objectives ------------------------------------------
+    results["initial_obj_neighbor"] = calculate_neighborhood_similarity(
+        js_dist_neighborhood, init_pi, normalize_mass=normalize_mass
+    )
+    results["final_obj_neighbor"] = calculate_neighborhood_similarity(
+        js_dist_neighborhood, final_pi, normalize_mass=normalize_mass
+    )
+    results["initial_obj_gene"] = calculate_gene_expression_similarity(
+        cosine_dist_gene_expr, init_pi, normalize_mass=normalize_mass
+    )
+    results["final_obj_gene"] = calculate_gene_expression_similarity(
+        cosine_dist_gene_expr, final_pi, normalize_mass=normalize_mass
+    )
+    results["initial_cell_type_match"] = cell_type_matching(cell_type_mismatch, init_pi)
+    results["final_cell_type_match"] = cell_type_matching(cell_type_mismatch, final_pi)
+
+    # --- Label-aware metrics --------------------------------------------
+    labels_available = (
+        sliceA is not None
+        and sliceB is not None
+        and label_key in sliceA.obs.columns
+        and label_key in sliceB.obs.columns
+    )
+    if labels_available:
+        labels_A = sliceA.obs[label_key].astype(str).values
+        labels_B = sliceB.obs[label_key].astype(str).values
+        results["paa_celltype"] = pairwise_alignment_accuracy(
+            labels_A, labels_B, final_pi, weighted=True
+        )
+        results["ltari_celltype"] = label_transfer_ari(labels_A, labels_B, final_pi)
+        # SCS of transferred labels at source positions
+        row_mass = final_pi.sum(axis=1)
+        active = row_mass > 1e-12
+        if active.any():
+            try:
+                pred = labels_B[np.argmax(final_pi[active], axis=1)]
+                results["scs_transferred"] = spatial_coherence_score(
+                    np.asarray(sliceA.obsm["spatial"])[active], pred, k=6
+                )
+            except Exception:
+                results["scs_transferred"] = float("nan")
+        else:
+            results["scs_transferred"] = float("nan")
+
+    # --- Mass-conservation + overlap diagnostics -------------------------
+    mass = mass_conservation_diagnostics(
+        final_pi, n_A=final_pi.shape[0], n_B=final_pi.shape[1]
+    )
+    for k, v in mass.items():
+        results[f"mass_{k}"] = v
+    results["estimated_overlap_fraction"] = estimated_overlap_fraction(final_pi)
+
+    # --- Ground-truth-aware metrics (FOSCTTM + landmark) -----------------
+    gt_available = (
+        sliceA is not None and sliceB is not None
+        and ground_truth_pairs is not None
+        and np.asarray(ground_truth_pairs).size >= 2
+    )
+    if gt_available:
+        try:
+            cA, cB = _post_procrustes_coords(sliceA, sliceB, final_pi)
+            gt = np.asarray(ground_truth_pairs)
+            idx_A = gt[:, 0].astype(int)
+            idx_B = gt[:, 1].astype(int)
+            results["foscttm"] = foscttm(cA[idx_A], cB[idx_B])
+        except Exception:
+            results["foscttm"] = float("nan")
+        # landmarks
+        try:
+            lp = landmark_pairs
+            if lp is None:
+                rng = np.random.default_rng(0)
+                k = min(50, np.asarray(ground_truth_pairs).shape[0])
+                sel = rng.choice(np.asarray(ground_truth_pairs).shape[0], size=k, replace=False)
+                lp = np.asarray(ground_truth_pairs)[sel]
+            results["landmark_mean_err"] = landmark_error(cA, cB, lp, reduction="mean")
+            results["landmark_median_err"] = landmark_error(cA, cB, lp, reduction="median")
+            results["landmark_rmse"] = landmark_error(cA, cB, lp, reduction="rmse")
+        except Exception:
+            results["landmark_mean_err"] = float("nan")
+            results["landmark_median_err"] = float("nan")
+            results["landmark_rmse"] = float("nan")
+
+    # --- Pretty print ----------------------------------------------------
+    if verbose:
+        rows = []
+
+        # Initial/Final cost objectives
+        rows.append((
+            " Neighborhood JSD",
+            results["initial_obj_neighbor"], results["final_obj_neighbor"],
+            "(lower=better)",
+        ))
+        rows.append((
+            " Gene expression cosine",
+            results["initial_obj_gene"], results["final_obj_gene"],
+            "(lower=better)",
+        ))
+        rows.append((
+            " Cell-type match (mass fraction)",
+            results["initial_cell_type_match"], results["final_cell_type_match"],
+            "(higher=better)",
+        ))
+
+        # Label-aware metrics
+        if "paa_celltype" in results:
+            rows.append((" PAA (cell-type, weighted)", None, results["paa_celltype"], "(higher=better)"))
+        if "ltari_celltype" in results:
+            rows.append((" LTARI (cell-type)", None, results["ltari_celltype"], "(higher=better)"))
+        if "scs_transferred" in results:
+            rows.append((" SCS of transferred labels", None, results["scs_transferred"], "(higher=better)"))
+
+        # FOSCTTM + landmarks
+        if "foscttm" in results:
+            rows.append((" FOSCTTM (post-Procrustes)", None, results["foscttm"], "(lower=better)"))
+        if "landmark_mean_err" in results:
+            rows.append((" Landmark mean error", None, results["landmark_mean_err"], "(lower=better)"))
+            rows.append((" Landmark median error", None, results["landmark_median_err"], "(lower=better)"))
+            rows.append((" Landmark RMSE", None, results["landmark_rmse"], "(lower=better)"))
+
+        # Mass diagnostics
+        rows.append((" Estimated overlap fraction", None, results["estimated_overlap_fraction"], "(model selection)"))
+        rows.append((" Transported mass (total)", None, results["mass_total_mass"], "(<= 1 unbalanced)"))
+        rows.append((" Kept mass, source side", None, results["mass_kept_src_fraction"], ""))
+        rows.append((" Kept mass, target side", None, results["mass_kept_tgt_fraction"], ""))
+        rows.append((" Death mass (source vanished)", None, results["mass_death_mass"], ""))
+        rows.append((" Birth mass (target appeared)", None, results["mass_birth_mass"], ""))
+        rows.append((" Source marginal entropy (norm)", None, results["mass_row_entropy_norm"], "(1=uniform)"))
+        rows.append((" Target marginal entropy (norm)", None, results["mass_col_entropy_norm"], "(1=uniform)"))
+
+        _print_table(rows, title="ALIGNMENT QUALITY METRICS")
+
+        # Improvements for the original cost objectives
+        def _pct(x_init, x_fin, higher_better):
+            if abs(x_init) < 1e-12:
+                return float("nan")
+            delta = (x_init - x_fin) if not higher_better else (x_fin - x_init)
+            return delta / abs(x_init) * 100.0
+
+        print(" Improvements (vs initial)")
+        print(f"   Neighborhood JSD          : {_pct(results['initial_obj_neighbor'], results['final_obj_neighbor'], False):>+8.2f}%")
+        print(f"   Gene expression cosine    : {_pct(results['initial_obj_gene'], results['final_obj_gene'], False):>+8.2f}%")
+        print(f"   Cell-type match           : {_pct(results['initial_cell_type_match'], results['final_cell_type_match'], True):>+8.2f}%")
+        print()
 
     return results
 
 
+# ============================================================================
+# Compactness / variance diagnostics (unchanged from original)
+# ============================================================================
+
 def calculate_forward_reverse_compactness(pi_mat, sliceA, sliceB):
     """
-    Form A diagnostic metric for spatial compactness.
-    Calculates the spatial variance of mapping for both forward and reverse directions
-    as well as effective support.
+    Diagnostic metric for spatial compactness.
 
-    Args:
-        pi_mat: Alignment mapping matrix (ns x nt)
-        sliceA: Source anndata object containing spatial coordinates in .obsm['spatial']
-        sliceB: Target anndata object containing spatial coordinates in .obsm['spatial']
-        
-    Returns:
-        dict containing:
-            'forward_compactness': Average spatial variance in target per source cell
-            'reverse_compactness': Average spatial variance in source per target cell
-            'effective_support_fwd': Mean effective number of target cells per source cell
-            'effective_support_rev': Mean effective number of source cells per target cell
+    Returns dict with:
+        'forward_compactness'  : avg target-side variance per source cell
+        'reverse_compactness'  : avg source-side variance per target cell
+        'effective_support_fwd': mean Renyi-2 effective support per source
+        'effective_support_rev': mean Renyi-2 effective support per target
     """
     pi_mat = np.asarray(pi_mat)
-    Xs = np.asarray(sliceA.obsm['spatial'])
-    Xt = np.asarray(sliceB.obsm['spatial'])
-    
-    # Epsilon for numerical stability
+    Xs = np.asarray(sliceA.obsm["spatial"])
+    Xt = np.asarray(sliceB.obsm["spatial"])
     eps = 1e-12
 
-    # Forward Compactness (Target variance for each source cell)
     pi_row_sums = pi_mat.sum(axis=1)
     pi_row_sums_safe = np.maximum(pi_row_sums, eps)
     pi_row_normalized = pi_mat / pi_row_sums_safe[:, None]
-    
-    bary_t = pi_row_normalized @ Xt  # Source barycenters in Target space (N x 2)
-    # Variance = E[||x||^2] - ||E[x]||^2
+    bary_t = pi_row_normalized @ Xt
     var_fwd_E_x2 = pi_row_normalized @ np.sum(Xt ** 2, axis=1)
     var_fwd_Ex_2 = np.sum(bary_t ** 2, axis=1)
-    # Average variance across source cells that have mass
     active_sources = pi_row_sums > eps
     var_fwd = np.clip(var_fwd_E_x2[active_sources] - var_fwd_Ex_2[active_sources], 0, None)
-    forward_compactness = np.mean(var_fwd) if len(var_fwd) > 0 else 0.0
+    forward_compactness = float(np.mean(var_fwd)) if len(var_fwd) > 0 else 0.0
 
-    # Reverse Compactness (Source variance for each target cell)
     pi_col_sums = pi_mat.sum(axis=0)
     pi_col_sums_safe = np.maximum(pi_col_sums, eps)
     pi_col_normalized = pi_mat / pi_col_sums_safe[None, :]
-    
-    bary_s = pi_col_normalized.T @ Xs  # Target barycenters in Source space (M x 2)
+    bary_s = pi_col_normalized.T @ Xs
     var_rev_E_x2 = pi_col_normalized.T @ np.sum(Xs ** 2, axis=1)
     var_rev_Ex_2 = np.sum(bary_s ** 2, axis=1)
-    # Average variance across target cells that have mass
     active_targets = pi_col_sums > eps
     var_rev = np.clip(var_rev_E_x2[active_targets] - var_rev_Ex_2[active_targets], 0, None)
-    reverse_compactness = np.mean(var_rev) if len(var_rev) > 0 else 0.0
+    reverse_compactness = float(np.mean(var_rev)) if len(var_rev) > 0 else 0.0
 
-    # Effective support
     eff_support_fwd = (pi_row_sums ** 2) / np.maximum(np.sum(pi_mat ** 2, axis=1), eps)
     eff_support_rev = (pi_col_sums ** 2) / np.maximum(np.sum(pi_mat ** 2, axis=0), eps)
-    mean_eff_support_fwd = np.mean(eff_support_fwd[active_sources]) if len(eff_support_fwd[active_sources]) > 0 else 0.0
-    mean_eff_support_rev = np.mean(eff_support_rev[active_targets]) if len(eff_support_rev[active_targets]) > 0 else 0.0
+    mean_eff_support_fwd = (
+        float(np.mean(eff_support_fwd[active_sources]))
+        if active_sources.any() else 0.0
+    )
+    mean_eff_support_rev = (
+        float(np.mean(eff_support_rev[active_targets]))
+        if active_targets.any() else 0.0
+    )
 
     return {
-        'forward_compactness': forward_compactness,
-        'reverse_compactness': reverse_compactness,
-        'effective_support_fwd': mean_eff_support_fwd,
-        'effective_support_rev': mean_eff_support_rev
+        "forward_compactness": forward_compactness,
+        "reverse_compactness": reverse_compactness,
+        "effective_support_fwd": mean_eff_support_fwd,
+        "effective_support_rev": mean_eff_support_rev,
     }
