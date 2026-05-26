@@ -1713,8 +1713,10 @@ def extract_continuous_macro_section(
     geodesic_B = compute_graph_geodesics(edge_B_norm)
 
     # 3. Build biologically grounded cluster context descriptors.
-    context_feat_A = np.asarray(cluster_cache_A.mu_struct_neighborhood, dtype=np.float64)
-    context_feat_B = np.asarray(cluster_cache_B.mu_struct_neighborhood, dtype=np.float64)
+    cluster_hist_A = np.asarray(cluster_cache_A.cluster_hist, dtype=np.float64)
+    cluster_hist_B = np.asarray(cluster_cache_B.cluster_hist, dtype=np.float64)
+    context_feat_A = compute_cluster_context_features(cluster_hist_A, adj_A)
+    context_feat_B = compute_cluster_context_features(cluster_hist_B, adj_B)
 
     # 4. Assemble candidate cluster-pairs and their overall evidence.
     matches, match_tiebreak_scores, global_pair_scores, global_pair_evidence, mi_contrib, log_enrichment, diagnostics = collect_candidate_match_pairs(
