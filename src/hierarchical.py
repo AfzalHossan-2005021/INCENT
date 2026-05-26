@@ -181,9 +181,7 @@ def build_slice_cluster_cache(
     adjacency, _ = build_cluster_contact_graph(coords, labels, valid)
     mu_struct_neighborhood = compute_cluster_context_features(mu_struct_local, adjacency)
 
-    global_shape = compute_cluster_global_shape_features(coords, centroids)
     mu_struct = np.concatenate([mu_struct_local, mu_struct_neighborhood], axis=1)
-
 
     return SliceClusterCache(
         labels=np.asarray(labels),
@@ -456,36 +454,6 @@ def compute_graph_geodesics(edge_lengths):
     return distances
 
 
-def compute_cluster_cell_type_histograms(adata, labels, n_clusters, label_key="cell_type_annot", all_types=None):
-    """
-    Compute within-cluster cell-type compositions for biologically grounded matching.
-
-    These histograms act as coarse "microenvironment identities" that are much
-    more stable than raw centroid geometry and help separate nearby symmetric
-    compartments whose local molecular composition differs subtly.
-    """
-    cell_types = adata.obs[label_key].astype(str).to_numpy()
-    if all_types is None:
-        all_types = np.array(sorted(np.unique(cell_types)), dtype=str)
-    else:
-        all_types = np.array(all_types, dtype=str)
-
-    type_to_idx = {ct: i for i, ct in enumerate(all_types)}
-    hist = np.zeros((n_clusters, len(all_types)), dtype=np.float64)
-
-    for cluster_id in range(n_clusters):
-        mask = labels == cluster_id
-        if not np.any(mask):
-            continue
-        mapped = [type_to_idx[x] for x in cell_types[mask] if x in type_to_idx]
-        if not mapped:
-            continue
-        counts = np.bincount(mapped, minlength=len(all_types)).astype(np.float64)
-        hist[cluster_id] = counts / max(counts.sum(), 1.0)
-
-    return hist, all_types
-
-
 def compute_cluster_context_features(cluster_hist, adjacency):
     """
     Build cluster context descriptors from own composition and adjacent composition.
@@ -553,57 +521,12 @@ def fit_weighted_rigid_transform(source_points, target_points, weights=None):
     return R, t
 
 
-def _seed_rigid_scale(centroids_A, centroids_B, selected_pairs, mi_contrib):
-    """
-    Robust scale of the seed Procrustes residuals.
-
-    Returns the MAD of the per-pair Euclidean residuals of ``selected_pairs``
-    under their MI-weighted rigid-fit, scaled by the Gaussian-consistency
-    constant 1.4826 = 1 / Phi^{-1}(0.75) so that under Gaussian noise the
-    return value is a consistent estimator of sigma. This replaces the
-    global cell-density statistic previously used as ``transform_scale``.
-
-    For seeds with fewer than two pairs there is no defined orientation and
-    the rigid term is disabled upstream; we return zero so callers can detect
-    this. For seeds that fit to machine precision (a true zero MAD) we
-    return a numerical-noise floor proportional to the coordinate magnitude
-    so the downstream division does not blow up.
-    """
-    if len(selected_pairs) < 2:
-        return 0.0
-    src = np.asarray(centroids_A[[u for u, _ in selected_pairs]], dtype=np.float64)
-    tgt = np.asarray(centroids_B[[v for _, v in selected_pairs]], dtype=np.float64)
-    weights = np.array(
-        [max(mi_contrib[u, v], 1e-12) for u, v in selected_pairs],
-        dtype=np.float64,
-    )
-    R, t = fit_weighted_rigid_transform(src, tgt, weights=weights)
-    residuals = np.linalg.norm(tgt - (src @ R.T + t), axis=1)
-    mad = float(np.median(np.abs(residuals - np.median(residuals))))
-    sigma_hat = 1.4826 * mad
-    if sigma_hat <= 0.0:
-        coord_scale = float(
-            np.max(np.abs(np.concatenate([src.ravel(), tgt.ravel()]))) + 1.0
-        )
-        sigma_hat = np.finfo(np.float64).eps * coord_scale * 16.0
-    return sigma_hat
-
-
-def empirical_logit_evidence(values, larger_is_better=True, baseline=None):
+def empirical_logit_evidence(values, larger_is_better=True):
     """
     Convert a score vector into centered, parameter-free evidence values.
 
     Scores are ranked empirically and mapped to log-odds. This places unrelated
     evidence channels on a common scale without introducing hand-tuned weights.
-
-    When ``baseline`` is supplied, the ranks are computed against that fixed
-    reference population (typically the union of every value the channel ever
-    produces, frozen at round 0). This makes the resulting logits comparable
-    across rounds: a value v always maps to the same logit, regardless of how
-    many other candidates are scored alongside it in the current call. The
-    return shape still matches ``values``.
-
-    Without ``baseline`` the behaviour is unchanged (legacy, per-call ranking).
     """
     values = np.asarray(values, dtype=np.float64)
     if values.size == 0:
@@ -619,28 +542,8 @@ def empirical_logit_evidence(values, larger_is_better=True, baseline=None):
         values[nan_mask] = np.min(filtered) if larger_is_better else np.max(filtered)
 
     working = values if larger_is_better else -values
-
-    if baseline is None:
-        ranks = rankdata(working, method="average")
-        p = ranks / (values.size + 1.0)
-        return np.log(p) - np.log1p(-p)
-
-    baseline = np.asarray(baseline, dtype=np.float64)
-    baseline = baseline[~np.isnan(baseline)]
-    if baseline.size == 0:
-        ranks = rankdata(working, method="average")
-        p = ranks / (values.size + 1.0)
-        return np.log(p) - np.log1p(-p)
-
-    baseline_working = baseline if larger_is_better else -baseline
-    baseline_sorted = np.sort(baseline_working)
-    # Hyndman-Fan type 7 average-rank: (left + right + 1) / 2
-    left = np.searchsorted(baseline_sorted, working, side="left")
-    right = np.searchsorted(baseline_sorted, working, side="right")
-    avg_rank = 0.5 * (left + right + 1.0)
-    p = avg_rank / (baseline_sorted.size + 1.0)
-    p = np.clip(p, 1.0 / (baseline_sorted.size + 2.0),
-                   1.0 - 1.0 / (baseline_sorted.size + 2.0))
+    ranks = rankdata(working, method="average")
+    p = ranks / (values.size + 1.0)
     return np.log(p) - np.log1p(-p)
 
 
@@ -652,56 +555,7 @@ def equal_area_ring_edges(max_radius, n_rings):
     return max_radius * np.sqrt(np.linspace(0.0, 1.0, int(n_rings) + 1))
 
 
-def compute_cluster_global_shape_features(coords, centroids, n_rings=6, harmonics=(0, 1, 2)):
-    """
-    Compute a cluster-centered, full-tissue morphology descriptor.
-
-    For each cluster centroid, the descriptor summarizes the distribution of all
-    tissue cells around that centroid using equal-area radial bins and
-    low-order angular harmonic magnitudes. This acts as a global morphology cue
-    that can distinguish practically symmetric regions whenever the overall
-    tissue support or crop boundaries break the symmetry.
-
-    The descriptor is rotation- and reflection-invariant because only harmonic
-    magnitudes are retained.
-    """
-    coords = np.asarray(coords, dtype=np.float64)
-    centroids = np.asarray(centroids, dtype=np.float64)
-    if coords.shape[0] == 0 or centroids.shape[0] == 0:
-        return np.zeros((centroids.shape[0], int(n_rings) * len(harmonics)), dtype=np.float64)
-
-    tissue_center = np.mean(coords, axis=0)
-    tissue_radius = np.percentile(np.linalg.norm(coords - tissue_center, axis=1), 99)
-    max_radius = max(2.0 * tissue_radius, 1e-12)
-    ring_edges = equal_area_ring_edges(max_radius, n_rings)
-
-    features = np.zeros((centroids.shape[0], int(n_rings) * len(harmonics)), dtype=np.float64)
-    for i, center in enumerate(centroids):
-        rel = coords - center
-        dist = np.linalg.norm(rel, axis=1)
-        ang = np.arctan2(rel[:, 1], rel[:, 0])
-        ring_idx = np.clip(np.digitize(dist, ring_edges[1:], right=True), 0, int(n_rings) - 1)
-
-        local = np.zeros((int(n_rings), len(harmonics)), dtype=np.float64)
-        for h_pos, m in enumerate(harmonics):
-            if m == 0:
-                mag = np.bincount(ring_idx, minlength=int(n_rings)).astype(np.float64)
-            else:
-                phase = float(m) * ang
-                real = np.bincount(ring_idx, weights=np.cos(phase), minlength=int(n_rings))
-                imag = np.bincount(ring_idx, weights=np.sin(phase), minlength=int(n_rings))
-                mag = np.hypot(real, imag)
-            local[:, h_pos] = mag
-
-        flat = local.reshape(-1)
-        if flat.sum() > 0:
-            flat /= flat.sum()
-        features[i] = flat
-
-    return features
-
-
-def collect_candidate_match_pairs(Pi_cluster, valid_A, valid_B, context_feat_A, context_feat_B):
+def collect_candidate_match_pairs(Pi_cluster, valid_A, valid_B):
     """
     Assemble transport-supported cluster pairs and their overall evidence.
 
@@ -716,9 +570,7 @@ def collect_candidate_match_pairs(Pi_cluster, valid_A, valid_B, context_feat_A, 
     The primary transport-derived score is the per-pair mutual-information
     contribution, which already combines pair specificity with matched mass.
     Log-enrichment is retained only as a secondary tie-break so that transport
-    evidence is not double-counted additively. The remaining evidence channel
-    comes from local niche context, keeping macro-section extraction grounded in
-    transport support plus local biology/topology only.
+    evidence is not double-counted additively.
     """
     log_enrichment = compute_pairwise_log_enrichment(Pi_cluster)
     mi_contrib = compute_pairwise_mutual_information_contribution(Pi_cluster)
@@ -740,7 +592,6 @@ def collect_candidate_match_pairs(Pi_cluster, valid_A, valid_B, context_feat_A, 
     matches = []
     mi_signal = []
     enrichment_signal = []
-    context_signal = []
     for idx in sorted_idx:
         u, v = np.unravel_index(idx, Pi_cluster.shape)
         if not (valid_A[u] and valid_B[v]):
@@ -750,30 +601,21 @@ def collect_candidate_match_pairs(Pi_cluster, valid_A, valid_B, context_feat_A, 
         mi_signal.append(float(mi_contrib[u, v]))
         enrichment_signal.append(float(log_enrichment[u, v]))
 
-        feat_A = context_feat_A[u]
-        feat_B = context_feat_B[v]
-        if feat_A.sum() <= 0 and feat_B.sum() <= 0:
-            context_signal.append(0.0)
-        else:
-            context_signal.append(float(-safe_jensenshannon(feat_A, feat_B)))
-
     mi_signal = np.asarray(mi_signal, dtype=np.float64)
     enrichment_signal = np.asarray(enrichment_signal, dtype=np.float64)
-    context_signal = np.asarray(context_signal, dtype=np.float64)
 
     mi_evidence = empirical_logit_evidence(mi_signal, larger_is_better=True)
-    context_evidence = empirical_logit_evidence(context_signal, larger_is_better=True)
 
     global_pair_evidence = {
-        pair: float(me + ce)
-        for pair, me, ce in zip(matches, mi_evidence, context_evidence)
+        pair: float(me)
+        for pair, me in zip(matches, mi_evidence)
     }
     global_pair_scores = np.array([global_pair_evidence[pair] for pair in matches], dtype=np.float64)
 
     diagnostics = {
         "num_positive_mass_pairs": int(np.sum(Pi_cluster > 0)),
         "num_enriched_pairs": int(np.sum(log_enrichment > 0)),
-        "transport_score_mode": "mi_plus_context_primary_enrichment_tiebreak",
+        "transport_score_mode": "mi_primary_enrichment_tiebreak",
     }
     return matches, enrichment_signal, global_pair_scores, global_pair_evidence, mi_contrib, log_enrichment, diagnostics
 
@@ -789,8 +631,7 @@ def score_frontier_matches(
     centroids_A,
     centroids_B,
     mi_contrib,
-    support_baseline=None,
-    rigid_baseline=None,
+    transform_scale,
 ):
     """
     Score the current frontier of admissible cluster-pairs.
@@ -800,19 +641,9 @@ def score_frontier_matches(
     2. support from already selected neighboring pairs
     3. rigid consistency, but only once at least two selected pairs define an
        orientation-aware transform
-
-    The rigid-residual tolerance scales with the robust dispersion of the
-    seed motif's own fit residuals (1.4826 * MAD), so it adapts to seed fit
-    quality rather than to a pre-specified spatial scale.
-
-    When ``support_baseline`` and ``rigid_baseline`` are supplied, the two
-    rank-normalised evidence channels use those fixed reference pools rather
-    than re-ranking on the current frontier. This makes scores comparable
-    across rounds, so a candidate with raw evidence E receives the same
-    logit regardless of which round it first becomes coupled.
     """
     if not frontier_A or not frontier_B or not selected_pairs:
-        return [], [], [], []
+        return [], []
 
     use_rigid = len(selected_pairs) >= 2
     if use_rigid:
@@ -825,13 +656,9 @@ def score_frontier_matches(
             centroids_B[[v for _, v in selected_pairs]],
             weights=seed_weights
         )
-        sigma_hat = _seed_rigid_scale(
-            centroids_A, centroids_B, selected_pairs, mi_contrib
-        )
     else:
         R_seed = None
         t_seed = None
-        sigma_hat = 0.0
 
     frontier_pairs = []
     support_strengths = []
@@ -858,7 +685,7 @@ def score_frontier_matches(
             if use_rigid:
                 rigid_prediction = centroids_A[u] @ R_seed.T + t_seed
                 rigid_residual = float(
-                    np.linalg.norm(centroids_B[v] - rigid_prediction) / sigma_hat
+                    np.linalg.norm(centroids_B[v] - rigid_prediction) / transform_scale
                 )
             else:
                 rigid_residual = 0.0
@@ -868,19 +695,11 @@ def score_frontier_matches(
             rigid_residuals.append(rigid_residual)
 
     if not frontier_pairs:
-        return [], [], [], []
+        return [], []
 
-    support_evidence = empirical_logit_evidence(
-        support_strengths,
-        larger_is_better=True,
-        baseline=support_baseline,
-    )
+    support_evidence = empirical_logit_evidence(support_strengths, larger_is_better=True)
     if use_rigid:
-        rigid_evidence = empirical_logit_evidence(
-            rigid_residuals,
-            larger_is_better=False,
-            baseline=rigid_baseline,
-        )
+        rigid_evidence = empirical_logit_evidence(rigid_residuals, larger_is_better=False)
     else:
         rigid_evidence = np.zeros(len(frontier_pairs), dtype=np.float64)
 
@@ -892,7 +711,7 @@ def score_frontier_matches(
     ):
         frontier_scores.append(global_pair_evidence[pair] + float(se + re))
 
-    return frontier_pairs, frontier_scores, support_strengths, rigid_residuals
+    return frontier_pairs, frontier_scores
 
 
 def empty_macro_section_result(n_cells_A, n_cells_B, reason, diagnostics=None):
@@ -947,8 +766,8 @@ def expand_macro_match_frontier(
     mi_contrib,
     adj_A,
     adj_B,
-    edge_scale_A,  # retained for backward compatibility; no longer used
-    edge_scale_B,  # retained for backward compatibility; no longer used
+    edge_scale_A,
+    edge_scale_B,
     centroids_A,
     centroids_B,
 ):
@@ -959,67 +778,18 @@ def expand_macro_match_frontier(
     only when it is contiguous in both tissues and beats the private unmatched
     alternative in the assignment problem. This yields a natural stopping rule
     with no target-size hyperparameter.
-
-    The rigid-consistency tolerance is computed inside
-    ``score_frontier_matches`` from the robust dispersion of the seed motif's
-    own Procrustes residuals (1.4826 * MAD), so callers no longer need to
-    supply a transform scale. The ``edge_scale_A`` and ``edge_scale_B``
-    arguments are kept for backward signature compatibility but are not used.
-
-    Cross-round score comparability (Issue 2). At the start of expansion we
-    freeze a baseline support/rigid raw-score pool over the entire union of
-    coupled candidates that could ever be encountered. Subsequent rounds rank
-    their candidates against this fixed pool, so a candidate with raw
-    evidence E receives the same logit regardless of which round it first
-    becomes coupled.
-
-    Backward consistency (Issue 1). At the end of each round, every
-    already-selected pair (except the seed) is re-scored under the updated
-    transform. A pair whose rigid evidence falls below zero in the new
-    baseline-comparable logit is evicted: the same admission criterion is
-    applied symmetrically to admission and eviction. The seed motif is never
-    evicted because it defines the rigid reference.
     """
     selected_pairs = list(seed_pairs)
     selected_A = {u for u, _ in seed_pairs}
     selected_B = {v for _, v in seed_pairs}
     candidate_pair_set = set(matches)
-    seed_set = set(seed_pairs)
-    banned_pairs = set()  # pairs evicted by the backward sweep are not re-admitted
+    transform_scale = max(edge_scale_A, edge_scale_B, 1e-12)
 
     diagnostics = {
         "expansion_rounds": 0,
         "accepted_pairs_per_round": [],
-        "evicted_pairs_per_round": [],
-        "banned_pairs": [],
         "stop_reason": "seed_only",
     }
-
-    # ─── Build round-0 baselines (Issue 2) ────────────────────────────────
-    # We do one initial scoring pass over the full coupled-candidate pool with
-    # the seed-only transform; the resulting raw support and rigid-residual
-    # values define the baseline against which every subsequent round ranks.
-    full_frontier_A = {u for u, _ in matches if u not in selected_A}
-    full_frontier_B = {v for _, v in matches if v not in selected_B}
-    _, _, support_baseline, rigid_baseline = score_frontier_matches(
-        frontier_A=full_frontier_A,
-        frontier_B=full_frontier_B,
-        candidate_pair_set=candidate_pair_set,
-        selected_pairs=selected_pairs,
-        global_pair_evidence=global_pair_evidence,
-        adj_A=adj_A,
-        adj_B=adj_B,
-        centroids_A=centroids_A,
-        centroids_B=centroids_B,
-        mi_contrib=mi_contrib,
-        support_baseline=None,
-        rigid_baseline=None,
-    )
-    # If the seed is too small to define rigid_baseline (use_rigid was False),
-    # the list is empty; that's fine: empirical_logit_evidence with an empty
-    # baseline gracefully falls back to per-call ranking on the first round
-    # that actually defines orientation, after which the baseline freezes.
-    baselines_frozen = bool(support_baseline) or bool(rigid_baseline)
 
     while True:
         diagnostics["expansion_rounds"] += 1
@@ -1039,10 +809,10 @@ def expand_macro_match_frontier(
             diagnostics["stop_reason"] = "frontier_exhausted"
             break
 
-        frontier_pairs, frontier_scores, fr_supp, fr_rigid = score_frontier_matches(
+        frontier_pairs, frontier_scores = score_frontier_matches(
             frontier_A=frontier_A,
             frontier_B=frontier_B,
-            candidate_pair_set=candidate_pair_set - banned_pairs,
+            candidate_pair_set=candidate_pair_set,
             selected_pairs=selected_pairs,
             global_pair_evidence=global_pair_evidence,
             adj_A=adj_A,
@@ -1050,23 +820,13 @@ def expand_macro_match_frontier(
             centroids_A=centroids_A,
             centroids_B=centroids_B,
             mi_contrib=mi_contrib,
-            support_baseline=support_baseline if baselines_frozen else None,
-            rigid_baseline=rigid_baseline if baselines_frozen else None,
+            transform_scale=transform_scale,
         )
         if not frontier_pairs:
             diagnostics["stop_reason"] = "no_contiguous_frontier_pairs"
             break
 
-        # Lazy baseline freeze: the first round that produces a non-empty
-        # rigid-residual pool defines the baseline for every subsequent round.
-        if not baselines_frozen and (fr_supp or fr_rigid):
-            support_baseline = list(fr_supp)
-            rigid_baseline = list(fr_rigid)
-            baselines_frozen = True
-
-        accepted_pairs = solve_frontier_assignment(
-            frontier_A, frontier_B, frontier_pairs, frontier_scores
-        )
+        accepted_pairs = solve_frontier_assignment(frontier_A, frontier_B, frontier_pairs, frontier_scores)
         if not accepted_pairs:
             diagnostics["stop_reason"] = "frontier_not_better_than_unmatched"
             break
@@ -1077,100 +837,9 @@ def expand_macro_match_frontier(
             selected_A.add(u)
             selected_B.add(v)
 
-        # ─── Backward consistency sweep (Issue 1) ──────────────────────────
-        # After admissions we evaluate every non-seed selected pair under the
-        # updated transform and evict those whose rigid logit-evidence is
-        # negative against the baseline pool. The same admission criterion is
-        # applied symmetrically; no new parameter is introduced.
-        evicted = _backward_consistency_sweep(
-            selected_pairs=selected_pairs,
-            seed_set=seed_set,
-            global_pair_evidence=global_pair_evidence,
-            mi_contrib=mi_contrib,
-            centroids_A=centroids_A,
-            centroids_B=centroids_B,
-            rigid_baseline=rigid_baseline if baselines_frozen else None,
-        )
-        if evicted:
-            evicted_set = set(evicted)
-            selected_pairs = [p for p in selected_pairs if p not in evicted_set]
-            selected_A = {u for u, _ in selected_pairs}
-            selected_B = {v for _, v in selected_pairs}
-            # Prevent re-admission to avoid oscillation
-            banned_pairs.update(evicted_set)
-            diagnostics["banned_pairs"].extend(evicted)
-        diagnostics["evicted_pairs_per_round"].append(len(evicted))
-
     diagnostics["selected_cluster_count_A"] = len(selected_A)
     diagnostics["selected_cluster_count_B"] = len(selected_B)
     return selected_pairs, diagnostics
-
-
-def _backward_consistency_sweep(
-    selected_pairs,
-    seed_set,
-    global_pair_evidence,
-    mi_contrib,
-    centroids_A,
-    centroids_B,
-    rigid_baseline,    # unused; kept for backward signature compatibility
-):
-    """
-    Re-validate every non-seed selected pair under the current transform.
-
-    Eviction criterion (Tukey 1977 fence rule applied to the current cohort):
-    fit the rigid transform on every selected pair, compute each pair's
-    Euclidean residual, and flag a pair as an outlier when its residual
-    exceeds Q3 + 1.5*IQR of the within-cohort residual distribution. Seed
-    pairs are exempt: they define the rigid reference.
-
-    This addresses the "once-admitted, always-admitted" failure mode of
-    greedy frontier expansion (Chetverikov 2002; Yang & Carlone 2020). The
-    Tukey fence rule introduces no hyperparameter --- the 1.5*IQR multiplier
-    is a published constant defining "mild" outliers under any symmetric
-    distribution.
-
-    The ``rigid_baseline`` argument is accepted for backward signature
-    compatibility but is no longer needed; the cohort-internal IQR rule
-    self-calibrates.
-
-    Returns the list of pairs to remove.
-    """
-    if len(selected_pairs) < 4:
-        # Below 4 pairs the IQR is undefined; with so few pairs the rigid
-        # fit is already dominated by the seed and eviction would be unsafe.
-        return []
-
-    weights = np.array(
-        [max(mi_contrib[u, v], 1e-12) for u, v in selected_pairs],
-        dtype=np.float64,
-    )
-    R, t = fit_weighted_rigid_transform(
-        centroids_A[[u for u, _ in selected_pairs]],
-        centroids_B[[v for _, v in selected_pairs]],
-        weights=weights,
-    )
-    residuals = np.array(
-        [
-            float(np.linalg.norm(
-                centroids_B[v] - (centroids_A[u] @ R.T + t)
-            ))
-            for u, v in selected_pairs
-        ],
-        dtype=np.float64,
-    )
-
-    # Tukey 1977 fence rule
-    q1, q3 = np.quantile(residuals, [0.25, 0.75])
-    iqr = q3 - q1
-    if iqr <= 0.0:
-        return []
-    fence = q3 + 1.5 * iqr
-
-    return [
-        pair for pair, r in zip(selected_pairs, residuals)
-        if pair not in seed_set and r > fence
-    ]
 
 
 def materialize_macro_section_result(
@@ -1570,13 +1239,11 @@ def score_macro_hypothesis(
             centroids_B[[v for _, v in selected_pairs]],
             weights=weights,
         )
-        sigma_hat = _seed_rigid_scale(
-            centroids_A, centroids_B, selected_pairs, mi_contrib
-        )
+        transform_scale = max(edge_scale_A, edge_scale_B, 1e-12)
         rigid_residuals = [
             float(
                 np.linalg.norm(centroids_B[v] - (centroids_A[u] @ R_sel.T + t_sel))
-                / sigma_hat
+                / transform_scale
             )
             for u, v in selected_pairs
         ]
@@ -1713,18 +1380,14 @@ def extract_continuous_macro_section(
     geodesic_B = compute_graph_geodesics(edge_B_norm)
 
     # 3. Build biologically grounded cluster context descriptors.
-    cluster_hist_A = np.asarray(cluster_cache_A.cluster_hist, dtype=np.float64)
-    cluster_hist_B = np.asarray(cluster_cache_B.cluster_hist, dtype=np.float64)
-    context_feat_A = compute_cluster_context_features(cluster_hist_A, adj_A)
-    context_feat_B = compute_cluster_context_features(cluster_hist_B, adj_B)
+    context_feat_A = np.asarray(cluster_cache_A.mu_struct_neighborhood, dtype=np.float64)
+    context_feat_B = np.asarray(cluster_cache_B.mu_struct_neighborhood, dtype=np.float64)
 
     # 4. Assemble candidate cluster-pairs and their overall evidence.
     matches, match_tiebreak_scores, global_pair_scores, global_pair_evidence, mi_contrib, log_enrichment, diagnostics = collect_candidate_match_pairs(
         Pi_cluster,
         valid_A,
-        valid_B,
-        context_feat_A,
-        context_feat_B,
+        valid_B
     )
     num_matches = len(matches)
     if num_matches == 0:
@@ -1936,3 +1599,4 @@ def extract_continuous_macro_section(
         diagnostics=diagnostics,
         alternative_hypotheses=alternative_hypotheses,
     )
+
