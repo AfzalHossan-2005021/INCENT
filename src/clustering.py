@@ -91,47 +91,48 @@ def build_spatial_graph(coords: np.ndarray):
 # Feature-matrix selection
 # ============================================================================
 
-def _resolve_feature_matrix(adata: AnnData, use_rep: Optional[str], spatial_key: str) -> np.ndarray:
+def _resolve_joint_features(adata: AnnData, use_rep: Optional[str], spatial_key: str, use_celltype: Optional[str]) -> np.ndarray:
     """
-    Return the (n_cells, d) feature matrix on which Ward is fit.
-
-    Resolution order:
-        * use_rep == "spatial"  -> spatial coordinates (legacy behaviour)
-        * use_rep is not None   -> adata.obsm[use_rep]
-        * use_rep is None       -> obsm["X_pca"] if present, else
-                                    densified adata.X (with a sane PCA
-                                    projection if X has many genes)
+    Return the (n_cells, d) feature matrix representing both continuous expression 
+    and categorical cell types.
     """
+    # 1. Resolve continuous gene expression / PCA representation
     if use_rep == "spatial":
-        return np.asarray(adata.obsm[spatial_key], dtype=np.float64)
-    if use_rep is not None:
-        if use_rep not in adata.obsm:
-            raise KeyError(
-                f"use_rep='{use_rep}' not found in adata.obsm. "
-                f"Available keys: {list(adata.obsm.keys())}"
-            )
-        return np.asarray(adata.obsm[use_rep], dtype=np.float64)
-    # Auto: prefer X_pca; else use X (subset to top-N PCs to stay tractable)
-    if "X_pca" in adata.obsm:
-        return np.asarray(adata.obsm["X_pca"], dtype=np.float64)
-    X = adata.X
-    if sp.issparse(X):
-        X = X.toarray()
-    X = np.asarray(X, dtype=np.float64)
-    # If X is wide (e.g. raw genes), project to 30 PCs in a deterministic way
-    # so Ward is tractable. We use a thin SVD, which is deterministic given
-    # input and faster than sklearn's PCA on the (n, g) -> (n, 30) projection.
-    if X.shape[1] > 50:
-        X_centered = X - X.mean(axis=0, keepdims=True)
-        # Truncated SVD via numpy for determinism and zero extra dependency
-        U, S, _Vt = np.linalg.svd(X_centered, full_matrices=False)
-        n_pc = min(30, U.shape[1])
-        return (U[:, :n_pc] * S[:n_pc]).astype(np.float64)
-    return X
+        features = np.asarray(adata.obsm[spatial_key], dtype=np.float64)
+    elif use_rep is not None:
+        features = np.asarray(adata.obsm[use_rep], dtype=np.float64)
+    elif "X_pca" in adata.obsm:
+        features = np.asarray(adata.obsm["X_pca"], dtype=np.float64)
+    else:
+        X = adata.X.toarray() if sp.issparse(adata.X) else np.asarray(adata.X, dtype=np.float64)
+        if X.shape[1] > 50:
+            X_centered = X - X.mean(axis=0, keepdims=True)
+            U, S, _Vt = np.linalg.svd(X_centered, full_matrices=False)
+            n_pc = min(30, U.shape[1])
+            features = (U[:, :n_pc] * S[:n_pc]).astype(np.float64)
+        else:
+            features = X
+
+    # 2. Integrate heavily-weighted Cell Type one-hot encodings if requested
+    if use_celltype is not None and use_celltype in adata.obs.columns:
+        series = adata.obs[use_celltype].astype("category")
+        one_hot = np.zeros((adata.n_obs, len(series.cat.categories)), dtype=np.float64)
+        one_hot[np.arange(adata.n_obs), series.cat.codes] = 1.0
+        
+        # Scale the one-hot vectors so that categorical differences dominate 
+        # local gene expression differences, prioritizing same-type merges.
+        scale_factor = np.std(features, axis=0).max() * 5.0
+        if scale_factor == 0:
+            scale_factor = 1.0
+        
+        one_hot *= scale_factor
+        features = np.hstack([features, one_hot])
+        
+    return features
 
 
 # ============================================================================
-# Gap-statistic K selection (Tibshirani, Walther & Hastie 2001)
+# Ward Integration
 # ============================================================================
 
 def _fit_ward(features: np.ndarray, connectivity: sp.spmatrix, n_clusters: int) -> np.ndarray:
@@ -154,19 +155,15 @@ def cluster_cells_spatial(
     """
     Parameter-free, deterministic biological clustering.
     
-    This function ignores all empirical threshold parameters (k_min, max_cluster_frac, etc.)
-    and enforces a mathematically pure definition of a mesoregion:
-    A connected component within the exact same biological cell type.
-    
-    If use_celltype is provided:
-        A cluster is defined exactly as a Connected Component in the Otsu-filtered Delaunay
-        graph, strictly constrained to cells of identical cell type.
-        This provides 100% deterministic, geometric 1-for-1 overlap matching.
-        
-    If use_celltype is NOT provided (fallback):
-        We use Agglomerative (Ward) clustering on the biological feature space, but using
-        the pure Otsu-filtered Delaunay connectivity. The number of clusters is dynamically
-        extracted via deterministic block sizes.
+    This function generates robust mesoregions by jointly integrating:
+      1. Spatial Coordinates: Otsu-filtered Delaunay graphs restrict clustering strictly 
+         to contiguous physical adjacencies, preventing cross-gap overlaps.
+      2. Gene Expression: Captures underlying continuous biological states.
+      3. Cell Types: Acts as a heavily weighted categorical prior preventing merging
+         of disparate tissues unless forced by noise or isolation.
+         
+    By enforcing a joint agglomeration approach, this solves the 'micro-cluster' 
+    (singleton) fragmentation issue that arises when predicting noisy cell types.
     """
     coords = np.asarray(adata.obsm[spatial_key])
     n_cells = coords.shape[0]
@@ -177,69 +174,21 @@ def cluster_cells_spatial(
     if not edges:
         return np.zeros(n_cells, dtype=int)
 
-    # 2. Pure parameter-free cell-type anchored components
-    if use_celltype is not None:
-        if use_celltype not in adata.obs.columns:
-            raise KeyError(f"use_celltype='{use_celltype}' not found in adata.obs.")
-            
-        types = np.asarray(adata.obs[use_celltype].astype(str).values)
-        
-        nbrs = [[] for _ in range(n_cells)]
-        for i, j in edges:
-            nbrs[i].append(j)
-            nbrs[j].append(i)
-            
-        labels = -np.ones(n_cells, dtype=int)
-        next_id = 0
-        
-        for t in np.unique(types):
-            members = np.where(types == t)[0]
-            if members.size == 0:
-                continue
-                
-            member_set = set(members.tolist())
-            idx_of = {int(m): i for i, m in enumerate(members)}
-            visited = np.zeros(members.size, dtype=bool)
-            
-            for start_idx, m in enumerate(members):
-                if visited[start_idx]:
-                    continue
-                    
-                # BFS to map the connected component of this explicit cell type
-                stack = [int(m)]
-                comp = []
-                while stack:
-                    u = stack.pop()
-                    if visited[idx_of[u]]:
-                        continue
-                    visited[idx_of[u]] = True
-                    comp.append(u)
-                    
-                    for v in nbrs[u]:
-                        if v in member_set and not visited[idx_of[v]]:
-                            stack.append(v)
-                            
-                labels[np.array(comp, dtype=int)] = next_id
-                next_id += 1
-                
-        # Handle detached isolated singletons gracefully
-        unlabeled = np.where(labels == -1)[0]
-        for u in unlabeled:
-            labels[u] = next_id
-            next_id += 1
-            
-        # Relabel contiguous
-        _, final_labels = np.unique(labels, return_inverse=True)
-        return final_labels.astype(int)
-
-    # 3. Fallback: If no cell_types available, fallback to pure Ward linkage
+    # 2. Build the spatial connectivity matrix
     row = np.array([e[0] for e in edges] + [e[1] for e in edges])
     col = np.array([e[1] for e in edges] + [e[0] for e in edges])
     data = np.ones(len(row), dtype=np.float64)
     connectivity = sp.coo_matrix((data, (row, col)), shape=(n_cells, n_cells))
 
-    features = _resolve_feature_matrix(adata, use_rep, spatial_key)
-    # A standard fixed scale when falling back to unsupervised features without parameter hints
+    # 3. Integrate Expression (use_rep) AND Annotations (use_celltype)
+    features = _resolve_joint_features(adata, use_rep, spatial_key, use_celltype)
+    
+    # 4. Use robust structural scale to guarantee sensible cluster sizes, 
+    # independent of random cell-type noisy breaks.
     n_clusters_target = max(2, int((n_cells / 200.0) * resolution))
 
-    return _fit_ward(features, connectivity, n_clusters_target).astype(int)
+    labels = _fit_ward(features, connectivity, n_clusters_target).astype(int)
+    
+    # 5. Ensure contiguous mapping
+    _, final_labels = np.unique(labels, return_inverse=True)
+    return final_labels.astype(int)
