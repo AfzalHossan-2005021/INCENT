@@ -177,39 +177,69 @@ def cluster_cells_spatial(
         W_self = W + sp.eye(n_cells, format='csr')
         W_norm = normalize(W_self, norm='l1', axis=1)
         
-        # 4. Multi-modal 2-Hop Graph Convolution (Smooths out exact salt-and-pepper noise)
+        # 4. Parameter-Free Optimization: Modularity-Maximized Diffusion
+        # Rather than arbitrary fixed "hops" for graph convolution, we diffuse the labels
+        # iteratively and halt exactly when Newman's Modularity (Q) hits its mathematical peak.
         series = adata.obs[use_celltype].astype("category")
         Y = np.zeros((n_cells, len(series.cat.categories)), dtype=np.float64)
         Y[np.arange(n_cells), series.cat.codes] = 1.0
         
-        Y_smooth = W_norm.dot(Y)
-        Y_smooth = W_norm.dot(Y_smooth) # 2nd Hop expands local receptive field
+        m2 = float(W.sum())
+        if m2 == 0:
+            m2 = 1e-12  # Safety fallback if perfectly orthogonal
+            
+        def _get_modularity(labels_seq: np.ndarray) -> float:
+            Q = 0.0
+            degrees = np.array(W.sum(axis=1)).flatten()
+            for c in np.unique(labels_seq):
+                mask = (labels_seq == c)
+                e_c = W[mask, :][:, mask].sum()
+                a_c = degrees[mask].sum()
+                Q += (e_c / m2) - (a_c / m2)**2
+            return Q
+
+        best_Q = -np.inf
+        best_labels = None
+        Y_smooth = Y.copy()
         
-        smoothed_types = np.argmax(Y_smooth, axis=1)
-        
-        # 5. Extract strict Connected Components constrained purely by Smoothed Types
-        nbrs = [[] for _ in range(n_cells)]
-        for i, j in edges:
-            if smoothed_types[i] == smoothed_types[j]:
-                nbrs[i].append(j)
-                nbrs[j].append(i)
+        # Bound execution but primarily driven by the peak of Q optimization
+        for step in range(30):
+            current_types = np.argmax(Y_smooth, axis=1)
+            
+            # 5. Extract strict Connected Components constrained purely by Smoothed Types
+            nbrs = [[] for _ in range(n_cells)]
+            for i, j in edges:
+                if current_types[i] == current_types[j]:
+                    nbrs[i].append(j)
+                    nbrs[j].append(i)
+                    
+            comp_labels = -np.ones(n_cells, dtype=int)
+            next_id = 0
+            for i in range(n_cells):
+                if comp_labels[i] == -1:
+                    stack = [i]
+                    comp_labels[i] = next_id
+                    while stack:
+                        u = stack.pop()
+                        for v in nbrs[u]:
+                            if comp_labels[v] == -1:
+                                comp_labels[v] = next_id
+                                stack.append(v)
+                    next_id += 1
+            
+            current_Q = _get_modularity(comp_labels)
+            
+            if current_Q > best_Q:
+                best_Q = current_Q
+                best_labels = comp_labels
+            else:
+                # Modularity strictly degraded/plateaued; algorithm converged to its structural optimal
+                break
                 
-        labels = -np.ones(n_cells, dtype=int)
-        next_id = 0
-        
-        for i in range(n_cells):
-            if labels[i] == -1:
-                stack = [i]
-                labels[i] = next_id
-                while stack:
-                    u = stack.pop()
-                    for v in nbrs[u]:
-                        if labels[v] == -1:
-                            labels[v] = next_id
-                            stack.append(v)
-                next_id += 1
-                
-        _, final_labels = np.unique(labels, return_inverse=True)
+            # Perform next continuous diffusion hop
+            Y_smooth = W_norm.dot(Y_smooth)
+            
+        _, final_labels = np.unique(best_labels, return_inverse=True)
         return final_labels.astype(int)
 
     # Fallback to standard Ward linkage if no cell types are provided
