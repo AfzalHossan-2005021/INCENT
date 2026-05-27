@@ -82,6 +82,7 @@ class SliceClusterCache:
     mu_struct_neighborhood: np.ndarray
     cluster_hist: np.ndarray
     all_types: np.ndarray
+    cluster_shapes: np.ndarray = field(default_factory=lambda: np.zeros((0, 4), dtype=np.float64))
 
 
 def safe_jensenshannon(p, q):
@@ -183,6 +184,8 @@ def build_slice_cluster_cache(
 
     mu_struct = np.concatenate([mu_struct_local, mu_struct_neighborhood], axis=1)
 
+    cluster_shapes = compute_cluster_shape_descriptors(coords, np.asarray(labels), valid)
+
     return SliceClusterCache(
         labels=np.asarray(labels),
         masses=masses,
@@ -193,6 +196,7 @@ def build_slice_cluster_cache(
         mu_struct_neighborhood=mu_struct_neighborhood,
         cluster_hist=cluster_hist,
         all_types=all_types,
+        cluster_shapes=cluster_shapes,
     )
 
 
@@ -555,7 +559,155 @@ def equal_area_ring_edges(max_radius, n_rings):
     return max_radius * np.sqrt(np.linspace(0.0, 1.0, int(n_rings) + 1))
 
 
-def collect_candidate_match_pairs(Pi_cluster, valid_A, valid_B, context_feat_A, context_feat_B):
+def compute_cluster_shape_descriptors(coords, labels, valid_mask):
+    """
+    Compute rigid-invariant morphological descriptors for every cluster.
+
+    Each cluster is summarised by four scalars derived from the spatial inertia
+    tensor (eigenvalue decomposition of the within-cluster position covariance):
+
+      • log_aspect_ratio  = log(λ_max / λ_min)
+        Zero for a perfectly isotropic (circular) cluster; grows for elongated
+        clusters. The logarithm makes the metric symmetric under eigenvalue swap.
+
+      • eccentricity      = sqrt(1 - λ_min / λ_max)
+        Zero for a disc, approaching one for a degenerate line segment.
+
+      • normalised_rg     = sqrt(λ_max + λ_min) / log(1 + n)
+        Radius of gyration divided by a log-size factor so clusters with very
+        different cell counts remain comparable.
+
+      • log_cluster_size  = log(1 + n)
+        Log cell count; penalises pairings with implausible cell-count mismatch.
+
+    All four descriptors are invariant to rigid motion (translation + rotation),
+    making cross-slice comparison meaningful before any alignment is performed.
+    They are intentionally NOT scale-invariant, so pairings that imply an
+    implausible physical-scale change between sections are penalised.
+    """
+    unique_labels = np.unique(labels)
+    n_clusters = len(unique_labels)
+    descriptors = np.zeros((n_clusters, 4), dtype=np.float64)
+
+    for cluster_idx, cluster_id in enumerate(unique_labels):
+        if not valid_mask[cluster_idx]:
+            continue
+        c_coords = coords[labels == cluster_id]
+        n = int(len(c_coords))
+        descriptors[cluster_idx, 3] = float(np.log1p(n))
+        if n < 2:
+            continue
+
+        center = c_coords.mean(axis=0)
+        rel    = c_coords - center                    # (n, 2)
+        cov    = rel.T @ rel / n                      # (2, 2)
+        eigvals = np.maximum(np.linalg.eigvalsh(cov), 0.0)   # ascending
+
+        lam_max = max(float(eigvals[-1]), 1e-12)
+        lam_min = max(float(eigvals[0]),  1e-12)
+
+        log_ar  = float(np.log(lam_max / lam_min))
+        ecc     = float(np.sqrt(max(1.0 - lam_min / lam_max, 0.0)))
+        rg      = float(np.sqrt(lam_max + lam_min))
+        norm_rg = rg / max(float(np.log1p(n)), 1.0)
+
+        descriptors[cluster_idx] = [log_ar, ecc, norm_rg, float(np.log1p(n))]
+
+    return descriptors
+
+
+def compute_pairwise_cluster_shape_similarity(shapes_A, shapes_B):
+    """
+    Pairwise rigid-invariant shape similarity matrix (C_A × C_B).
+
+    Both descriptor matrices are jointly range-normalised to [0, 1] before
+    computing L2 distances.  The negative distance is returned so that higher
+    values indicate more similar shapes, consistent with the sign convention
+    used by ``empirical_logit_evidence``.
+    """
+    combined  = np.vstack([shapes_A, shapes_B])
+    col_min   = combined.min(axis=0)
+    col_range = np.maximum(combined.max(axis=0) - col_min, 1e-12)
+
+    nA = (shapes_A - col_min) / col_range    # (C_A, 4)
+    nB = (shapes_B - col_min) / col_range    # (C_B, 4)
+
+    diff = nA[:, None, :] - nB[None, :, :]  # (C_A, C_B, 4)
+    return -np.linalg.norm(diff, axis=-1)   # negative distance → higher=better
+
+
+def compute_motif_rigidity_residual(centroids_A, centroids_B, motif_pairs, mi_contrib=None):
+    """
+    Shape-consistency residual for a seed motif configuration.
+
+    Measures how well the spatial arrangement of cluster centroids in slice A
+    maps onto their counterparts in slice B under the best admissible rigid
+    transform (rotation + translation, reflections allowed). The residual is
+    scale-normalised and motif-size-aware:
+
+    • Singleton (n=1): 0.0 — any single point maps perfectly.
+
+    • Edge      (n=2): |log(d_B / d_A)| where d is the inter-centroid distance.
+      Two-point shapes are trivially identical under partial Procrustes, so the
+      only meaningful cue is whether the edge length is consistent between slices.
+
+    • Triangle+ (n≥3): weighted partial Procrustes shape residual (Kendall
+      shape distance). Point sets are centred, Frobenius-normalised, then aligned
+      by optimal rotation (SVD). A value of 0 means identical shape; the maximum
+      for 2-D triangles is sqrt(2).
+
+    The ``mi_contrib`` matrix, when supplied, is used to weight each matched pair
+    so that pairs with stronger transport support have more influence on the
+    estimated transform.
+    """
+    n = len(motif_pairs)
+    if n < 2:
+        return 0.0
+
+    src = centroids_A[[u for u, _ in motif_pairs]].astype(np.float64)
+    tgt = centroids_B[[v for _, v in motif_pairs]].astype(np.float64)
+
+    if mi_contrib is not None:
+        w = np.array([max(float(mi_contrib[u, v]), 1e-12) for u, v in motif_pairs])
+        w /= w.sum()
+    else:
+        w = np.ones(n, dtype=np.float64) / n
+
+    if n == 2:
+        d_A = float(np.linalg.norm(src[0] - src[1]))
+        d_B = float(np.linalg.norm(tgt[0] - tgt[1]))
+        if d_A < 1e-12 or d_B < 1e-12:
+            return 0.0
+        return float(abs(np.log(d_B / d_A)))
+
+    # Triangle+: weighted partial Procrustes shape distance
+    src_c = src - (w[:, None] * src).sum(axis=0)
+    tgt_c = tgt - (w[:, None] * tgt).sum(axis=0)
+
+    s_src = float(np.sqrt(max(np.sum(w * np.sum(src_c ** 2, axis=1)), 1e-24)))
+    s_tgt = float(np.sqrt(max(np.sum(w * np.sum(tgt_c ** 2, axis=1)), 1e-24)))
+    if s_src < 1e-12 or s_tgt < 1e-12:
+        return 0.0
+
+    src_n = src_c / s_src
+    tgt_n = tgt_c / s_tgt
+
+    U, _, Vt = np.linalg.svd((w[:, None] * src_n).T @ tgt_n)
+    R        = Vt.T @ U.T
+    aligned  = src_n @ R.T
+
+    return float(np.sqrt(max(np.sum(w * np.sum((tgt_n - aligned) ** 2, axis=1)), 0.0)))
+
+
+def collect_candidate_match_pairs(
+    Pi_cluster,
+    valid_A,
+    valid_B,
+    context_feat_A,
+    context_feat_B,
+    shape_A=None,
+    shape_B=None,
+):
     """
     Assemble transport-supported cluster pairs and their overall evidence.
 
@@ -618,16 +770,33 @@ def collect_candidate_match_pairs(Pi_cluster, valid_A, valid_B, context_feat_A, 
     mi_evidence = empirical_logit_evidence(mi_signal, larger_is_better=True)
     context_evidence = empirical_logit_evidence(context_signal, larger_is_better=True)
 
+    # --- Shape similarity channel (rigid-invariant per-cluster morphology) ------
+    # When shape descriptors are available, compute pairwise shape similarity
+    # between matched clusters and convert to empirical logit evidence. This
+    # penalises candidate pairs where one cluster is elongated and the other
+    # is isotropic, or where cluster sizes differ implausibly, without
+    # introducing any scale or orientation assumption.
+    if shape_A is not None and shape_B is not None:
+        shape_sim_matrix = compute_pairwise_cluster_shape_similarity(shape_A, shape_B)
+        shape_signal = np.array(
+            [float(shape_sim_matrix[u, v]) for u, v in matches],
+            dtype=np.float64,
+        )
+        shape_evidence = empirical_logit_evidence(shape_signal, larger_is_better=True)
+    else:
+        shape_evidence = np.zeros(len(matches), dtype=np.float64)
+
     global_pair_evidence = {
-        pair: float(me + ce)
-        for pair, me, ce in zip(matches, mi_evidence, context_evidence)
+        pair: float(me + ce + se)
+        for pair, me, ce, se in zip(matches, mi_evidence, context_evidence, shape_evidence)
     }
     global_pair_scores = np.array([global_pair_evidence[pair] for pair in matches], dtype=np.float64)
 
     diagnostics = {
         "num_positive_mass_pairs": int(np.sum(Pi_cluster > 0)),
         "num_enriched_pairs": int(np.sum(log_enrichment > 0)),
-        "transport_score_mode": "mi_plus_context_primary_enrichment_tiebreak",
+        "transport_score_mode": "mi_plus_context_plus_shape_primary_enrichment_tiebreak",
+        "shape_channel_active": shape_A is not None and shape_B is not None,
     }
     return matches, enrichment_signal, global_pair_scores, global_pair_evidence, mi_contrib, log_enrichment, diagnostics
 
@@ -976,7 +1145,17 @@ def solve_seed_assignment(matches, pair_scores):
     return np.array(sorted(selected), dtype=int)
 
 
-def rank_seed_motifs(match_adj, match_scores, allowed_indices, match_tiebreak_scores=None):
+def rank_seed_motifs(
+    match_adj,
+    match_scores,
+    allowed_indices,
+    match_tiebreak_scores=None,
+    matches=None,
+    centroids_A=None,
+    centroids_B=None,
+    mi_contrib=None,
+    rigidity_weight=1.0,
+):
     """
     Enumerate admissible seed motifs in deterministic score order.
 
@@ -999,16 +1178,35 @@ def rank_seed_motifs(match_adj, match_scores, allowed_indices, match_tiebreak_sc
     allowed = set(allowed_indices.tolist())
     ranked = {3: [], 2: [], 1: []}
 
+    # Rigidity bonus: lower Procrustes residual → higher bonus.
+    # Active only when centroids and matches are supplied; otherwise all
+    # bonuses are zero so existing behaviour is fully preserved.
+    _use_rigidity = (matches is not None and centroids_A is not None
+                     and centroids_B is not None)
+
+    def _rig_bonus(indices_tuple):
+        if not _use_rigidity or len(indices_tuple) < 2:
+            return 0.0
+        motif_pairs = [matches[i] for i in indices_tuple]
+        residual = compute_motif_rigidity_residual(
+            centroids_A, centroids_B, motif_pairs, mi_contrib
+        )
+        # log1p bounds the penalty; weight controls its contribution
+        return -float(rigidity_weight) * float(np.log1p(residual))
+
     for i in allowed_indices:
-        ranked[1].append((float(match_scores[i]), float(match_tiebreak_scores[i]), (int(i),)))
+        idx_t = (int(i),)
+        ranked[1].append((float(match_scores[i]) + _rig_bonus(idx_t),
+                          float(match_tiebreak_scores[i]), idx_t))
 
     for i_pos, i in enumerate(allowed_indices):
         for j in allowed_indices[i_pos + 1:]:
             if match_adj[i, j]:
+                idx_t = tuple(sorted((int(i), int(j))))
                 ranked[2].append((
-                    float(match_scores[i] + match_scores[j]),
+                    float(match_scores[i] + match_scores[j]) + _rig_bonus(idx_t),
                     float(match_tiebreak_scores[i] + match_tiebreak_scores[j]),
-                    tuple(sorted((int(i), int(j))))
+                    idx_t,
                 ))
 
     for i_pos, i in enumerate(allowed_indices):
@@ -1018,10 +1216,11 @@ def rank_seed_motifs(match_adj, match_scores, allowed_indices, match_tiebreak_sc
                 continue
             for k in allowed_indices[j_pos + 1:]:
                 if k in allowed and match_adj[i, k] and match_adj[j, k]:
+                    idx_t = tuple(sorted((int(i), int(j), int(k))))
                     ranked[3].append((
-                        float(match_scores[i] + match_scores[j] + match_scores[k]),
+                        float(match_scores[i] + match_scores[j] + match_scores[k]) + _rig_bonus(idx_t),
                         float(match_tiebreak_scores[i] + match_tiebreak_scores[j] + match_tiebreak_scores[k]),
-                        tuple(sorted((int(i), int(j), int(k))))
+                        idx_t,
                     ))
 
     for motif_size in ranked:
@@ -1064,7 +1263,17 @@ def solve_frontier_assignment(frontier_A, frontier_B, candidate_pairs, candidate
     return selected
 
 
-def select_initial_match_components(matches, match_adj, match_scores, match_tiebreak_scores=None, top_k=3):
+def select_initial_match_components(
+    matches,
+    match_adj,
+    match_scores,
+    match_tiebreak_scores=None,
+    top_k=3,
+    centroids_A=None,
+    centroids_B=None,
+    mi_contrib=None,
+    rigidity_weight=1.0,
+):
     """
     Enumerate the top seed motifs to be expanded as competing macro hypotheses.
 
@@ -1101,6 +1310,11 @@ def select_initial_match_components(matches, match_adj, match_scores, match_tieb
         match_scores,
         assigned_indices,
         match_tiebreak_scores=match_tiebreak_scores,
+        matches=matches,
+        centroids_A=centroids_A,
+        centroids_B=centroids_B,
+        mi_contrib=mi_contrib,
+        rigidity_weight=rigidity_weight,
     )
     ordered_records = []
     best_size = None
@@ -1402,6 +1616,8 @@ def extract_continuous_macro_section(
         valid_B,
         context_feat_A,
         context_feat_B,
+        shape_A=cluster_cache_A.cluster_shapes if cluster_cache_A.cluster_shapes.shape[0] > 0 else None,
+        shape_B=cluster_cache_B.cluster_shapes if cluster_cache_B.cluster_shapes.shape[0] > 0 else None,
     )
     num_matches = len(matches)
     if num_matches == 0:
@@ -1428,6 +1644,9 @@ def extract_continuous_macro_section(
         global_pair_scores,
         match_tiebreak_scores=match_tiebreak_scores,
         top_k=3,
+        centroids_A=centroids_A,
+        centroids_B=centroids_B,
+        mi_contrib=mi_contrib,
     )
     diagnostics.update(seed_diagnostics)
     if len(seed_index_trials) == 0:
