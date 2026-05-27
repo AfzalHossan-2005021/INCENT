@@ -1595,8 +1595,8 @@ def extract_continuous_macro_section(
         Pi_cluster,
         valid_A,
         valid_B,
-        shape_A=cluster_cache_A.cluster_shapes if cluster_cache_A.cluster_shapes.shape[0] > 0 else None,
-        shape_B=cluster_cache_B.cluster_shapes if cluster_cache_B.cluster_shapes.shape[0] > 0 else None,
+        shape_A=None,
+        shape_B=None,
     )
     num_matches = len(matches)
     if num_matches == 0:
