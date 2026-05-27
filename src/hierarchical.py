@@ -79,10 +79,8 @@ class SliceClusterCache:
     valid: np.ndarray
     mu_expr: np.ndarray
     mu_struct: np.ndarray
-    mu_struct_neighborhood: np.ndarray
     cluster_hist: np.ndarray
     all_types: np.ndarray
-    cluster_shapes: np.ndarray = field(default_factory=lambda: np.zeros((0, 4), dtype=np.float64))
 
 
 def safe_jensenshannon(p, q):
@@ -179,11 +177,6 @@ def build_slice_cluster_cache(
             flat_local /= flat_local.sum()
         mu_struct_local[cluster_idx] = flat_local
 
-    adjacency, _ = build_cluster_contact_graph(coords, labels, valid)
-    mu_struct_neighborhood = compute_cluster_context_features(mu_struct_local, adjacency)
-
-    cluster_shapes = compute_cluster_shape_descriptors(coords, np.asarray(labels), valid)
-
     return SliceClusterCache(
         labels=np.asarray(labels),
         masses=masses,
@@ -191,10 +184,8 @@ def build_slice_cluster_cache(
         valid=valid,
         mu_expr=mu_expr,
         mu_struct=mu_struct_local,
-        mu_struct_neighborhood=mu_struct_neighborhood,
         cluster_hist=cluster_hist,
-        all_types=all_types,
-        cluster_shapes=cluster_shapes,
+        all_types=all_types
     )
 
 
@@ -557,83 +548,6 @@ def equal_area_ring_edges(max_radius, n_rings):
     return max_radius * np.sqrt(np.linspace(0.0, 1.0, int(n_rings) + 1))
 
 
-def compute_cluster_shape_descriptors(coords, labels, valid_mask):
-    """
-    Compute rigid-invariant morphological descriptors for every cluster.
-
-    Each cluster is summarised by four scalars derived from the spatial inertia
-    tensor (eigenvalue decomposition of the within-cluster position covariance):
-
-      • log_aspect_ratio  = log(λ_max / λ_min)
-        Zero for a perfectly isotropic (circular) cluster; grows for elongated
-        clusters. The logarithm makes the metric symmetric under eigenvalue swap.
-
-      • eccentricity      = sqrt(1 - λ_min / λ_max)
-        Zero for a disc, approaching one for a degenerate line segment.
-
-      • normalised_rg     = sqrt(λ_max + λ_min) / log(1 + n)
-        Radius of gyration divided by a log-size factor so clusters with very
-        different cell counts remain comparable.
-
-      • log_cluster_size  = log(1 + n)
-        Log cell count; penalises pairings with implausible cell-count mismatch.
-
-    All four descriptors are invariant to rigid motion (translation + rotation),
-    making cross-slice comparison meaningful before any alignment is performed.
-    They are intentionally NOT scale-invariant, so pairings that imply an
-    implausible physical-scale change between sections are penalised.
-    """
-    unique_labels = np.unique(labels)
-    n_clusters = len(unique_labels)
-    descriptors = np.zeros((n_clusters, 4), dtype=np.float64)
-
-    for cluster_idx, cluster_id in enumerate(unique_labels):
-        if not valid_mask[cluster_idx]:
-            continue
-        c_coords = coords[labels == cluster_id]
-        n = int(len(c_coords))
-        descriptors[cluster_idx, 3] = float(np.log1p(n))
-        if n < 2:
-            continue
-
-        center = c_coords.mean(axis=0)
-        rel    = c_coords - center                    # (n, 2)
-        cov    = rel.T @ rel / n                      # (2, 2)
-        eigvals = np.maximum(np.linalg.eigvalsh(cov), 0.0)   # ascending
-
-        lam_max = max(float(eigvals[-1]), 1e-12)
-        lam_min = max(float(eigvals[0]),  1e-12)
-
-        log_ar  = float(np.log(lam_max / lam_min))
-        ecc     = float(np.sqrt(max(1.0 - lam_min / lam_max, 0.0)))
-        rg      = float(np.sqrt(lam_max + lam_min))
-        norm_rg = rg / max(float(np.log1p(n)), 1.0)
-
-        descriptors[cluster_idx] = [log_ar, ecc, norm_rg, float(np.log1p(n))]
-
-    return descriptors
-
-
-def compute_pairwise_cluster_shape_similarity(shapes_A, shapes_B):
-    """
-    Pairwise rigid-invariant shape similarity matrix (C_A × C_B).
-
-    Both descriptor matrices are jointly range-normalised to [0, 1] before
-    computing L2 distances.  The negative distance is returned so that higher
-    values indicate more similar shapes, consistent with the sign convention
-    used by ``empirical_logit_evidence``.
-    """
-    combined  = np.vstack([shapes_A, shapes_B])
-    col_min   = combined.min(axis=0)
-    col_range = np.maximum(combined.max(axis=0) - col_min, 1e-12)
-
-    nA = (shapes_A - col_min) / col_range    # (C_A, 4)
-    nB = (shapes_B - col_min) / col_range    # (C_B, 4)
-
-    diff = nA[:, None, :] - nB[None, :, :]  # (C_A, C_B, 4)
-    return -np.linalg.norm(diff, axis=-1)   # negative distance → higher=better
-
-
 def compute_motif_rigidity_residual(centroids_A, centroids_B, motif_pairs, mi_contrib=None):
     """
     Shape-consistency residual for a seed motif configuration.
@@ -701,8 +615,6 @@ def collect_candidate_match_pairs(
     Pi_cluster,
     valid_A,
     valid_B,
-    shape_A=None,
-    shape_B=None,
 ):
     """
     Assemble transport-supported cluster pairs and their overall evidence.
@@ -754,33 +666,16 @@ def collect_candidate_match_pairs(
 
     mi_evidence = empirical_logit_evidence(mi_signal, larger_is_better=True)
 
-    # --- Shape similarity channel (rigid-invariant per-cluster morphology) ------
-    # When shape descriptors are available, compute pairwise shape similarity
-    # between matched clusters and convert to empirical logit evidence. This
-    # penalises candidate pairs where one cluster is elongated and the other
-    # is isotropic, or where cluster sizes differ implausibly, without
-    # introducing any scale or orientation assumption.
-    if shape_A is not None and shape_B is not None:
-        shape_sim_matrix = compute_pairwise_cluster_shape_similarity(shape_A, shape_B)
-        shape_signal = np.array(
-            [float(shape_sim_matrix[u, v]) for u, v in matches],
-            dtype=np.float64,
-        )
-        shape_evidence = empirical_logit_evidence(shape_signal, larger_is_better=True)
-    else:
-        shape_evidence = np.zeros(len(matches), dtype=np.float64)
-
     global_pair_evidence = {
-        pair: float(me + se)
-        for pair, me, se in zip(matches, mi_evidence, shape_evidence)
+        pair: float(me)
+        for pair, me in zip(matches, mi_evidence)
     }
     global_pair_scores = np.array([global_pair_evidence[pair] for pair in matches], dtype=np.float64)
 
     diagnostics = {
         "num_positive_mass_pairs": int(np.sum(Pi_cluster > 0)),
         "num_enriched_pairs": int(np.sum(log_enrichment > 0)),
-        "transport_score_mode": "mi_plus_shape_primary_enrichment_tiebreak",
-        "shape_channel_active": shape_A is not None and shape_B is not None,
+        "transport_score_mode": "mi_primary_enrichment_tiebreak",
     }
     return matches, enrichment_signal, global_pair_scores, global_pair_evidence, mi_contrib, log_enrichment, diagnostics
 
@@ -1595,8 +1490,6 @@ def extract_continuous_macro_section(
         Pi_cluster,
         valid_A,
         valid_B,
-        shape_A=None,
-        shape_B=None,
     )
     num_matches = len(matches)
     if num_matches == 0:
