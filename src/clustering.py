@@ -32,8 +32,12 @@ from typing import Optional
 def build_spatial_graph(coords: np.ndarray):
     """
     Builds a spatial connectivity graph (adjacency matrix/edge list).
-    Uses a parameter-free Otsu's thresholding on edge lengths to automatically
-    remove spurious long edges that bridge tissue gaps or concave boundaries.
+    Uses a Local Adaptive Graph approach to remove spurious long edges 
+    (tissue gaps/concave boundaries) without fragmenting sparse regions.
+    
+    This replaces the global Otsu threshold, which caused arbitrary 
+    fragmentation ("small clusters") in sparse tissue and violated 
+    truncation-invariance.
     
     Args:
         coords: Spatial coordinates array shape (N, 2).
@@ -45,24 +49,38 @@ def build_spatial_graph(coords: np.ndarray):
     tri = Delaunay(coords)
     indptr, indices = tri.vertex_neighbor_vertices
     
+    # Pre-calculate local median edge lengths for adaptive filtering
+    local_medians = np.zeros(n_cells, dtype=np.float64)
+    for i in range(n_cells):
+        start, end = indptr[i], indptr[i+1]
+        if end > start:
+            neighbor_coords = coords[indices[start:end]]
+            dists = np.linalg.norm(neighbor_coords - coords[i], axis=1)
+            local_medians[i] = np.median(dists)
+            
     raw_edges = []
-    lengths = []
+    ratios = []
     
     for i in range(n_cells):
         for j in indices[indptr[i]:indptr[i + 1]]:
             if i < j:  # Avoid duplicates
                 d = np.linalg.norm(coords[i] - coords[j])
+                
+                # 1. Project physical distance into a scale-invariant ratio
+                scale = min(local_medians[i], local_medians[j])
+                r = d / scale if scale > 0 else 1.0
+                ratios.append(r)
                 raw_edges.append((i, j))
-                lengths.append(d)
-
-    if not lengths:
+                
+    if not ratios:
         return []
-        
-    lengths = np.array(lengths)
+
+    ratios = np.array(ratios)
     
-    # Parameter-free Otsu thresholding to drop spurious boundary-spanning Delaunay edges
-    bins = min(100, len(lengths))
-    hist, bin_edges = np.histogram(lengths, bins=bins)
+    # 2. Parameter-Free Separation: Instead of arbitrary heuristic limits, 
+    # compute the statistically optimal variance cutoff via Otsu on the ratios.
+    bins = min(100, len(ratios))
+    hist, bin_edges = np.histogram(ratios, bins=bins)
     hist = hist / np.sum(hist)
     bin_centers = (bin_edges[:-1] + bin_edges[1:]) / 2.0
     
@@ -72,16 +90,14 @@ def build_spatial_graph(coords: np.ndarray):
     mu_cumsum = np.cumsum(hist * bin_centers)
     mu1 = mu_cumsum / np.maximum(w1, 1e-12)
     mu_total = mu_cumsum[-1]
-    
     mu2 = (mu_total - mu_cumsum) / np.maximum(w2, 1e-12)
     
     variance_between = w1 * w2 * (mu1 - mu2) ** 2
-    optimal_idx = np.argmax(variance_between)
-    threshold = bin_centers[optimal_idx]
+    optimal_multiplier = bin_centers[np.argmax(variance_between)]
 
     edges = []
-    for (i, j), length in zip(raw_edges, lengths):
-        if length <= threshold:
+    for (i, j), r in zip(raw_edges, ratios):
+        if r <= optimal_multiplier:
             edges.append((i, j))
 
     return edges
