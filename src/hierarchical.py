@@ -181,9 +181,6 @@ def build_slice_cluster_cache(
     adjacency, _ = build_cluster_contact_graph(coords, labels, valid)
     mu_struct_neighborhood = compute_cluster_context_features(mu_struct_local, adjacency)
 
-    global_shape = compute_cluster_global_shape_features(coords, centroids)
-    mu_struct = np.concatenate([mu_struct_local, mu_struct_neighborhood], axis=1)
-
 
     return SliceClusterCache(
         labels=np.asarray(labels),
@@ -191,7 +188,7 @@ def build_slice_cluster_cache(
         centroids=centroids,
         valid=valid,
         mu_expr=mu_expr,
-        mu_struct=mu_struct,
+        mu_struct=mu_struct_local,
         mu_struct_neighborhood=mu_struct_neighborhood,
         cluster_hist=cluster_hist,
         all_types=all_types,
@@ -701,7 +698,7 @@ def compute_cluster_global_shape_features(coords, centroids, n_rings=6, harmonic
     return features
 
 
-def collect_candidate_match_pairs(Pi_cluster, valid_A, valid_B, context_feat_A, context_feat_B):
+def collect_candidate_match_pairs(Pi_cluster, valid_A, valid_B):
     """
     Assemble transport-supported cluster pairs and their overall evidence.
 
@@ -716,9 +713,7 @@ def collect_candidate_match_pairs(Pi_cluster, valid_A, valid_B, context_feat_A, 
     The primary transport-derived score is the per-pair mutual-information
     contribution, which already combines pair specificity with matched mass.
     Log-enrichment is retained only as a secondary tie-break so that transport
-    evidence is not double-counted additively. The remaining evidence channel
-    comes from local niche context, keeping macro-section extraction grounded in
-    transport support plus local biology/topology only.
+    evidence is not double-counted additively.
     """
     log_enrichment = compute_pairwise_log_enrichment(Pi_cluster)
     mi_contrib = compute_pairwise_mutual_information_contribution(Pi_cluster)
@@ -740,7 +735,6 @@ def collect_candidate_match_pairs(Pi_cluster, valid_A, valid_B, context_feat_A, 
     matches = []
     mi_signal = []
     enrichment_signal = []
-    context_signal = []
     for idx in sorted_idx:
         u, v = np.unravel_index(idx, Pi_cluster.shape)
         if not (valid_A[u] and valid_B[v]):
@@ -750,30 +744,21 @@ def collect_candidate_match_pairs(Pi_cluster, valid_A, valid_B, context_feat_A, 
         mi_signal.append(float(mi_contrib[u, v]))
         enrichment_signal.append(float(log_enrichment[u, v]))
 
-        feat_A = context_feat_A[u]
-        feat_B = context_feat_B[v]
-        if feat_A.sum() <= 0 and feat_B.sum() <= 0:
-            context_signal.append(0.0)
-        else:
-            context_signal.append(float(-safe_jensenshannon(feat_A, feat_B)))
-
     mi_signal = np.asarray(mi_signal, dtype=np.float64)
     enrichment_signal = np.asarray(enrichment_signal, dtype=np.float64)
-    context_signal = np.asarray(context_signal, dtype=np.float64)
 
     mi_evidence = empirical_logit_evidence(mi_signal, larger_is_better=True)
-    context_evidence = empirical_logit_evidence(context_signal, larger_is_better=True)
 
     global_pair_evidence = {
-        pair: float(me + ce)
-        for pair, me, ce in zip(matches, mi_evidence, context_evidence)
+        pair: float(me)
+        for pair, me in zip(matches, mi_evidence)
     }
     global_pair_scores = np.array([global_pair_evidence[pair] for pair in matches], dtype=np.float64)
 
     diagnostics = {
         "num_positive_mass_pairs": int(np.sum(Pi_cluster > 0)),
         "num_enriched_pairs": int(np.sum(log_enrichment > 0)),
-        "transport_score_mode": "mi_plus_context_primary_enrichment_tiebreak",
+        "transport_score_mode": "mi_primary_enrichment_tiebreak",
     }
     return matches, enrichment_signal, global_pair_scores, global_pair_evidence, mi_contrib, log_enrichment, diagnostics
 
@@ -1616,8 +1601,8 @@ def extract_continuous_macro_section(
     growth heuristics. It proceeds in two stages:
 
     1. Seed selection:
-       Transport-supported cluster-pairs are scored by transport enrichment
-       and local niche context.
+         Transport-supported cluster-pairs are scored by transport-derived
+         evidence and log-enrichment.
        A deterministic one-to-one seed assignment is computed first, and the
        top few connected seed motifs are retained by total seed evidence, with
        larger motifs used as a topology-aware tie-break. This preserves the
@@ -1628,9 +1613,9 @@ def extract_continuous_macro_section(
        Starting from each seed motif, the method grows both slices jointly on
        the product graph of admissible cluster-pairs. The expansion keeps all
        positive-mass transport pairs available, but accepts frontier pairs only
-       when they are jointly supported by transport/context evidence, support
-       from already selected neighboring matches, and, once orientation is
-       identifiable, rigid consistency under the current
+         when they are jointly supported by transport evidence, support from
+         already selected neighboring matches, and, once orientation is
+         identifiable, rigid consistency under the current
        seed-derived transform. The final macro-overlap is the expanded
        hypothesis with the highest total node-and-edge evidence.
 
@@ -1712,22 +1697,13 @@ def extract_continuous_macro_section(
     geodesic_A = compute_graph_geodesics(edge_A_norm)
     geodesic_B = compute_graph_geodesics(edge_B_norm)
 
-    # 3. Build biologically grounded cluster context descriptors.
-    cluster_hist_A = np.asarray(cluster_cache_A.cluster_hist, dtype=np.float64)
-    cluster_hist_B = np.asarray(cluster_cache_B.cluster_hist, dtype=np.float64)
-    context_feat_A = compute_cluster_context_features(cluster_hist_A, adj_A)
-    context_feat_B = compute_cluster_context_features(cluster_hist_B, adj_B)
-
-    # 4. Assemble candidate cluster-pairs and their overall evidence.
+    # 3. Assemble candidate cluster-pairs and their overall evidence.
     matches, match_tiebreak_scores, global_pair_scores, global_pair_evidence, mi_contrib, log_enrichment, diagnostics = collect_candidate_match_pairs(
         Pi_cluster,
         valid_A,
         valid_B,
-        context_feat_A,
-        context_feat_B,
     )
-    num_matches = len(matches)
-    if num_matches == 0:
+    if len(matches) == 0:
         return empty_macro_section_result(
             N,
             M,
