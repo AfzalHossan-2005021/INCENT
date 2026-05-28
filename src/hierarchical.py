@@ -181,15 +181,13 @@ def build_slice_cluster_cache(
     adjacency, _ = build_cluster_contact_graph(coords, labels, valid)
     mu_struct_neighborhood = compute_cluster_context_features(mu_struct_local, adjacency)
 
-    mu_struct = np.concatenate([mu_struct_local, mu_struct_neighborhood], axis=1)
-
     return SliceClusterCache(
         labels=np.asarray(labels),
         masses=masses,
         centroids=centroids,
         valid=valid,
         mu_expr=mu_expr,
-        mu_struct=mu_struct,
+        mu_struct=mu_struct_local,
         mu_struct_neighborhood=mu_struct_neighborhood,
         cluster_hist=cluster_hist,
         all_types=all_types,
