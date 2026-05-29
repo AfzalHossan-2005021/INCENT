@@ -71,7 +71,7 @@ def to_backend(x, nx, data_type=None, reference=None):
     return x_nx
 
 
-def fused_gromov_wasserstein_incent(M, C1, C2, p, q, G_init = None, alpha = 0.1, reg_compact=1.0, armijo=True, log=False, numItermax=6000, numItermaxEmd=100000, tol_rel=1e-9, tol_abs=1e-9, verbose=False, **kwargs):
+def fused_gromov_wasserstein_incent(M, C1, C2, p, q, G_init = None, alpha = 0.1, armijo=False, log=False, numItermax=6000, numItermaxEmd=100000, tol_rel=1e-9, tol_abs=1e-9, verbose=False, **kwargs):
     """
     This method is written by Anup Bhowmik, CSE, BUET
 
@@ -96,7 +96,6 @@ def fused_gromov_wasserstein_incent(M, C1, C2, p, q, G_init = None, alpha = 0.1,
     # loss_fun: loss function to use (square loss)
     # alpha: step size
     # armijo: whether to use armijo line search
-    # reg_compact: the quadratic compactness regularizer coefficient (Form B)
     # log: whether to print log
     # numItermax: maximum number of iterations
     # tol_rel: relative tolerance
@@ -116,31 +115,13 @@ def fused_gromov_wasserstein_incent(M, C1, C2, p, q, G_init = None, alpha = 0.1,
         G0 = (1/nx.sum(G_init)) * G_init
     G0 = to_backend(G0, nx)
 
-    p_inv = 1.0 / nx.maximum(p, 1e-12)
-    q_inv = 1.0 / nx.maximum(q, 1e-12)
-
-    C1_sq = C1 ** 2
-    C2_sq = C2 ** 2
-
     def f(G):
         # Base Gromov-Wasserstein term
-        gw_loss = nx.sum((G @ G.T)  * C1) + nx.sum((G.T @ G)  * C2)
-        # Form A Compactness penalty requires squared distances for precise variance
-        if reg_compact > 0:
-            compact_fwd = 0.5 * nx.sum((p_inv[:, None] * G) @ C2_sq * G)
-            compact_rev = 0.5 * nx.sum(C1_sq @ (G * q_inv[None, :]) * G)
-            return gw_loss + reg_compact * (compact_fwd + compact_rev)
-        return gw_loss
+        return nx.sum((G @ G.T)  * C1) + nx.sum((G.T @ G)  * C2)
 
     def df(G):
         # Gradient of GW term
-        gw_grad = 2 * (nx.dot(C1, G) + nx.dot(G, C2))
-        # Gradient of Form A Compactness term
-        if reg_compact > 0:
-            grad_fwd = (p_inv[:, None] * G) @ C2_sq
-            grad_rev = C1_sq @ (G * q_inv[None, :])
-            return gw_grad + reg_compact * (grad_fwd + grad_rev)
-        return gw_grad
+        return 2 * (nx.dot(C1, G) + nx.dot(G, C2))
 
     if armijo:
         def line_search(cost, G, deltaG, Mi, cost_G, df_G, **kwargs):
@@ -234,9 +215,7 @@ def jensenshannon_distance_1_vs_many_backend(X, Y):
 
 
 def jensenshannon_divergence_backend(X, Y):
-    """
-    This function is added ny Nuwaisir
-    
+    """    
     Returns pairwise JS divergence (over all pairs of samples) of two matrices X and Y.
 
     Takes advantage of POT backend to speed up computation.
@@ -266,7 +245,6 @@ def jensenshannon_divergence_backend(X, Y):
         js_dist[i, :] = jensenshannon_distance_1_vs_many_backend(X[i:i+1], Y)
         
     print("Finished calculating cost matrix")
-    # print(nx.unique(nx.isnan(js_dist)))
 
     return js_dist
 

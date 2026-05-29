@@ -8,7 +8,6 @@ from typing import Optional, Tuple, Union
 from scipy.spatial import cKDTree
 from sklearn.metrics.pairwise import euclidean_distances, cosine_distances
 
-from .utils import select_backend, fused_gromov_wasserstein_incent, to_dense_array, extract_data_matrix, jensenshannon_divergence_backend, to_backend
 from .clustering import cluster_cells_spatio_biological
 from .hierarchical import (
     build_slice_cluster_cache,
@@ -17,11 +16,20 @@ from .hierarchical import (
     extract_continuous_macro_section,
     run_coarse_partial_fgw,
 )
+from .utils import (
+    select_backend,
+    fused_gromov_wasserstein_incent,
+    to_dense_array,
+    extract_data_matrix,
+    jensenshannon_divergence_backend,
+    to_backend
+)
 from .visualize import (
     visualize_clustered_slices,
     visualize_cluster_mapping,
     visualize_initial_connected_component,
     visualize_selected_anchors,
+    visualize_global_overlap_projection,
 )
 
 
@@ -31,17 +39,14 @@ def hierarchical_pairwise_align(
     alpha: float,
     beta: float,
     gamma: float,
-    delta: float = 0.5,
-    reg_compact: float = 0.001,
+    delta: float = 0.75,
     numItermax: int = 100000,
     use_gpu: bool = True,
     resolution: float = 1.0,
     spatial_key: str = "spatial",
     use_rep: Optional[str] = "X_pca",
     label_key: str = "cell_type_annot",
-    w_graph: float = 0.5,
     visualize_clusters: bool = True,
-    dummy_cell: bool = False,
     verbose: bool = False,
     **kwargs
 ):
@@ -96,8 +101,8 @@ def hierarchical_pairwise_align(
     
     print("--- [HOT] Step 3: Compute Cluster Costs and Structures ---")
     M_cluster = compute_cluster_feature_costs(mu_exprA, mu_structA, mu_exprB, mu_structB, delta=delta)
-    C_A = compute_cluster_structural_matrix(centroidsA, 1.0 - w_graph, w_graph)
-    C_B = compute_cluster_structural_matrix(centroidsB, 1.0 - w_graph, w_graph)
+    C_A = compute_cluster_structural_matrix(centroidsA)
+    C_B = compute_cluster_structural_matrix(centroidsB)
     
     print("--- [HOT] Step 4: Run Coarse Partial FGW ---")
     Pi_cluster = run_coarse_partial_fgw(M_cluster, C_A, C_B, p_A, p_B, alpha=alpha)
@@ -254,34 +259,16 @@ def hierarchical_pairwise_align(
             G_init_shadow /= G_init_sum
 
         if visualize_clusters:
-            try:
-                import matplotlib.pyplot as plt
-                fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 6))
-                
-                ptsA_full = sliceA.obsm[spatial_key]
-                ptsB_full = sliceB.obsm[spatial_key]
-                
-                weight_A_full = np.zeros(sliceA.shape[0])
-                weight_A_full[idx_A_shadow] = weight_A_shadow
-                
-                weight_B_full = np.zeros(sliceB.shape[0])
-                weight_B_full[idx_B_shadow] = weight_B_shadow
-                
-                sc1 = ax1.scatter(ptsA_full[:,0], ptsA_full[:,1], c=weight_A_full, cmap='magma', s=2, alpha=0.9)
-                ax1.set_title("Slice A: Shadow Weights (Core Decaying)")
-                ax1.axis('equal')
-                fig.colorbar(sc1, ax=ax1, label='Init Weight Bias')
-                
-                sc2 = ax2.scatter(ptsB_full[:,0], ptsB_full[:,1], c=weight_B_full, cmap='magma', s=2, alpha=0.9)
-                ax2.set_title("Slice B: Shadow Weights (Core Decaying)")
-                ax2.axis('equal')
-                fig.colorbar(sc2, ax=ax2, label='Init Weight Bias')
-                
-                plt.suptitle("Global Overlap Projection Weights (Exact Shadow + Core Decay)")
-                plt.show()
-            except Exception as e:
-                print(f"Overlap weight visualization failed: {e}")
-            
+                visualize_global_overlap_projection(
+                    sliceA=sliceA,
+                    sliceB=sliceB,
+                    idx_A_shadow=idx_A_shadow,
+                    idx_B_shadow=idx_B_shadow,
+                    weight_A_shadow=weight_A_shadow,
+                    weight_B_shadow=weight_B_shadow,
+                    spatial_key=spatial_key
+                )
+
         print(f"--- [HOT] Step 8: Executing Final Base OT on Shadow Portions (A: {len(idx_A_shadow)}, B: {len(idx_B_shadow)}) ---")
         pi_shadow_final = pairwise_align(
             sliceA=sliceA_shadow,
@@ -289,11 +276,9 @@ def hierarchical_pairwise_align(
             alpha=alpha,
             beta=beta,
             gamma=gamma,
-            reg_compact=reg_compact,
             G_init=G_init_shadow,
             numItermax=numItermax,
             use_gpu=use_gpu,
-            dummy_cell=dummy_cell,
             verbose=verbose,
             **kwargs
         )
@@ -308,105 +293,6 @@ def hierarchical_pairwise_align(
     except Exception as e:
         print(f"Global refinement failed: {e}. Returning block-restricted pi_full.")
         return pi_full
-
-
-def create_random_rectangular_portion(
-    adata: AnnData,
-    random_seed: int,
-    portion_percentage: float,
-    spatial_key: str = "spatial",
-    max_attempts: int = 64,
-) -> AnnData:
-    """
-    Sample a non-empty rectangular spatial crop from a slice.
-
-    The crop comes from a randomly oriented rectangular window with a random
-    aspect ratio. Its area is chosen to approximately match
-    ``portion_percentage`` of the slice bounding box, and the sampled window
-    whose cell count is closest to the requested fraction is retained.
-    """
-    if not (0.0 < float(portion_percentage) < 100.0):
-        raise ValueError("portion_percentage must be strictly between 0 and 100.")
-
-    coords = np.asarray(adata.obsm[spatial_key], dtype=np.float64)
-    if coords.ndim != 2 or coords.shape[1] < 2:
-        raise ValueError(f"`adata.obsm[{spatial_key!r}]` must contain 2D coordinates.")
-
-    n_cells = int(adata.n_obs)
-    if n_cells < 4:
-        raise ValueError("At least 4 cells are required to build a rectangular self-alignment test slice.")
-
-    frac = float(portion_percentage) / 100.0
-    target_count = int(np.clip(np.round(frac * n_cells), 1, n_cells - 1))
-    min_cells = min(max(4, min(10, target_count)), n_cells - 1)
-
-    mins = coords[:, :2].min(axis=0)
-    maxs = coords[:, :2].max(axis=0)
-    spans = np.maximum(maxs - mins, 1e-12)
-    bbox_area = float(np.prod(spans))
-    target_area = max(bbox_area * frac, 1e-12)
-
-    rng = np.random.default_rng(random_seed)
-    best_mask = None
-    best_score = None
-    best_window = None
-
-    for area_scale in (1.0, 0.85, 1.15, 0.7, 1.3, 0.55, 1.5):
-        for _ in range(max_attempts):
-            aspect_ratio = float(np.exp(rng.uniform(np.log(0.5), np.log(2.0))))
-            rect_area = max(target_area * float(area_scale), 1e-12)
-            rect_width = np.sqrt(rect_area * aspect_ratio)
-            rect_height = np.sqrt(rect_area / aspect_ratio)
-
-            center = coords[rng.integers(0, n_cells), :2].astype(np.float64, copy=True)
-            angle = float(rng.uniform(0.0, np.pi))
-            cos_a = np.cos(angle)
-            sin_a = np.sin(angle)
-            rotation = np.array([[cos_a, -sin_a], [sin_a, cos_a]], dtype=np.float64)
-
-            centered = coords[:, :2] - center
-            local = centered @ rotation
-            half_width = rect_width / 2.0
-            half_height = rect_height / 2.0
-            mask = (
-                (np.abs(local[:, 0]) <= half_width)
-                & (np.abs(local[:, 1]) <= half_height)
-            )
-            count = int(mask.sum())
-            if count < min_cells or count >= n_cells:
-                continue
-
-            score = (abs(count - target_count), -count)
-            if best_score is None or score < best_score:
-                best_score = score
-                best_mask = mask.copy()
-                best_window = {
-                    "center": center.copy(),
-                    "angle_radians": angle,
-                    "width": float(rect_width),
-                    "height": float(rect_height),
-                    "aspect_ratio": aspect_ratio,
-                }
-
-    if best_mask is None:
-        raise ValueError(
-            "Could not sample a valid rectangular portion from the slice. "
-            "Try a larger portion_percentage."
-        )
-
-    portion_indices = np.flatnonzero(best_mask)
-    portion = adata[portion_indices].copy()
-    portion.uns["self_alignment_test"] = {
-        "random_seed": int(random_seed),
-        "portion_percentage": float(portion_percentage),
-        "selected_cell_count": int(portion.n_obs),
-        "window_center": best_window["center"].tolist(),
-        "window_angle_radians": float(best_window["angle_radians"]),
-        "window_width": float(best_window["width"]),
-        "window_height": float(best_window["height"]),
-        "window_aspect_ratio": float(best_window["aspect_ratio"]),
-    }
-    return portion
 
 
 def align_multiple_slices(
@@ -458,8 +344,6 @@ def pairwise_align(
     alpha: float,
     beta: float,
     gamma: float,
-    reg_compact: float = 0.01,
-    armijo: bool = True,
     radius: Optional[float] = None,
     use_rep: Optional[str] = None,
     G_init = None,
@@ -471,7 +355,6 @@ def pairwise_align(
     epsilon: float = 1e-6,
     verbose: bool = True,
     gpu_verbose: bool = True,
-    dummy_cell: bool = True,
     **kwargs) -> Union[NDArray[np.floating], Tuple[NDArray[np.floating], float, float, float, float]]:
     """
 
@@ -544,8 +427,8 @@ def pairwise_align(
         data_type=data_type,
         eps=epsilon,
         radii=None,                    # or pass an explicit list, e.g. [20, 35, 50]
-        radius_k=6,
-        radius_multipliers=(2.5, 4.0, 6.0),
+        radius_k=3,
+        radius_multipliers=(2.5, 4.0, 5.0),
         n_shells=3,
         harmonics=(0, 1, 2),
         harmonic_weights=None,
@@ -554,150 +437,26 @@ def pairwise_align(
     )
     M2 = to_backend(js_dist_neighborhood, nx, data_type=data_type)
 
-
-    # ── Dummy cell augmentation ────────────────────────────────────────────
-    # Only add a dummy on the side that actually has a deficit.
-    # _has_dummy_src: True if source has fewer cells → need dummy source (birth)
-    # _has_dummy_tgt: True if target has fewer cells → need dummy target (death)
-    _has_dummy_src = False
-    _has_dummy_tgt = False
-
-    if dummy_cell:
-        from collections import Counter
-        ns, nt = sliceA.shape[0], sliceB.shape[0]
-        labels_A = sliceA.obs['cell_type_annot'].values
-        labels_B = sliceB.obs['cell_type_annot'].values
-        counts_A = Counter(labels_A)
-        counts_B = Counter(labels_B)
-        all_types = set(counts_A.keys()) | set(counts_B.keys())
-        _budget = sum(max(counts_A.get(k, 0), counts_B.get(k, 0)) for k in all_types)
-        _w_dummy_src = _budget - ns   # extra weight for dummy source cell (birth)
-        _w_dummy_tgt = _budget - nt   # extra weight for dummy target cell (death)
-        _has_dummy_src = _w_dummy_src > 0
-        _has_dummy_tgt = _w_dummy_tgt > 0
-
-        print(f"[dummy_cell] budget={_budget}, "
-              f"dummy_src={'YES (birth)' if _has_dummy_src else 'NO'} w={_w_dummy_src}, "
-              f"dummy_tgt={'YES (death)' if _has_dummy_tgt else 'NO'} w={_w_dummy_tgt}")
-
-        _ns_aug = ns + (1 if _has_dummy_src else 0)
-        _nt_aug = nt + (1 if _has_dummy_tgt else 0)
-
-        # ---- Augment D_A if dummy source needed ----
-        if _has_dummy_src:
-            zeros_col = nx.zeros((ns, 1), type_as=D_A)
-            D_A_temp = nx.concatenate([D_A, zeros_col], axis=1)
-            zeros_row = nx.zeros((1, _ns_aug), type_as=D_A)
-            D_A = nx.concatenate([D_A_temp, zeros_row], axis=0)
-
-        # ---- Augment D_B if dummy target needed ----
-        if _has_dummy_tgt:
-            zeros_col = nx.zeros((nt, 1), type_as=D_B)
-            D_B_temp = nx.concatenate([D_B, zeros_col], axis=1)
-            zeros_row = nx.zeros((1, _nt_aug), type_as=D_B)
-            D_B = nx.concatenate([D_B_temp, zeros_row], axis=0)
-        
-        # ---- Augment M1: add dummy row/col only where needed ----
-        if _has_dummy_tgt:
-            mean_col = nx.mean(M1, axis=1)
-            mean_col = nx.reshape(mean_col, (-1, 1))
-            M1 = nx.concatenate([M1, mean_col], axis=1)
-        if _has_dummy_src:
-            mean_row = nx.mean(M1, axis=0)
-            mean_row = nx.reshape(mean_row, (1, -1))
-            M1 = nx.concatenate([M1, mean_row], axis=0)
-        if _has_dummy_src and _has_dummy_tgt:
-            M1[-1, -1] = 0.0
-
-        # ---- Augment M2: add dummy row/col only where needed ----
-        if _has_dummy_tgt:
-            mean_col = nx.mean(M2, axis=1)
-            mean_col = nx.reshape(mean_col, (-1, 1))
-            M2 = nx.concatenate([M2, mean_col], axis=1)
-        if _has_dummy_src:
-            mean_row = nx.mean(M2, axis=0)
-            mean_row = nx.reshape(mean_row, (1, -1))
-            M2 = nx.concatenate([M2, mean_row], axis=0)
-        if _has_dummy_src and _has_dummy_tgt:
-            M2[-1, -1] = 0.0
-
     # init distributions
     if a_distribution is None:
-        if dummy_cell:
-            if _has_dummy_src:
-                a_vals = np.full(ns + 1, 1.0 / _budget, dtype=np.float64)
-                a_vals[-1] = float(_w_dummy_src) / _budget
-                a = nx.from_numpy(a_vals)
-            else:
-                a = nx.from_numpy(np.ones(ns, dtype=np.float64) / _budget)
-        else:
-            # uniform distribution, a = array([1/n, 1/n, ...])
-            a = nx.from_numpy(np.ones(sliceA.shape[0], dtype=np.float64) / sliceA.shape[0])
+        a = nx.from_numpy(np.ones(sliceA.shape[0], dtype=np.float64) / sliceA.shape[0])
     else:
-        if dummy_cell:
-            raise ValueError("Custom a_distribution is not supported with dummy_cell=True.")
         a = nx.from_numpy(a_distribution)
         
     if b_distribution is None:
-        if dummy_cell:
-            if _has_dummy_tgt:
-                b_vals = np.full(nt + 1, 1.0 / _budget, dtype=np.float64)
-                b_vals[-1] = float(_w_dummy_tgt) / _budget
-                b = nx.from_numpy(b_vals)
-            else:
-                b = nx.from_numpy(np.ones(nt, dtype=np.float64) / _budget)
-        else:
-            b = nx.from_numpy(np.ones(sliceB.shape[0], dtype=np.float64) / sliceB.shape[0])
+        b = nx.from_numpy(np.ones(sliceB.shape[0], dtype=np.float64) / sliceB.shape[0])
     else:
-        if dummy_cell:
-            raise ValueError("Custom b_distribution is not supported with dummy_cell=True.")
         b = nx.from_numpy(b_distribution)
 
     a = to_backend(a, nx, data_type=data_type)
     b = to_backend(b, nx, data_type=data_type)
     
-    
     # Run OT
     if G_init is not None:
-        if dummy_cell and (_has_dummy_src or _has_dummy_tgt):
-            # Pad user-provided (ns x nt) G_init to augmented dims safely
-            _gi = np.array(G_init, dtype=np.float64)
-            _a_np = nx.to_numpy(a)
-            _b_np = nx.to_numpy(b)
-            # Use outer product for safe, strictly positive marginal initialization
-            _gi_aug = np.outer(_a_np, _b_np)
-            
-            # Blend user's G_init into the core cell-to-cell block
-            core_mass = np.sum(_gi_aug[:ns, :nt])
-            if core_mass > 0:
-                _gi_aug[:ns, :nt] = _gi * core_mass
-            else:
-                _gi_aug[:ns, :nt] = _gi
-                
-            _gi_aug /= np.sum(_gi_aug)
-            G_init = _gi_aug
         G_init = to_backend(G_init, nx, data_type=data_type)
-    
-    pi = fused_gromov_wasserstein_incent(M1 + gamma * M2, D_A, D_B, a, b, G_init = G_init, alpha= alpha, reg_compact=reg_compact, armijo=armijo, numItermax=numItermax, verbose=verbose, **kwargs)
+
+    pi = fused_gromov_wasserstein_incent(M1 + gamma * M2, D_A, D_B, a, b, G_init = G_init, alpha= alpha, numItermax=numItermax, verbose=verbose, **kwargs)
     pi = nx.to_numpy(pi)
-
-    # ── Dummy cell: strip dummy row/col, renormalize, report birth/death ────
-    if dummy_cell and (_has_dummy_src or _has_dummy_tgt):
-        pi_full = pi.copy()
-
-        # Compute birth / death mass before stripping
-        birth_mass = float(pi_full[-1, :nt].sum()) if _has_dummy_src else 0.0
-        death_mass = float(pi_full[:ns, -1].sum()) if _has_dummy_tgt else 0.0
-
-        # Strip only the dummy row/col that was actually added
-        if _has_dummy_src and _has_dummy_tgt:
-            pi = pi_full[:ns, :nt]
-        elif _has_dummy_src:
-            pi = pi_full[:ns, :]      # strip dummy source row only
-        elif _has_dummy_tgt:
-            pi = pi_full[:, :nt]      # strip dummy target col only
-
-        print(f"[dummy_cell] death_mass: {death_mass:.6f}, birth_mass: {birth_mass:.6f}")
 
     if isinstance(nx, ot.backend.TorchBackend):
         if torch.cuda.is_available():
@@ -706,7 +465,7 @@ def pairwise_align(
     return pi
 
 
-def estimate_characteristic_spacing(adata, k=6, spatial_key="spatial"):
+def estimate_characteristic_spacing(adata, k=3, spatial_key="spatial"):
     """
     Robust local spacing estimate: median distance to the k-th nearest neighbor.
     Useful for choosing radii that scale with local cell density.
@@ -934,7 +693,7 @@ def neighborhood_distribution_fourier(
     return features, metadata
 
 
-def default_radii_from_spacing(sliceA, sliceB, k=6, multipliers=(2.5, 4.0, 6.0), spatial_key="spatial"):
+def default_radii_from_spacing(sliceA, sliceB, k=3, multipliers=(2.5, 4.0, 5.0), spatial_key="spatial"):
     sA = estimate_characteristic_spacing(sliceA, k=k, spatial_key=spatial_key)
     sB = estimate_characteristic_spacing(sliceB, k=k, spatial_key=spatial_key)
     base = max(sA, sB)
@@ -1007,7 +766,7 @@ def neighborhood_distribution_multiscale(
     return X, {"scales": meta_blocks}
 
 
-def calculate_spatial_distance(sliceA, sliceB, nx, data_type=np.float32, spatial_key = 'spatial', eps=1e-8, norm_k=6):
+def calculate_spatial_distance(sliceA, sliceB, nx, data_type=np.float32, spatial_key = 'spatial', eps=1e-8, norm_k=3):
     """
     Calculate spatial distance between cells in a slice, normalized by robust local spacing.
 
@@ -1104,8 +863,8 @@ def calculate_neighborhood_dissimilarity(
     data_type=np.float32,
     eps=1e-8,
     radii=None,
-    radius_k=6,
-    radius_multipliers=(2.5, 4.0, 6.0),
+    radius_k=3,
+    radius_multipliers=(2.5, 4.0, 5.0),
     n_shells=3,
     harmonics=(0, 1, 2),
     harmonic_weights=None,

@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 from scipy.optimize import linear_sum_assignment
 from scipy.spatial import cKDTree
 from scipy.sparse.csgraph import dijkstra
-from scipy.spatial import distance_matrix, Delaunay
+from scipy.spatial import Delaunay
 from sklearn.metrics.pairwise import cosine_distances
 from scipy.special import rel_entr
 from scipy.stats import rankdata
@@ -79,7 +79,6 @@ class SliceClusterCache:
     valid: np.ndarray
     mu_expr: np.ndarray
     mu_struct: np.ndarray
-    mu_struct_neighborhood: np.ndarray
     cluster_hist: np.ndarray
     all_types: np.ndarray
 
@@ -178,9 +177,6 @@ def build_slice_cluster_cache(
             flat_local /= flat_local.sum()
         mu_struct_local[cluster_idx] = flat_local
 
-    adjacency, _ = build_cluster_contact_graph(coords, labels, valid)
-    mu_struct_neighborhood = compute_cluster_context_features(mu_struct_local, adjacency)
-
     return SliceClusterCache(
         labels=np.asarray(labels),
         masses=masses,
@@ -188,7 +184,6 @@ def build_slice_cluster_cache(
         valid=valid,
         mu_expr=mu_expr,
         mu_struct=mu_struct_local,
-        mu_struct_neighborhood=mu_struct_neighborhood,
         cluster_hist=cluster_hist,
         all_types=all_types,
     )
@@ -227,46 +222,31 @@ def compute_cluster_feature_costs(mu_expr_A, mu_struct_A, mu_expr_B, mu_struct_B
     return M_cluster
 
 
-def compute_cluster_structural_matrix(centroids, w_euc=0.5, w_graph=0.5):
+def compute_cluster_structural_matrix(centroids):
     """
     Compute the structural distance matrix C for clusters based on their centroids.
     
     Args:
         centroids: (C, 2) coords of clusters.
-        w_euc: weight for direct euclidean distance.
-        w_graph: weight for graph-based distance.
     
     Returns:
         C: (C, C) combined structural distance matrix.
     """
-    # Simple euclidean distance for now if w_graph is 0
-    C_euc = distance_matrix(centroids, centroids)
     
-    if w_graph > 0:
-        # build adj matrix
-        n = centroids.shape[0]
-        adj = np.zeros((n, n))
-
-        tri = Delaunay(centroids)
-        indptr, indices = tri.vertex_neighbor_vertices
-        for i in range(n):
-            for j in indices[indptr[i]:indptr[i+1]]:
-                adj[i, j] = np.linalg.norm(centroids[i] - centroids[j])
-        
-        C_graph = dijkstra(sp.csr_matrix(adj), directed=False)
-        # handle infinite dists
-        C_graph[np.isinf(C_graph)] = np.max(C_graph[~np.isinf(C_graph)]) * 2
-        
-        w_total = w_euc + w_graph
-        if w_total == 0: w_total = 1.0
-        w_euc_norm = w_euc / w_total
-        w_graph_norm = w_graph / w_total
-            
-        C = w_euc_norm * C_euc + w_graph_norm * C_graph
-    else:
-        C = C_euc
-        
-    return C
+    # build adj matrix
+    n = centroids.shape[0]
+    adj = np.zeros((n, n))
+    tri = Delaunay(centroids)
+    indptr, indices = tri.vertex_neighbor_vertices
+    for i in range(n):
+        for j in indices[indptr[i]:indptr[i+1]]:
+            adj[i, j] = np.linalg.norm(centroids[i] - centroids[j])
+    
+    C_graph = dijkstra(sp.csr_matrix(adj), directed=False)
+    # handle infinite dists
+    C_graph[np.isinf(C_graph)] = np.max(C_graph[~np.isinf(C_graph)]) * 2
+    
+    return C_graph
 
 
 def run_coarse_partial_fgw(M_cluster, C_A, C_B, p_A, p_B, alpha=0.5, m=None, reg_m=1.0):
@@ -429,58 +409,6 @@ def normalize_contact_graph(edge_lengths):
     positive = edge_lengths[edge_lengths > 0]
     scale = float(np.median(positive)) if positive.size > 0 else 1.0
     return edge_lengths / max(scale, 1e-12), max(scale, 1e-12)
-
-
-def compute_graph_geodesics(edge_lengths):
-    """
-    Compute all-pairs geodesic distances on the normalized cluster contact graph.
-
-    Disconnected distances are mapped to a large finite penalty so they remain
-    usable in downstream arithmetic without introducing special-case branches.
-    """
-    distances = dijkstra(sp.csr_matrix(edge_lengths), directed=False)
-    finite = distances[np.isfinite(distances)]
-    if finite.size == 0:
-        distances = np.full_like(edge_lengths, 2.0, dtype=np.float64)
-        np.fill_diagonal(distances, 0.0)
-        return distances
-
-    finite_nonzero = finite[finite > 0]
-    fallback = float(np.max(finite_nonzero)) * 2.0 if finite_nonzero.size > 0 else 2.0
-    distances[np.isinf(distances)] = fallback
-    np.fill_diagonal(distances, 0.0)
-    return distances
-
-
-def compute_cluster_context_features(cluster_hist, adjacency):
-    """
-    Build cluster context descriptors from own composition and adjacent composition.
-
-    The descriptor concatenates the within-cluster composition with the mean
-    composition of directly contacting neighboring clusters, yielding a local
-    niche signature that is insensitive to rigid motion yet informative for
-    symmetry resolution.
-    """
-    n_clusters = cluster_hist.shape[0]
-    context = np.zeros_like(cluster_hist, dtype=np.float64)
-
-    for i in range(n_clusters):
-        neighbors = np.where(adjacency[i])[0]
-        neighbors = neighbors[neighbors != i]
-
-        aggregate = cluster_hist[i].copy()
-        if neighbors.size > 0:
-            aggregate += cluster_hist[neighbors].mean(axis=0)
-
-        total = aggregate.sum()
-        if total > 0:
-            context[i] = aggregate / total
-
-    features = np.concatenate([cluster_hist, context], axis=1)
-    row_sums = features.sum(axis=1, keepdims=True)
-    nz = row_sums[:, 0] > 0
-    features[nz] /= row_sums[nz]
-    return features
 
 
 def fit_weighted_rigid_transform(source_points, target_points, weights=None):
@@ -1169,10 +1097,6 @@ def score_macro_hypothesis(
     global_pair_evidence,
     mi_contrib,
     Pi_cluster,
-    geodesic_A,
-    geodesic_B,
-    edge_A_norm,
-    edge_B_norm,
     edge_scale_A,
     edge_scale_B,
     centroids_A,
@@ -1374,12 +1298,6 @@ def extract_continuous_macro_section(
 
     edge_A_norm, edge_scale_A = normalize_contact_graph(edge_A)
     edge_B_norm, edge_scale_B = normalize_contact_graph(edge_B)
-    geodesic_A = compute_graph_geodesics(edge_A_norm)
-    geodesic_B = compute_graph_geodesics(edge_B_norm)
-
-    # 3. Build biologically grounded cluster context descriptors.
-    context_feat_A = np.asarray(cluster_cache_A.mu_struct_neighborhood, dtype=np.float64)
-    context_feat_B = np.asarray(cluster_cache_B.mu_struct_neighborhood, dtype=np.float64)
 
     # 4. Assemble candidate cluster-pairs and their overall evidence.
     matches, match_tiebreak_scores, global_pair_scores, global_pair_evidence, mi_contrib, log_enrichment, diagnostics = collect_candidate_match_pairs(
@@ -1469,10 +1387,6 @@ def extract_continuous_macro_section(
             global_pair_evidence=global_pair_evidence,
             mi_contrib=mi_contrib,
             Pi_cluster=Pi_cluster,
-            geodesic_A=geodesic_A,
-            geodesic_B=geodesic_B,
-            edge_A_norm=edge_A_norm,
-            edge_B_norm=edge_B_norm,
             edge_scale_A=edge_scale_A,
             edge_scale_B=edge_scale_B,
             centroids_A=centroids_A,

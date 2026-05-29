@@ -400,7 +400,7 @@ def visualize_3d_stack(
         print("To plot in 3D, mpl_toolkits.mplot3d must be installed.")
         return
     
-        # Step 2: Global geometric assembly using the Procrustes chain
+    # Step 2: Global geometric assembly using the Procrustes chain
     print("\n--- Assembling Global Coordinate Stack ---")
     aligned_slices = stack_slices_pairwise(slices, pi_matrices, output_params=False)
 
@@ -442,119 +442,6 @@ def visualize_3d_stack(
     if n_slices <= 10:
         ax.legend(loc='upper right', bbox_to_anchor=(1.2, 1.0))
         
-    plt.tight_layout()
-    plt.show()
-
-
-def visualize_created_slice_portion(
-    original_slice: AnnData,
-    created_slice: AnnData,
-    spatial_key: str = "spatial",
-    original_color: str = "lightgray",
-    portion_color: str = "crimson",
-    point_size: float = 4.0,
-    alpha_all: float = 0.35,
-    alpha_portion: float = 0.9,
-    show_window: bool = True,
-):
-    """
-    Visualize which portion of an original slice produced a created subslice.
-
-    The created cells are identified primarily by shared ``obs_names``. When
-    the created slice contains the sampling metadata written by
-    ``create_random_rectangular_portion``, the sampled rectangular window is
-    also overlaid on the original slice.
-    """
-    pts_original = np.asarray(original_slice.obsm[spatial_key], dtype=np.float64)
-    pts_created = np.asarray(created_slice.obsm[spatial_key], dtype=np.float64)
-
-    if pts_original.ndim != 2 or pts_original.shape[1] < 2:
-        raise ValueError(f"`original_slice.obsm[{spatial_key!r}]` must contain 2D coordinates.")
-    if pts_created.ndim != 2 or pts_created.shape[1] < 2:
-        raise ValueError(f"`created_slice.obsm[{spatial_key!r}]` must contain 2D coordinates.")
-
-    original_names = np.asarray(original_slice.obs_names.astype(str))
-    created_names = set(created_slice.obs_names.astype(str))
-
-    if created_names:
-        portion_mask = np.array([name in created_names for name in original_names], dtype=bool)
-    else:
-        portion_mask = np.zeros(original_slice.n_obs, dtype=bool)
-
-    if not np.any(portion_mask):
-        raise ValueError(
-            "Could not identify created cells inside the original slice from obs_names."
-        )
-
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 6))
-
-    ax1.scatter(
-        pts_original[:, 0],
-        pts_original[:, 1],
-        c=original_color,
-        s=point_size,
-        alpha=alpha_all,
-        label="Original Slice",
-    )
-    ax1.scatter(
-        pts_original[portion_mask, 0],
-        pts_original[portion_mask, 1],
-        c=portion_color,
-        s=point_size,
-        alpha=alpha_portion,
-        label="Created Portion",
-    )
-
-    metadata = created_slice.uns.get("self_alignment_test", {})
-    if show_window and metadata:
-        center = metadata.get("window_center")
-        angle = metadata.get("window_angle_radians")
-        width = metadata.get("window_width")
-        height = metadata.get("window_height")
-        if center is not None and angle is not None and width is not None and height is not None:
-            center = np.asarray(center, dtype=np.float64)
-            half_w = float(width) / 2.0
-            half_h = float(height) / 2.0
-            corners = np.array(
-                [
-                    [-half_w, -half_h],
-                    [half_w, -half_h],
-                    [half_w, half_h],
-                    [-half_w, half_h],
-                ],
-                dtype=np.float64,
-            )
-            cos_a = np.cos(float(angle))
-            sin_a = np.sin(float(angle))
-            rotation = np.array([[cos_a, -sin_a], [sin_a, cos_a]], dtype=np.float64)
-            rotated_corners = corners @ rotation + center
-            patch = Polygon(
-                rotated_corners,
-                closed=True,
-                fill=False,
-                edgecolor="black",
-                linewidth=1.5,
-                linestyle="--",
-                label="Sampling Window",
-            )
-            ax1.add_patch(patch)
-
-    ax1.set_title("Original Slice with Created Portion")
-    ax1.axis("equal")
-    ax1.legend()
-
-    ax2.scatter(
-        pts_created[:, 0],
-        pts_created[:, 1],
-        c=portion_color,
-        s=point_size,
-        alpha=alpha_portion,
-        label="Created Slice",
-    )
-    ax2.set_title("Created Slice")
-    ax2.axis("equal")
-    ax2.legend()
-
     plt.tight_layout()
     plt.show()
 
@@ -710,3 +597,39 @@ def visualize_initial_connected_component(
 
     plt.show()
 
+
+def visualize_global_overlap_projection(
+    sliceA,
+    sliceB,
+    idx_A_shadow,
+    idx_B_shadow,
+    weight_A_shadow,
+    weight_B_shadow,
+    spatial_key="spatial"
+):
+    """
+    Visualizes the global overlap projection weights across the entire slices, showing how the shadow portion is distributed spatially with the core decay.
+    """
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 6))
+    
+    ptsA_full = sliceA.obsm[spatial_key]
+    ptsB_full = sliceB.obsm[spatial_key]
+    
+    weight_A_full = np.zeros(sliceA.shape[0])
+    weight_A_full[idx_A_shadow] = weight_A_shadow
+    
+    weight_B_full = np.zeros(sliceB.shape[0])
+    weight_B_full[idx_B_shadow] = weight_B_shadow
+    
+    sc1 = ax1.scatter(ptsA_full[:,0], ptsA_full[:,1], c=weight_A_full, cmap='magma', s=2, alpha=0.9)
+    ax1.set_title("Slice A: Shadow Weights (Core Decaying)")
+    ax1.axis('equal')
+    fig.colorbar(sc1, ax=ax1, label='Init Weight Bias')
+    
+    sc2 = ax2.scatter(ptsB_full[:,0], ptsB_full[:,1], c=weight_B_full, cmap='magma', s=2, alpha=0.9)
+    ax2.set_title("Slice B: Shadow Weights (Core Decaying)")
+    ax2.axis('equal')
+    fig.colorbar(sc2, ax=ax2, label='Init Weight Bias')
+    
+    plt.suptitle("Global Overlap Projection Weights (Exact Shadow + Core Decay)")
+    plt.show()

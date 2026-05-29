@@ -1,4 +1,3 @@
-import warnings
 import numpy as np
 import scipy.sparse as sp
 from scipy.spatial import Delaunay
@@ -97,12 +96,6 @@ def cluster_cells_spatio_biological(
 
     # ------------------------------------------------------------------- #
     # 1. Standardise and dimension-normalise both modalities              #
-    #                                                                     #
-    # After StandardScaler each feature has unit variance.  With d_s = 2  #
-    # spatial dims and d_b biological dims, the spatial modality          #
-    # contributes sum-of-squares ≈ d_s per cell and bio ≈ d_b.  Dividing  #
-    # by sqrt(d) makes each modality contribute exactly (weight)^2 to the #
-    # average-linkage distance, independent of dimensionality.            #
     # ------------------------------------------------------------------- #
     d_s = coords.shape[1]        # always 2 for 2-D spatial coordinates
     d_b = bio_features.shape[1]  # number of PCA components
