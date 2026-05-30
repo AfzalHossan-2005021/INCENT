@@ -16,12 +16,6 @@ Per-pair quality metrics
   pairs are supplied.
 * Spatial Coherence Score (SCS) of transferred labels.
 
-Mass-conservation diagnostics
------------------------------
-* Total transported mass, kept-mass per side, birth/death mass,
-  normalised marginal entropies, and an effective-support overlap-fraction
-  estimator.
-
 Compactness / variance diagnostics
 ----------------------------------
 * Forward/reverse spatial compactness and effective support (preserved from
@@ -52,6 +46,7 @@ from .core import (
     calculate_neighborhood_dissimilarity,
     calculate_gene_expression_cosine_distance,
     calculate_cell_type_mismatch,
+    estimate_characteristic_spacing
 )
 
 
@@ -272,78 +267,6 @@ def spatial_coherence_score(
 
 
 # ============================================================================
-# Mass-conservation diagnostics
-# ============================================================================
-
-def mass_conservation_diagnostics(
-    pi: np.ndarray,
-    n_A: Optional[int] = None,
-    n_B: Optional[int] = None,
-    expected_mass: float = 1.0,
-) -> dict:
-    """
-    Diagnostics for unbalanced transport.
-
-    Returns the total transported mass, mass kept per side relative to its
-    expected share, birth / death mass (deficit on either side), and
-    normalised marginal entropies (1 = uniform marginal, 0 = degenerate).
-    """
-    pi = np.asarray(pi, dtype=np.float64)
-    if n_A is None:
-        n_A = pi.shape[0]
-    if n_B is None:
-        n_B = pi.shape[1]
-    total = float(pi.sum())
-    row_mass = pi.sum(axis=1)
-    col_mass = pi.sum(axis=0)
-    src_expected = expected_mass / max(n_A, 1)
-    tgt_expected = expected_mass / max(n_B, 1)
-    kept_src = float(np.minimum(row_mass, src_expected).sum())
-    kept_tgt = float(np.minimum(col_mass, tgt_expected).sum())
-    death_mass = float(max(expected_mass - row_mass.sum(), 0.0))
-    birth_mass = float(max(expected_mass - col_mass.sum(), 0.0))
-
-    def _norm_entropy(v):
-        v = np.asarray(v, dtype=np.float64)
-        s = v.sum()
-        if s <= 1e-12:
-            return 0.0
-        p = v / s
-        nz = p > 1e-12
-        h = -np.sum(p[nz] * np.log(p[nz]))
-        h_max = np.log(v.size) if v.size > 1 else 1.0
-        return float(h / h_max) if h_max > 0 else 0.0
-
-    return {
-        "total_mass": total,
-        "row_mass_sum": float(row_mass.sum()),
-        "col_mass_sum": float(col_mass.sum()),
-        "kept_src_fraction": kept_src,
-        "kept_tgt_fraction": kept_tgt,
-        "death_mass": death_mass,
-        "birth_mass": birth_mass,
-        "row_entropy_norm": _norm_entropy(row_mass),
-        "col_entropy_norm": _norm_entropy(col_mass),
-    }
-
-
-def estimated_overlap_fraction(pi: np.ndarray) -> float:
-    """
-    Estimate of the overlap-mass fraction (geometric mean of effective
-    per-side support / cell count, via Renyi-2 entropy).
-    """
-    pi = np.asarray(pi, dtype=np.float64)
-    n_A, n_B = pi.shape
-    row_mass = pi.sum(axis=1)
-    col_mass = pi.sum(axis=0)
-    eff_src = (row_mass.sum() ** 2) / max(float((row_mass ** 2).sum()), 1e-12)
-    eff_tgt = (col_mass.sum() ** 2) / max(float((col_mass ** 2).sum()), 1e-12)
-    frac_src = eff_src / max(n_A, 1)
-    frac_tgt = eff_tgt / max(n_B, 1)
-    return float(np.sqrt(max(frac_src, 0.0) * max(frac_tgt, 0.0)))
-
-
-# ============================================================================
 # Helper for the headline aggregator: optional coordinate alignment
 # ============================================================================
 
@@ -365,6 +288,179 @@ def _post_procrustes_coords(sliceA, sliceB, pi):
             np.asarray(sliceA.obsm["spatial"]),
             np.asarray(sliceB.obsm["spatial"]),
         )
+
+
+# ============================================================================
+# Compactness / variance diagnostics
+# ============================================================================
+
+def calculate_forward_reverse_compactness(
+    pi_mat,
+    sliceA,
+    sliceB,
+    spatial_key: str = "spatial",
+    k: int = 6,
+    verbose: bool = True,
+):
+    """
+    Diagnostic metric for spatial compactness of a transport plan.
+
+    Measures how spatially coherent each cell's mass assignment is in both
+    the forward (source → target) and reverse (target → source) directions.
+    All variance outputs are normalised by σ², where σ is the characteristic
+    cell spacing estimated from the two slices, making values dataset-agnostic
+    and directly comparable across experiments and competing methods.
+
+    Args:
+        pi_mat      : Alignment mapping matrix (ns × nt). Rows = source cells,
+                      columns = target cells.
+        sliceA      : Source AnnData object. Must contain spatial coordinates
+                      in .obsm[spatial_key].
+        sliceB      : Target AnnData object. Must contain spatial coordinates
+                      in .obsm[spatial_key].
+        spatial_key : Key in .obsm that holds 2-D spatial coordinates.
+                      Default: 'spatial'.
+        k           : Number of nearest neighbours used by
+                      estimate_characteristic_spacing() to compute σ.
+                      Default: 6 (consistent with calculate_spatial_distance).
+        verbose     : If True, prints a formatted interpretation table.
+                      Default: True.
+
+    Returns:
+        dict with keys:
+            'sigma'               – Characteristic cell spacing σ (raw units).
+                                    Divide any raw variance by σ² to reproduce
+                                    the normalised values below.
+            'forward_compactness' – Mean spatial variance of target coordinates
+                                    per source cell, normalised by σ².
+                                    Low (< 1.0) = spatially coherent, one-to-one-
+                                    like mapping. High (> 9.0) ≈ random/PASTE.
+            'reverse_compactness' – Same, transposed: variance of source
+                                    coordinates per target cell, normalised by σ².
+            'asymmetry_ratio'     – forward_compactness / reverse_compactness.
+                                    ≈ 1.0  → balanced, bijective alignment.
+                                    >> 1.0 → many sources fan out to few targets
+                                              (possible tissue loss / cell death).
+                                    << 1.0 → one source maps to many scattered
+                                              targets (possible proliferation).
+            'locality_score_fwd'  – 1 / (1 + forward_compactness), mapped to
+                                    [0, 1]. Higher is better. Convenient scalar
+                                    for tables and figures.
+            'locality_score_rev'  – 1 / (1 + reverse_compactness), same scale.
+            'effective_support_fwd' – Mean participation ratio (row-wise):
+                                    (Σ_j π_ij)² / Σ_j π_ij².  ≈ 1 means
+                                    near-hard assignment; ≈ n_target means
+                                    uniform mass spreading.
+            'effective_support_rev' – Same, column-wise (target perspective).
+
+    Interpretation guide (normalised compactness values):
+        < 1.0   Excellent  — mapping lands within ~1 cell spacing
+        1 – 4   Good       — soft but spatially focused assignment
+        4 – 9   Poor       — diffuse, spanning several cell diameters
+        > 9     Random     — comparable to a uniform / PASTE-style plan
+    """
+    pi_mat = np.asarray(pi_mat)
+    eps = 1e-12
+
+    # ── Characteristic spacing (same estimator used in calculate_spatial_distance) ──
+    sigma_s = estimate_characteristic_spacing(sliceA, k=k, spatial_key=spatial_key)
+    sigma_t = estimate_characteristic_spacing(sliceB, k=k, spatial_key=spatial_key)
+    sigma   = max(sigma_s, sigma_t, eps)
+
+    # ── Normalise coordinates so variances are in units of σ² ──
+    Xs = np.asarray(sliceA.obsm[spatial_key], dtype=np.float64) / sigma
+    Xt = np.asarray(sliceB.obsm[spatial_key], dtype=np.float64) / sigma
+
+    # ── Forward compactness: variance of target coords per source cell ──
+    pi_row_sums      = pi_mat.sum(axis=1)
+    pi_row_sums_safe = np.maximum(pi_row_sums, eps)
+    pi_row_norm      = pi_mat / pi_row_sums_safe[:, None]
+
+    bary_t        = pi_row_norm @ Xt                                  # (ns, 2)
+    E_x2_fwd      = pi_row_norm @ np.sum(Xt ** 2, axis=1)            # E[||x||²]
+    Ex_2_fwd      = np.sum(bary_t ** 2, axis=1)                      # ||E[x]||²
+
+    active_src    = pi_row_sums > eps
+    var_fwd       = np.clip(E_x2_fwd[active_src] - Ex_2_fwd[active_src], 0.0, None)
+    forward_compactness = float(np.mean(var_fwd)) if var_fwd.size > 0 else 0.0
+
+    # ── Reverse compactness: variance of source coords per target cell ──
+    pi_col_sums      = pi_mat.sum(axis=0)
+    pi_col_sums_safe = np.maximum(pi_col_sums, eps)
+    pi_col_norm      = pi_mat / pi_col_sums_safe[None, :]
+
+    bary_s        = pi_col_norm.T @ Xs                                # (nt, 2)
+    E_x2_rev      = pi_col_norm.T @ np.sum(Xs ** 2, axis=1)
+    Ex_2_rev      = np.sum(bary_s ** 2, axis=1)
+
+    active_tgt    = pi_col_sums > eps
+    var_rev       = np.clip(E_x2_rev[active_tgt] - Ex_2_rev[active_tgt], 0.0, None)
+    reverse_compactness = float(np.mean(var_rev)) if var_rev.size > 0 else 0.0
+
+    # ── Asymmetry ratio ──
+    if reverse_compactness > eps:
+        asymmetry_ratio = forward_compactness / reverse_compactness
+    else:
+        asymmetry_ratio = float("nan")
+
+    # ── Locality scores (higher = better, bounded [0, 1]) ──
+    locality_score_fwd = 1.0 / (1.0 + forward_compactness)
+    locality_score_rev = 1.0 / (1.0 + reverse_compactness)
+
+    # ── Effective support (participation ratio) ──
+    eff_sup_fwd = (pi_row_sums ** 2) / np.maximum(
+        np.sum(pi_mat ** 2, axis=1), eps
+    )
+    eff_sup_rev = (pi_col_sums ** 2) / np.maximum(
+        np.sum(pi_mat ** 2, axis=0), eps
+    )
+    mean_eff_sup_fwd = (
+        float(np.mean(eff_sup_fwd[active_src])) if eff_sup_fwd[active_src].size > 0 else 0.0
+    )
+    mean_eff_sup_rev = (
+        float(np.mean(eff_sup_rev[active_tgt])) if eff_sup_rev[active_tgt].size > 0 else 0.0
+    )
+
+    # ── Qualitative label ──
+    def _label(fc):
+        if   fc < 1.0: return "Excellent"
+        elif fc < 4.0: return "Good"
+        elif fc < 9.0: return "Poor"
+        else:          return "Random-equivalent"
+
+    # ── Optional verbose table ──
+    if verbose:
+        asym_str = f"{asymmetry_ratio:.4f}" if not (asymmetry_ratio != asymmetry_ratio) else "n/a"
+        print("\n" + "=" * 80)
+        title = "SPATIAL COMPACTNESS METRICS"
+        print(" " * ((80 - len(title)) // 2) + title)
+        print("=" * 80)
+        print(f"  Characteristic cell spacing σ : {sigma:.4f} (raw coordinate units)")
+        print(f"  All variance values are normalised by σ² = {sigma**2:.4f}")
+        print("-" * 80)
+        print(f"  {'Metric':<38} {'Value':>12}  {'Interpretation'}")
+        print("-" * 80)
+        print(f"  {'Forward compactness (σ²)':<38} {forward_compactness:>12.4f}  {_label(forward_compactness)}")
+        print(f"  {'Reverse compactness (σ²)':<38} {reverse_compactness:>12.4f}  {_label(reverse_compactness)}")
+        print(f"  {'Asymmetry ratio (fwd / rev)':<38} {asym_str:>12}  {'≈1.0 balanced | >1 death | <1 prolif.'}")
+        print(f"  {'Locality score fwd  [0→1]':<38} {locality_score_fwd:>12.4f}  {'higher is better'}")
+        print(f"  {'Locality score rev  [0→1]':<38} {locality_score_rev:>12.4f}  {'higher is better'}")
+        print(f"  {'Effective support fwd (cells)':<38} {mean_eff_sup_fwd:>12.2f}  {'1=hard assign | →n_t=uniform'}")
+        print(f"  {'Effective support rev (cells)':<38} {mean_eff_sup_rev:>12.2f}  {'1=hard assign | →n_s=uniform'}")
+        print("=" * 80)
+        print(f"  Guide: <1.0 Excellent | 1–4 Good | 4–9 Poor | >9 Random/PASTE-equivalent")
+        print("=" * 80 + "\n")
+
+    return {
+        "sigma":                sigma,
+        "forward_compactness":  forward_compactness,
+        "reverse_compactness":  reverse_compactness,
+        "asymmetry_ratio":      asymmetry_ratio,
+        "locality_score_fwd":   locality_score_fwd,
+        "locality_score_rev":   locality_score_rev,
+        "effective_support_fwd": mean_eff_sup_fwd,
+        "effective_support_rev": mean_eff_sup_rev,
+    }
 
 
 # ============================================================================
@@ -456,11 +552,6 @@ def calculate_performance_metrics(
         ``initial_cell_type_match``, ``final_cell_type_match``
     Label-aware (added if labels available):
         ``paa_celltype``, ``ltari_celltype``, ``scs_transferred``
-    Mass diagnostics:
-        ``mass_total_mass``, ``mass_kept_src_fraction``,
-        ``mass_kept_tgt_fraction``, ``mass_death_mass``,
-        ``mass_birth_mass``, ``mass_row_entropy_norm``,
-        ``mass_col_entropy_norm``, ``estimated_overlap_fraction``
     Ground-truth-aware (added if ground_truth_pairs supplied):
         ``foscttm``, ``landmark_mean_err``, ``landmark_median_err``,
         ``landmark_rmse``
@@ -534,14 +625,6 @@ def calculate_performance_metrics(
         else:
             results["scs_transferred"] = float("nan")
 
-    # --- Mass-conservation + overlap diagnostics -------------------------
-    mass = mass_conservation_diagnostics(
-        final_pi, n_A=final_pi.shape[0], n_B=final_pi.shape[1]
-    )
-    for k, v in mass.items():
-        results[f"mass_{k}"] = v
-    results["estimated_overlap_fraction"] = estimated_overlap_fraction(final_pi)
-
     # --- Ground-truth-aware metrics (FOSCTTM + landmark) -----------------
     gt_available = (
         sliceA is not None and sliceB is not None
@@ -610,16 +693,6 @@ def calculate_performance_metrics(
             rows.append((" Landmark median error", None, results["landmark_median_err"], "(lower=better)"))
             rows.append((" Landmark RMSE", None, results["landmark_rmse"], "(lower=better)"))
 
-        # Mass diagnostics
-        rows.append((" Estimated overlap fraction", None, results["estimated_overlap_fraction"], "(model selection)"))
-        rows.append((" Transported mass (total)", None, results["mass_total_mass"], "(<= 1 unbalanced)"))
-        rows.append((" Kept mass, source side", None, results["mass_kept_src_fraction"], ""))
-        rows.append((" Kept mass, target side", None, results["mass_kept_tgt_fraction"], ""))
-        rows.append((" Death mass (source vanished)", None, results["mass_death_mass"], ""))
-        rows.append((" Birth mass (target appeared)", None, results["mass_birth_mass"], ""))
-        rows.append((" Source marginal entropy (norm)", None, results["mass_row_entropy_norm"], "(1=uniform)"))
-        rows.append((" Target marginal entropy (norm)", None, results["mass_col_entropy_norm"], "(1=uniform)"))
-
         _print_table(rows, title="ALIGNMENT QUALITY METRICS")
 
         # Improvements for the original cost objectives
@@ -636,61 +709,3 @@ def calculate_performance_metrics(
         print()
 
     return results
-
-
-# ============================================================================
-# Compactness / variance diagnostics (unchanged from original)
-# ============================================================================
-
-def calculate_forward_reverse_compactness(pi_mat, sliceA, sliceB):
-    """
-    Diagnostic metric for spatial compactness.
-
-    Returns dict with:
-        'forward_compactness'  : avg target-side variance per source cell
-        'reverse_compactness'  : avg source-side variance per target cell
-        'effective_support_fwd': mean Renyi-2 effective support per source
-        'effective_support_rev': mean Renyi-2 effective support per target
-    """
-    pi_mat = np.asarray(pi_mat)
-    Xs = np.asarray(sliceA.obsm["spatial"])
-    Xt = np.asarray(sliceB.obsm["spatial"])
-    eps = 1e-12
-
-    pi_row_sums = pi_mat.sum(axis=1)
-    pi_row_sums_safe = np.maximum(pi_row_sums, eps)
-    pi_row_normalized = pi_mat / pi_row_sums_safe[:, None]
-    bary_t = pi_row_normalized @ Xt
-    var_fwd_E_x2 = pi_row_normalized @ np.sum(Xt ** 2, axis=1)
-    var_fwd_Ex_2 = np.sum(bary_t ** 2, axis=1)
-    active_sources = pi_row_sums > eps
-    var_fwd = np.clip(var_fwd_E_x2[active_sources] - var_fwd_Ex_2[active_sources], 0, None)
-    forward_compactness = float(np.mean(var_fwd)) if len(var_fwd) > 0 else 0.0
-
-    pi_col_sums = pi_mat.sum(axis=0)
-    pi_col_sums_safe = np.maximum(pi_col_sums, eps)
-    pi_col_normalized = pi_mat / pi_col_sums_safe[None, :]
-    bary_s = pi_col_normalized.T @ Xs
-    var_rev_E_x2 = pi_col_normalized.T @ np.sum(Xs ** 2, axis=1)
-    var_rev_Ex_2 = np.sum(bary_s ** 2, axis=1)
-    active_targets = pi_col_sums > eps
-    var_rev = np.clip(var_rev_E_x2[active_targets] - var_rev_Ex_2[active_targets], 0, None)
-    reverse_compactness = float(np.mean(var_rev)) if len(var_rev) > 0 else 0.0
-
-    eff_support_fwd = (pi_row_sums ** 2) / np.maximum(np.sum(pi_mat ** 2, axis=1), eps)
-    eff_support_rev = (pi_col_sums ** 2) / np.maximum(np.sum(pi_mat ** 2, axis=0), eps)
-    mean_eff_support_fwd = (
-        float(np.mean(eff_support_fwd[active_sources]))
-        if active_sources.any() else 0.0
-    )
-    mean_eff_support_rev = (
-        float(np.mean(eff_support_rev[active_targets]))
-        if active_targets.any() else 0.0
-    )
-
-    return {
-        "forward_compactness": forward_compactness,
-        "reverse_compactness": reverse_compactness,
-        "effective_support_fwd": mean_eff_support_fwd,
-        "effective_support_rev": mean_eff_support_rev,
-    }
