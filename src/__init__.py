@@ -10,6 +10,7 @@ from .metrices import (
 )
 
 from .visualize import (
+    stack_slices_pairwise,
     visualize_alignment,
     visualize_3d_stack,
 )
@@ -27,6 +28,7 @@ __all__ = [
     'align_multiple_slices',
     'calculate_performance_metrics',
     'calculate_forward_reverse_compactness',
+    'stack_slices_pairwise',
     'visualize_alignment',
     'visualize_3d_stack',
     'InteractiveCropSelector',
