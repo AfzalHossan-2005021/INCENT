@@ -36,17 +36,17 @@ from .visualize import (
 def hierarchical_pairwise_align(
     sliceA: AnnData,
     sliceB: AnnData,
-    alpha: float,
-    beta: float,
-    gamma: float,
+    alpha: float = 0.5,
+    beta: float = 0.5,
+    gamma: float = 0.25,
     delta: float = 0.75,
     numItermax: int = 100000,
     use_gpu: bool = True,
     resolution: float = 1.0,
     spatial_key: str = "spatial",
-    use_rep: Optional[str] = "X_pca",
+    use_rep: str = "X_pca",
     label_key: str = "cell_type_annot",
-    visualize_clusters: bool = True,
+    visualize_clusters: bool = False,
     verbose: bool = False,
     **kwargs
 ):
