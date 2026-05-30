@@ -8,7 +8,7 @@ from typing import Optional, Tuple, Union
 from scipy.spatial import cKDTree
 from sklearn.metrics.pairwise import euclidean_distances, cosine_distances
 
-from .clustering import cluster_cells_spatio_biological
+from .clustering import cluster_cells_spatial
 from .hierarchical import (
     build_slice_cluster_cache,
     compute_cluster_feature_costs,
@@ -57,8 +57,8 @@ def hierarchical_pairwise_align(
     Returns the cell-level alignment pi.
     """
     print("--- [HOT] Step 1: Clustering Cells into Mesoregions ---")
-    labelsA = cluster_cells_spatio_biological(sliceA, spatial_key=spatial_key, resolution=resolution)
-    labelsB = cluster_cells_spatio_biological(sliceB, spatial_key=spatial_key, resolution=resolution)
+    labelsA = cluster_cells_spatial(sliceA, spatial_key=spatial_key, resolution=resolution)
+    labelsB = cluster_cells_spatial(sliceB, spatial_key=spatial_key, resolution=resolution)
 
     # Pre-cache global cell types for cluster structure alignment
     all_types = np.array(sorted(set(sliceA.obs[label_key].astype(str)) | set(sliceB.obs[label_key].astype(str))), dtype=str)
