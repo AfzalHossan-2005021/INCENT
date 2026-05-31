@@ -1,60 +1,47 @@
-import numpy as np
 import ot
-import scipy.sparse as sp
 import torch
-from ot.gromov import solve_gromov_linesearch
-from ot.optim import cg, line_search_armijo
+
+import numpy as np
+import scipy.sparse as sp
 from tqdm import tqdm
+
+from ot.optim import line_search_armijo, cg
+from ot.gromov import solve_gromov_linesearch
 
 
 def select_backend(use_gpu=False, gpu_verbose=True):
     """
-    Select the appropriate backend (NumPy or PyTorch) based on GPU availability
-    and user preference.
+    Selects the appropriate backend (numpy or torch) based on GPU availability and user preference.
 
     Args:
-        use_gpu: If True, attempt to use the PyTorch CUDA backend.
-        gpu_verbose: If True, print a message describing the chosen backend.
-
+        use_gpu: Whether to use GPU if available.
+        gpu_verbose: Whether to print GPU information when selected.
     Returns:
-        Tuple ``(use_gpu, nx)`` where ``use_gpu`` reflects whether GPU was
-        actually selected and ``nx`` is a POT backend instance (always
-        non-None).
+        The selected backend module (numpy or torch).
     """
-    if use_gpu and torch.cuda.is_available():
-        if gpu_verbose:
-            print("Using GPU with PyTorch backend.")
-        return True, ot.backend.TorchBackend()
-
-    if use_gpu and not torch.cuda.is_available():
-        if gpu_verbose:
-            print("CUDA is not available on your system. Reverting to CPU with NumPy backend.")
-        return False, ot.backend.NumpyBackend()
-
-    # use_gpu is False
-    if gpu_verbose:
+    nx = None
+    if use_gpu:
         if torch.cuda.is_available():
-            print("Tip: CUDA is available on your system. Enable GPU support with use_gpu=True.")
+            nx = ot.backend.TorchBackend()
+            if gpu_verbose:
+                print("Using gpu with Pytorch backend.")
         else:
-            print("Using CPU with NumPy backend.")
-    return False, ot.backend.NumpyBackend()
+            use_gpu = False
+            nx = ot.backend.NumpyBackend()
+            if gpu_verbose:
+                print("CUDA is not available on your system. Reverting to CPU with Numpy backend.")
+    else:
+        nx = ot.backend.NumpyBackend()
+        if torch.cuda.is_available() and gpu_verbose:
+            print("Tip: CUDA is available on your system. You can enable GPU support by setting use_gpu=True.")
+        elif gpu_verbose:
+            print("Using cpu with Numpy backend.")
+    return use_gpu, nx
 
 
-def to_backend(x, nx, data_type=None, reference=None, device=None):
+def to_backend(x, nx, data_type=None, reference=None):
     """
-    Centralized helper to move arrays/tensors onto the requested POT backend
-    while keeping device and dtype consistent.
-
-    Resolution order for placement on Torch backends:
-      1. ``reference`` (if given) — match the device of the reference tensor
-         using POT's ``type_as`` semantics. This is the recommended path.
-      2. Explicit ``device`` argument (e.g. ``"cpu"``, ``"cuda"``,
-         ``"cuda:1"``).
-      3. Default to ``cuda`` when CUDA is available.
-
-    Passing a ``reference`` tensor takes precedence over both explicit
-    ``device`` and the implicit CUDA default, so callers can always force a
-    specific device by supplying any tensor already on it.
+    Centralized function to manage CPU-GPU movement and type consistency.
     """
     # Force to numpy safely
     if hasattr(x, 'cpu'):
@@ -63,29 +50,28 @@ def to_backend(x, nx, data_type=None, reference=None, device=None):
         x = x.numpy()
     elif hasattr(x, "todense"):
         x = x.todense()
-
+    
     # Optional typing to numpy type
     if data_type is not None:
         x = np.asarray(x, dtype=data_type)
     else:
         x = np.asarray(x)
-
+        
     x_nx = nx.from_numpy(x)
 
-    if reference is not None:
-        # Match device + dtype of reference using POT's type_as logic.
+    # Use reference tensor to match device/type if provided
+    # Otherwise set up PyTorch CUDA if backend is Torch and CUDA is available
+    if reference is not None: # Use POT type_as logic
         x_nx = nx.zeros(x_nx.shape, type_as=reference) + x_nx
     elif nx.__class__.__name__ == 'TorchBackend':
         import torch
-        if device is not None:
-            x_nx = x_nx.to(device)
-        elif torch.cuda.is_available():
+        if torch.cuda.is_available():
             x_nx = x_nx.cuda()
 
     return x_nx
 
 
-def fused_gromov_wasserstein_incent(M, C1, C2, p, q, G_init = None, alpha = 0.1, reg_compact=1.0, armijo=True, log=False, numItermax=6000, numItermaxEmd=100000, tol_rel=1e-9, tol_abs=1e-9, verbose=False, **kwargs):
+def fused_gromov_wasserstein_incent(M, C1, C2, p, q, G_init = None, alpha = 0.1, armijo=False, log=False, numItermax=6000, numItermaxEmd=100000, tol_rel=1e-9, tol_abs=1e-9, verbose=False, **kwargs):
     """
     This method is written by Anup Bhowmik, CSE, BUET
 
@@ -110,7 +96,6 @@ def fused_gromov_wasserstein_incent(M, C1, C2, p, q, G_init = None, alpha = 0.1,
     # loss_fun: loss function to use (square loss)
     # alpha: step size
     # armijo: whether to use armijo line search
-    # reg_compact: the quadratic compactness regularizer coefficient (Form B)
     # log: whether to print log
     # numItermax: maximum number of iterations
     # tol_rel: relative tolerance
@@ -130,34 +115,13 @@ def fused_gromov_wasserstein_incent(M, C1, C2, p, q, G_init = None, alpha = 0.1,
         G0 = (1/nx.sum(G_init)) * G_init
     G0 = to_backend(G0, nx)
 
-    p_inv = 1.0 / nx.maximum(p, 1e-12)
-    q_inv = 1.0 / nx.maximum(q, 1e-12)
-
-    C1_sq = C1 ** 2
-    C2_sq = C2 ** 2
-
-    # Precompute constants for general GW (square loss)
-    constC = nx.dot(C1_sq, p)[:, None] + nx.dot(q, C2_sq)[None, :]
-
     def f(G):
-        # General GW loss
-        gw_loss = nx.sum(constC * G) - 2 * nx.sum(nx.dot(C1, nx.dot(G, C2)) * G)
-        # Form A Compactness penalty requires squared distances for precise variance
-        if reg_compact > 0:
-            compact_fwd = 0.5 * nx.sum((p_inv[:, None] * G) @ C2_sq * G)
-            compact_rev = 0.5 * nx.sum(C1_sq @ (G * q_inv[None, :]) * G)
-            return gw_loss + reg_compact * (compact_fwd + compact_rev)
-        return gw_loss
+        # Base Gromov-Wasserstein term
+        return nx.sum((G @ G.T)  * C1) + nx.sum((G.T @ G)  * C2)
 
     def df(G):
-        # General GW gradient
-        gw_grad = constC - 2 * nx.dot(C1, nx.dot(G, C2))
-        # Gradient of Form A Compactness term
-        if reg_compact > 0:
-            grad_fwd = (p_inv[:, None] * G) @ C2_sq
-            grad_rev = C1_sq @ (G * q_inv[None, :])
-            return gw_grad + reg_compact * (grad_fwd + grad_rev)
-        return gw_grad
+        # Gradient of GW term
+        return 2 * (nx.dot(C1, G) + nx.dot(G, C2))
 
     if armijo:
         def line_search(cost, G, deltaG, Mi, cost_G, df_G, **kwargs):
@@ -174,6 +138,7 @@ def fused_gromov_wasserstein_incent(M, C1, C2, p, q, G_init = None, alpha = 0.1,
             return solve_gromov_linesearch(G, deltaG, cost_G, C1, C2, M=(1-alpha)*M, reg=alpha, alpha_min=0.0, alpha_max=1.0, nx=nx, **kwargs)
 
     if log:
+   
         res, log = cg(p, q, (1-alpha)*M, alpha, f, df, G0=G0, line_search=line_search, numItermax=numItermax, numItermaxEmd=numItermaxEmd, stopThr=tol_rel, stopThr2=tol_abs, verbose=verbose, log=log, nx=nx, **kwargs)
 
         fgw_dist = log['loss'][-1]
@@ -204,18 +169,18 @@ def kl_divergence_corresponding_backend(X, Y):
 
     nx = ot.backend.get_backend(X,Y)
 
-    X = X/nx.sum(X,axis=1, keepdims=True)
-    Y = Y/nx.sum(Y,axis=1, keepdims=True)
-    log_X = nx.log(X)
-    log_Y = nx.log(Y)
+    epsilon = 1e-12
+
+    X = X/(nx.sum(X,axis=1, keepdims=True) + epsilon)
+    Y = Y/(nx.sum(Y,axis=1, keepdims=True) + epsilon)
+    log_X = nx.log(X + epsilon)
+    log_Y = nx.log(Y + epsilon)
     X_log_X = nx.einsum('ij,ij->i',X,log_X)
     X_log_X = nx.reshape(X_log_X,(1,X_log_X.shape[0]))
 
     X_log_Y = nx.einsum('ij,ij->i',X,log_Y)
     X_log_Y = nx.reshape(X_log_Y,(1,X_log_Y.shape[0]))
-
     D = X_log_X.T - X_log_Y.T
-    # Stay on the active backend; the caller decides when to materialize numpy.
     return D
 
 
@@ -236,21 +201,21 @@ def jensenshannon_distance_1_vs_many_backend(X, Y):
     assert X.shape[0] == 1
     # device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-    nx = ot.backend.get_backend(X, Y)        # np or torch depending upon gpu availability
-    X = nx.concatenate([X] * Y.shape[0], axis=0)  # broadcast X
-    X = X / nx.sum(X, axis=1, keepdims=True)      # normalize
-    Y = Y / nx.sum(Y, axis=1, keepdims=True)      # normalize
+    nx = ot.backend.get_backend(X,Y)        # np or torch depending upon gpu availability
+    X = nx.concatenate([X] * Y.shape[0], axis=0) # broadcast X
+    X = X/(nx.sum(X,axis=1, keepdims=True) + 1e-12)   # normalize
+    Y = Y/(nx.sum(Y,axis=1, keepdims=True) + 1e-12)   # normalize
     M = (X + Y) / 2.0
     kl_X_M = kl_divergence_corresponding_backend(X, M)
     kl_Y_M = kl_divergence_corresponding_backend(Y, M)
-    js_dist = nx.sqrt((kl_X_M + kl_Y_M) / 2.0).T[0]
+    # Clip small negative values due to floating point error before sqrt
+    js_sq = (kl_X_M + kl_Y_M) / 2.0
+    js_dist = nx.sqrt(nx.maximum(js_sq, 0.0)).T[0]
     return js_dist
 
 
 def jensenshannon_divergence_backend(X, Y):
-    """
-    This function is added ny Nuwaisir
-    
+    """    
     Returns pairwise JS divergence (over all pairs of samples) of two matrices X and Y.
 
     Takes advantage of POT backend to speed up computation.
@@ -266,32 +231,27 @@ def jensenshannon_divergence_backend(X, Y):
 
     assert X.shape[1] == Y.shape[1], "X and Y do not have the same number of features."
 
-    nx = ot.backend.get_backend(X,Y)
-
-    X = X/nx.sum(X,axis=1, keepdims=True)
-    Y = Y/nx.sum(Y,axis=1, keepdims=True)
+    nx = ot.backend.get_backend(X,Y)        
+    
+    X = X/(nx.sum(X,axis=1, keepdims=True) + 1e-12)
+    Y = Y/(nx.sum(Y,axis=1, keepdims=True) + 1e-12)
 
     n = X.shape[0]
     m = Y.shape[0]
-
+    
     js_dist = nx.zeros((n, m))
 
     for i in tqdm(range(n)):
         js_dist[i, :] = jensenshannon_distance_1_vs_many_backend(X[i:i+1], Y)
-
+        
     print("Finished calculating cost matrix")
-    # print(nx.unique(nx.isnan(js_dist)))
 
-    # Return on the active backend; downstream callers will route through
-    # ``to_backend`` or ``nx.to_numpy`` as needed. Avoids CPU/GPU device
-    # mixing that the previous ``.numpy()`` round-trip introduced.
     return js_dist
-
 
 def pairwise_msd(A, B):
     """
     Returns pairwise mean squared distance (over all pairs of samples) of two matrices A and B.
-    
+
     Args:
         A: np array with dim (m_samples by d_features)
         B: np array with dim (n_samples by d_features)
