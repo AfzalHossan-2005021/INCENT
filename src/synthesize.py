@@ -770,7 +770,7 @@ def preview_crop(
 
 
 if __name__ == "__main__":
-    data_dir = "./"
+    data_dir = "../data/"
     data_file = "adata90wk_donor_id_3_slice_0.h5ad"
 
     adata = sc.read_h5ad(data_dir + data_file)

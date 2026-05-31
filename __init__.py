@@ -10,6 +10,7 @@ from .src import (
     create_interactive_rectangular_portion,
     select_rectangular_portion_blocking,
     preview_crop,
+    perturb_portion
 )
 
 __all__ = [
@@ -24,4 +25,5 @@ __all__ = [
     'create_interactive_rectangular_portion',
     'select_rectangular_portion_blocking',
     'preview_crop',
+    'perturb_portion'
 ]

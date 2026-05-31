@@ -21,6 +21,10 @@ from .synthesize import (
     preview_crop,
 )
 
+from .perturb import (
+    perturb_portion,
+)
+
 __all__ = [
     'pairwise_align',
     'hierarchical_pairwise_align',
@@ -33,4 +37,5 @@ __all__ = [
     'create_interactive_rectangular_portion',
     'select_rectangular_portion_blocking',
     'preview_crop',
+    'perturb_portion'
 ]
