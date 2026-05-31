@@ -83,8 +83,6 @@ import numpy as np
 import scanpy as sc
 from anndata import AnnData
 
-from benchmarks import data
-
 
 # ----------------------------------------------------------------------------
 # Geometry helpers (convention identical to synthesize.py / core.py)
