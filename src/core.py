@@ -5,7 +5,7 @@ import numpy as np
 from anndata import AnnData
 from numpy.typing import NDArray
 from typing import Optional, Tuple, Union
-from scipy.spatial import cKDTree
+from scipy.spatial import cKDTree, Voronoi
 from sklearn.metrics.pairwise import euclidean_distances, cosine_distances
 
 from .clustering import cluster_cells_spatial
@@ -465,21 +465,107 @@ def pairwise_align(
     return pi
 
 
-def estimate_characteristic_spacing(adata, k=3, spatial_key="spatial"):
+def _voronoi_cell_areas(coords):
+    """Areas of the bounded Voronoi cells of a 2D point set.
+
+    Cells on the convex-hull boundary have unbounded Voronoi regions and are
+    skipped, so the resulting spacing estimate is edge-corrected by construction.
+    Returns an empty array when a Voronoi diagram with bounded cells cannot be
+    built (fewer than 4 points, (near-)collinear or duplicate input).
     """
-    Robust local spacing estimate: median distance to the k-th nearest neighbor.
-    Useful for choosing radii that scale with local cell density.
+    coords = np.asarray(coords, dtype=np.float64)
+    if coords.shape[0] < 4:
+        return np.empty(0, dtype=np.float64)
+    try:
+        vor = Voronoi(coords)
+    except Exception:
+        return np.empty(0, dtype=np.float64)
+
+    areas = []
+    for pt_idx in range(coords.shape[0]):
+        region = vor.regions[vor.point_region[pt_idx]]
+        if len(region) == 0 or -1 in region:
+            continue  # unbounded region -> boundary cell -> excluded (edge correction)
+        verts = vor.vertices[region]
+        x, y = verts[:, 0], verts[:, 1]
+        a = 0.5 * np.abs(np.dot(x, np.roll(y, 1)) - np.dot(y, np.roll(x, 1)))  # shoelace
+        if np.isfinite(a) and a > 0:
+            areas.append(a)
+    return np.asarray(areas, dtype=np.float64)
+
+
+def _interior_voronoi_mask(coords):
+    """Boolean mask of points whose Voronoi cell is bounded (interior cells)."""
+    coords = np.asarray(coords, dtype=np.float64)
+    mask = np.zeros(coords.shape[0], dtype=bool)
+    if coords.shape[0] < 4:
+        return mask
+    try:
+        vor = Voronoi(coords)
+    except Exception:
+        return mask
+    for pt_idx in range(coords.shape[0]):
+        region = vor.regions[vor.point_region[pt_idx]]
+        if len(region) > 0 and -1 not in region:
+            mask[pt_idx] = True
+    return mask
+
+
+def estimate_characteristic_spacing(adata, k=3, spatial_key="spatial", method="voronoi"):
+    """Robust estimate of the characteristic cell spacing of a section.
+
+    A single length scale used to size the footprint rasterization grid, the
+    cellular neighborhood radii, and the spatial-distance normalization. By
+    default it is derived from the Voronoi tessellation, which needs no
+    neighbor-count parameter and is edge-corrected by construction.
+
+    Args:
+        adata: Section with coordinates in ``adata.obsm[spatial_key]``.
+        k: Neighbor order for the k-NN methods (ignored by ``method='voronoi'``).
+            Retained for backward compatibility.
+        spatial_key: Key into ``adata.obsm`` holding the (n, 2) coordinates.
+        method: One of
+            'voronoi'      - sqrt(median bounded-Voronoi-cell area). Parameter-free,
+                             edge-corrected. Default; falls back to 'knn' if no
+                             bounded cell can be formed.
+            'knn_interior' - median k-th nearest-neighbor distance over interior
+                             (bounded-Voronoi) cells only. Edge-corrected k-NN.
+            'knn'          - median k-th nearest-neighbor distance over all cells.
+                             Original behavior; kept for sensitivity analysis.
+
+    Returns:
+        The characteristic spacing as a float, or 1.0 for degenerate input.
+
+    Notes:
+        For a homogeneous 2D Poisson field of intensity lambda, the mean Voronoi
+        cell area is 1/lambda, so sqrt(median area) ~ 0.96 / sqrt(lambda); the
+        median k=3 NN distance is ~ 0.93 / sqrt(lambda). The two estimators agree
+        to within ~4% on uniform tissue, so the radius multipliers and the
+        grid factor need no retuning; the Voronoi form merely removes the
+        arbitrary choice of k and the convex-hull boundary bias.
     """
     coords = np.asarray(adata.obsm[spatial_key], dtype=np.float64)
     n = coords.shape[0]
     if n < 2:
         return 1.0
 
-    k_eff = min(k + 1, n)  # +1 because nearest neighbor includes self at distance 0
+    if method == "voronoi":
+        areas = _voronoi_cell_areas(coords)
+        if areas.size > 0:
+            return float(np.sqrt(np.median(areas)))
+        method = "knn"  # degenerate geometry: fall back to k-NN
+
+    # k-NN path ('knn' and 'knn_interior'); +1 because the query returns self.
+    k_eff = min(k + 1, n)
     tree = cKDTree(coords)
     dists, _ = tree.query(coords, k=k_eff)
-
     kth = dists[:, -1]
+
+    if method == "knn_interior":
+        interior = _interior_voronoi_mask(coords)
+        if interior.any():
+            kth = kth[interior]
+
     kth = kth[np.isfinite(kth) & (kth > 0)]
     if kth.size == 0:
         return 1.0
