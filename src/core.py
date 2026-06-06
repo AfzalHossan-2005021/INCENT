@@ -215,7 +215,7 @@ def hierarchical_pairwise_align(
         # Build 2D occupancy maps
         max_idx_A = grid_A.max(axis=0)
         max_idx_B = grid_B.max(axis=0)
-        grid_bounds = np.maximum(max_idx_A, max_idx_B)
+        grid_bounds = np.maximum(max_idx_A, max_idx_B) + 5  # pad for safety
         
         from scipy.ndimage import binary_dilation
         mask_A = np.zeros(grid_bounds, dtype=bool)
