@@ -215,7 +215,7 @@ def hierarchical_pairwise_align(
         # Build 2D occupancy maps
         max_idx_A = grid_A.max(axis=0)
         max_idx_B = grid_B.max(axis=0)
-        grid_bounds = np.maximum(max_idx_A, max_idx_B) + 5  # pad for safety
+        grid_bounds = np.maximum(max_idx_A, max_idx_B)
         
         from scipy.ndimage import binary_dilation
         mask_A = np.zeros(grid_bounds, dtype=bool)
@@ -247,8 +247,8 @@ def hierarchical_pairwise_align(
         sliceB_shadow = sliceB[idx_B_shadow].copy()
         
         # Scaling the decay dynamically based on the width of the shadow
-        sigma_A = max(1e-5, np.max(dist_A[idx_A_shadow]) / 2.0)
-        sigma_B = max(1e-5, np.max(dist_B[idx_B_shadow]) / 2.0)
+        sigma_A = max(1e-5, np.max(dist_A[idx_A_shadow]))
+        sigma_B = max(1e-5, np.max(dist_B[idx_B_shadow]))
         
         weight_A_shadow = np.exp(- (dist_A[idx_A_shadow]**2) / (2 * sigma_A**2))
         weight_B_shadow = np.exp(- (dist_B[idx_B_shadow]**2) / (2 * sigma_B**2))
