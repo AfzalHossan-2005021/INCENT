@@ -200,7 +200,7 @@ def hierarchical_pairwise_align(
         # capturing the actual boundaries, contours, and internal holes perfectly.
         s_A = estimate_characteristic_spacing(sliceA, spatial_key=spatial_key)
         s_B = estimate_characteristic_spacing(sliceB, spatial_key=spatial_key)
-        grid_size = max(s_A, s_B) * 2.0  # Granularity is roughly 2 cell spaces wide
+        grid_size = max(s_A, s_B)
         
         # Compute common coordinate boundaries
         min_coords = np.minimum(coords_A_aligned.min(axis=0), coords_B_aligned.min(axis=0))
