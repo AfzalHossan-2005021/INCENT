@@ -373,6 +373,78 @@ def visualize_alignment(
     return new_slices
 
 
+def visualize_alignment_with_anchors(
+    slices: List[AnnData],
+    anchor_indices: List[np.ndarray],
+    spatial_key: str = "spatial",
+    alpha: float = 0.5,
+    s: float = 1.0,
+    colors: list = None
+):
+    """
+    Visualizes the 2D alignment of multiple sequential slices after Procrustes refinement.
+    Cells outside the selected anchors are shown in gray; anchor cells retain their slice color.
+
+    Args:
+        slices: List of AnnData objects to align and visualize.
+        pis: List of OT transport matrices (len = len(slices) - 1).
+        anchor_indices: List of index arrays (one per slice) marking the anchor/overlap cells.
+                        Pass None for a slice to color all its cells normally.
+        spatial_key: Key in .obsm storing spatial coordinates.
+        alpha: Transparency for anchor (colored) points.
+        s: Point size.
+        colors: Optional per-slice colors. Defaults to red/blue for 2 slices, tab20 otherwise.
+    """
+    n_slices = len(slices)
+
+    if colors is None:
+        if n_slices == 2:
+            colors = ['#e41a1c', '#377eb8']
+        else:
+            cmap = plt.get_cmap('tab20')
+            colors = [cmap(i % 20) for i in range(n_slices)]
+    elif len(colors) < n_slices:
+        colors = [colors[i % len(colors)] for i in range(n_slices)]
+
+    print(f"====================\nAligned {n_slices} slices")
+    fig = plt.figure(figsize=(8, 8))
+
+    for idx, (slice_obj, color) in enumerate(zip(slices, colors)):
+        coords = slice_obj.obsm[spatial_key]
+        n_cells = coords.shape[0]
+        label = f'Slice {idx} (Anchor)' if idx == 0 else f'Slice {idx}'
+
+        anchor_idx = anchor_indices[idx] if idx < len(anchor_indices) else None
+
+        if anchor_idx is None or len(anchor_idx) == n_cells:
+            # All cells are anchors — same as visualize_alignment
+            plt.scatter(coords[:, 0], coords[:, 1], s=s, alpha=alpha, label=label, c=[color] * n_cells)
+        else:
+            anchor_mask = np.zeros(n_cells, dtype=bool)
+            anchor_mask[anchor_idx] = True
+
+            # Gray for non-anchor cells (no label to keep legend clean)
+            if not anchor_mask.all():
+                plt.scatter(
+                    coords[~anchor_mask, 0], coords[~anchor_mask, 1],
+                    s=s, alpha=alpha, c='lightgray', zorder=1
+                )
+
+            # Colored for anchor cells
+            if anchor_mask.any():
+                plt.scatter(
+                    coords[anchor_mask, 0], coords[anchor_mask, 1],
+                    s=s, alpha=alpha, label=label, c=[color] * int(anchor_mask.sum()), zorder=2
+                )
+
+    plt.axis("equal")
+    plt.axis("off")
+    if n_slices <= 10:
+        plt.legend(loc='upper right', bbox_to_anchor=(1.15, 1.0))
+    plt.tight_layout()
+    plt.show()
+
+
 def visualize_3d_stack(
     slices: list,
     pi_matrices: list,

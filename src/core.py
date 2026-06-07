@@ -25,11 +25,13 @@ from .utils import (
     to_backend
 )
 from .visualize import (
+    stack_slices_pairwise,
     visualize_clustered_slices,
     visualize_cluster_mapping,
     visualize_initial_connected_component,
     visualize_selected_anchors,
     visualize_global_overlap_projection,
+    visualize_alignment_with_anchors,
 )
 
 
@@ -188,10 +190,16 @@ def hierarchical_pairwise_align(
                         pi_full[grid_A, grid_B] += block_mass
 
     print("--- [HOT] Step 7: Global Refinement via Overlap Projection ---")
-    from .visualize import stack_slices_pairwise
     try:
         # 1. Geometrically align full slices using the partial block solution
         aligned_slices = stack_slices_pairwise([sliceA, sliceB], [pi_full], output_params=False)
+        if visualize_clusters:
+            visualize_alignment_with_anchors(
+                aligned_slices,
+                [idx_A,idx_B],
+                spatial_key=spatial_key,
+            )
+        
         coords_A_aligned = np.asarray(aligned_slices[0].obsm[spatial_key])
         coords_B_aligned = np.asarray(aligned_slices[1].obsm[spatial_key])
         
