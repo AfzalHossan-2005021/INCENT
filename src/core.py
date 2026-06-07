@@ -13,7 +13,9 @@ from .hierarchical import (
     build_slice_cluster_cache,
     compute_cluster_feature_costs,
     compute_cluster_structural_matrix,
+    compute_pairwise_mutual_information_contribution,
     extract_continuous_macro_section,
+    fit_weighted_rigid_transform,
     run_coarse_partial_fgw,
 )
 from .utils import (
@@ -35,6 +37,149 @@ from .visualize import (
 )
 
 
+# Dimensionless mesoscale constant inherited from the multiscale neighborhood
+# descriptor's outer radius multiplier (see ``radius_multipliers`` default in
+# ``calculate_neighborhood_dissimilarity``). A supercell is sized to cover
+# roughly one such neighborhood footprint, so the coarse and fine stages of the
+# pipeline commit to a single, consistent spatial scale.
+NEIGHBORHOOD_OUTER_MULTIPLIER = 5.0
+
+
+def estimate_coarsen_length(sliceA, sliceB, spatial_key="spatial"):
+    """
+    Derive the shared supercell seed spacing from the two slices' intrinsic geometry.
+
+    The characteristic cell spacing ``s`` is estimated for each slice with the
+    parameter-free, edge-corrected Voronoi estimator and shared as ``max(s_A, s_B)``
+    (the same convention used for the neighborhood radii and the overlap grid).
+    The supercell side ``S`` is then set so that one supercell covers about the
+    same area as the outer neighborhood-descriptor disk of radius
+    ``NEIGHBORHOOD_OUTER_MULTIPLIER * s``, i.e. ``S = sqrt(pi) * R_outer``. This
+    removes the old cell-count-coupled magic number while keeping both slices at
+    one shared physical scale.
+
+    Returns:
+        (S, s): the supercell seed spacing and the shared characteristic spacing.
+    """
+    s_A = estimate_characteristic_spacing(sliceA, spatial_key=spatial_key)
+    s_B = estimate_characteristic_spacing(sliceB, spatial_key=spatial_key)
+    s = max(s_A, s_B)
+    r_outer = NEIGHBORHOOD_OUTER_MULTIPLIER * s
+    S = float(np.sqrt(np.pi) * r_outer)
+    return S, s
+
+
+def _coarse_matchability(Pi_cluster, centroids_A, centroids_B):
+    """
+    Cross-slice matchability of a coarse coupling, for automatic scale selection.
+
+    Specificity is the total mutual-information contribution of the coupling
+    under the size-preserving independence null (higher = sharper, more
+    one-to-one cluster correspondence). The rigid residual is the median
+    centroid displacement of reciprocal-best cluster pairs after the best rigid
+    fit, normalized by the slice-B centroid spread (lower = more geometrically
+    consistent constellations). Both reuse existing hierarchical-stage utilities.
+    """
+    mi = float(np.sum(compute_pairwise_mutual_information_contribution(Pi_cluster)))
+
+    if Pi_cluster.size == 0 or np.sum(Pi_cluster) <= 0:
+        return mi, np.inf
+
+    a_best = Pi_cluster.argmax(axis=1)
+    b_best = Pi_cluster.argmax(axis=0)
+    pairs = [
+        (i, int(a_best[i]))
+        for i in range(Pi_cluster.shape[0])
+        if Pi_cluster[i, a_best[i]] > 0 and b_best[a_best[i]] == i
+    ]
+    if len(pairs) < 2:
+        return mi, np.inf
+
+    src = centroids_A[[i for i, _ in pairs]]
+    tgt = centroids_B[[j for _, j in pairs]]
+    R, t = fit_weighted_rigid_transform(src, tgt)
+    resid = float(np.median(np.linalg.norm(tgt - (src @ R.T + t), axis=1)))
+    scale = float(np.median(np.linalg.norm(centroids_B - centroids_B.mean(axis=0), axis=1))) + 1e-12
+    return mi, resid / scale
+
+
+def select_coarsen_length(
+    sliceA,
+    sliceB,
+    spatial_key="spatial",
+    use_rep="X_pca",
+    label_key="cell_type_annot",
+    alpha=0.5,
+    delta=0.75,
+    multipliers=(0.6, 0.8, 1.0, 1.3, 1.6),
+):
+    """
+    Pick the supercell seed spacing that maximizes cross-slice cluster matchability.
+
+    Candidate scales are a geometric ladder around the intrinsic default. For
+    each, both slices are tessellated, the coarse partial FGW coupling is solved,
+    and the pair is scored by ``_coarse_matchability``. Specificity (maximize)
+    and rigid residual (minimize) are min-max normalized across candidates and
+    summed; the best score wins, with the coarser scale used as a tie-break
+    (coarser is cheaper downstream). This is parameter-free but ~Nx the coarse
+    FGW cost, so it is opt-in.
+    """
+    S0, _ = estimate_coarsen_length(sliceA, sliceB, spatial_key=spatial_key)
+    candidates = [float(m) * S0 for m in multipliers]
+
+    all_types = np.array(sorted(
+        set(sliceA.obs[label_key].astype(str)) | set(sliceB.obs[label_key].astype(str))
+    ), dtype=str)
+
+    scored = []  # (S, mi, resid)
+    for S in candidates:
+        labelsA = cluster_cells_spatial(sliceA, spatial_key=spatial_key, coarsen_length=S)
+        labelsB = cluster_cells_spatial(sliceB, spatial_key=spatial_key, coarsen_length=S)
+        if len(np.unique(labelsA)) < 2 or len(np.unique(labelsB)) < 2:
+            continue
+
+        cache_A = build_slice_cluster_cache(
+            sliceA, labelsA, spatial_key=spatial_key, feature_key=use_rep,
+            label_key=label_key, all_types=all_types,
+        )
+        cache_B = build_slice_cluster_cache(
+            sliceB, labelsB, spatial_key=spatial_key, feature_key=use_rep,
+            label_key=label_key, all_types=all_types,
+        )
+        M_cluster = compute_cluster_feature_costs(
+            cache_A.mu_expr, cache_A.mu_struct, cache_B.mu_expr, cache_B.mu_struct, delta=delta,
+        )
+        C_A = compute_cluster_structural_matrix(cache_A.centroids)
+        C_B = compute_cluster_structural_matrix(cache_B.centroids)
+        Pi = run_coarse_partial_fgw(M_cluster, C_A, C_B, cache_A.masses, cache_B.masses, alpha=alpha)
+
+        mi, resid = _coarse_matchability(Pi, cache_A.centroids, cache_B.centroids)
+        scored.append((S, mi, resid))
+        print(f"  [sweep] S={S:.4g}: specificity(MI)={mi:.4g}, rigid-residual={resid:.4g}")
+
+    if not scored:
+        return S0
+
+    S_arr = np.array([s for s, _, _ in scored], dtype=np.float64)
+    mi_arr = np.array([m for _, m, _ in scored], dtype=np.float64)
+    resid_arr = np.array([r for _, _, r in scored], dtype=np.float64)
+
+    def _minmax(x, higher_is_better):
+        finite = np.isfinite(x)
+        y = np.where(finite, x, np.nan)
+        lo, hi = np.nanmin(y), np.nanmax(y)
+        if not np.isfinite(lo) or hi - lo < 1e-12:
+            base = np.zeros_like(x, dtype=np.float64)
+        else:
+            base = (np.nan_to_num(y, nan=lo) - lo) / (hi - lo)
+        return base if higher_is_better else (1.0 - base)
+
+    combined = _minmax(mi_arr, True) + _minmax(resid_arr, False)
+    best = np.max(combined)
+    winners = np.where(combined >= best - 1e-9)[0]
+    return float(S_arr[winners[np.argmax(S_arr[winners])]])
+
+
 def hierarchical_pairwise_align(
     sliceA: AnnData,
     sliceB: AnnData,
@@ -44,7 +189,8 @@ def hierarchical_pairwise_align(
     delta: float = 0.75,
     numItermax: int = 100000,
     use_gpu: bool = True,
-    resolution: float = 1.0,
+    coarsen_scale: Optional[float] = None,
+    auto_coarsen_scale: bool = False,
     spatial_key: str = "spatial",
     use_rep: str = "X_pca",
     label_key: str = "cell_type_annot",
@@ -55,12 +201,41 @@ def hierarchical_pairwise_align(
     """
     Performs Hierarchical OT by clustering cells into mesoregions, aligning clusters with Partial FGW,
     and then restricting the cell-level OT matchings to the aligned blocks.
-    
+
+    The mesoregions are uniform, contiguous supercells produced by a deterministic
+    grid-seeded centroidal Voronoi tessellation (see ``cluster_cells_spatial``).
+    Both slices are tessellated at one shared physical scale so the supercells
+    match in size, shape, and position -- the property the cluster-level FGW
+    alignment depends on. The scale is chosen automatically; there is no
+    magic-number cluster count and no per-call resolution knob.
+
+    Args:
+        coarsen_scale: Optional hard override of the supercell seed spacing (a
+            physical length in coordinate units). When ``None`` the scale is
+            derived from the slices' intrinsic geometry.
+        auto_coarsen_scale: When ``True`` (and ``coarsen_scale`` is ``None``),
+            select the scale by sweeping candidates and maximizing cross-slice
+            cluster matchability instead of using the intrinsic default. Slower.
+
     Returns the cell-level alignment pi.
     """
     print("--- [HOT] Step 1: Clustering Cells into Mesoregions ---")
-    labelsA = cluster_cells_spatial(sliceA, spatial_key=spatial_key, resolution=resolution)
-    labelsB = cluster_cells_spatial(sliceB, spatial_key=spatial_key, resolution=resolution)
+    if coarsen_scale is not None:
+        S = float(coarsen_scale)
+        print(f"Coarsening scale (user-supplied): S={S:.4g}")
+    elif auto_coarsen_scale:
+        S = select_coarsen_length(
+            sliceA, sliceB,
+            spatial_key=spatial_key, use_rep=use_rep, label_key=label_key,
+            alpha=alpha, delta=delta,
+        )
+        print(f"Coarsening scale (auto, matchability sweep): S={S:.4g}")
+    else:
+        S, s = estimate_coarsen_length(sliceA, sliceB, spatial_key=spatial_key)
+        print(f"Coarsening scale (intrinsic): S={S:.4g} (characteristic spacing s={s:.4g})")
+
+    labelsA = cluster_cells_spatial(sliceA, spatial_key=spatial_key, coarsen_length=S)
+    labelsB = cluster_cells_spatial(sliceB, spatial_key=spatial_key, coarsen_length=S)
 
     # Pre-cache global cell types for cluster structure alignment
     all_types = np.array(sorted(set(sliceA.obs[label_key].astype(str)) | set(sliceB.obs[label_key].astype(str))), dtype=str)
