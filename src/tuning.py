@@ -43,6 +43,15 @@ DEFAULT_INIT = {"alpha": 0.5, "beta": 0.5, "gamma": 0.25, "alpha_cluster": 0.5, 
 WEIGHT_KEYS = ("alpha", "beta", "gamma", "alpha_cluster", "delta")
 
 
+def gpu_available() -> bool:
+    """True if a CUDA device is usable (so the FGW OT runs on GPU via the POT torch backend)."""
+    try:
+        import torch
+        return bool(torch.cuda.is_available())
+    except Exception:
+        return False
+
+
 # ----------------------------------------------------------------------------
 # helpers
 # ----------------------------------------------------------------------------
@@ -212,7 +221,8 @@ def select_alignment_weights(
     """
     init = dict(init or DEFAULT_INIT)
     align_kwargs = dict(align_kwargs or {})
-    align_kwargs.setdefault("use_gpu", False)
+    align_kwargs.setdefault("use_gpu", gpu_available())
+    align_kwargs.setdefault("gpu_verbose", False)
     align_kwargs.setdefault("verbose", False)
     align_kwargs.setdefault("visualize_clusters", False)
     label_key = align_kwargs.get("label_key", "cell_type_annot")
@@ -288,7 +298,8 @@ def select_weights_unsupervised(
     """
     init = dict(init or DEFAULT_INIT)
     align_kwargs = dict(align_kwargs or {})
-    align_kwargs.setdefault("use_gpu", False)
+    align_kwargs.setdefault("use_gpu", gpu_available())
+    align_kwargs.setdefault("gpu_verbose", False)
     align_kwargs.setdefault("verbose", False)
     align_kwargs.setdefault("visualize_clusters", False)
     spatial_key = align_kwargs.get("spatial_key", "spatial")

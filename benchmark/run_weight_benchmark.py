@@ -34,6 +34,7 @@ from src.tuning import (
     select_alignment_weights,
     make_self_alignment_instances,
     simplex_grid,
+    gpu_available,
     DEFAULT_INIT,
     _quiet,
 )
@@ -194,11 +195,16 @@ def run_weight_benchmark(
     If ``outdir`` is given, writes ``results.json`` and figures.
     """
     align_kwargs = dict(align_kwargs or {})
-    align_kwargs.setdefault("use_gpu", False)
+    align_kwargs.setdefault("use_gpu", gpu_available())  # use CUDA for the FGW OT if present
+    align_kwargs.setdefault("gpu_verbose", False)
     align_kwargs.setdefault("verbose", False)
     align_kwargs.setdefault("visualize_clusters", False)
     label_key = align_kwargs.get("label_key", "cell_type_annot")
     spatial_key = align_kwargs.get("spatial_key", "spatial")
+    if align_kwargs["use_gpu"]:
+        print("[benchmark] GPU (CUDA) enabled for alignment OT.")
+    else:
+        print("[benchmark] running on CPU (no CUDA device detected or use_gpu=False).")
 
     # A. select robust defaults on the development split
     sel = select_alignment_weights(
@@ -327,8 +333,15 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser(description="Synthetic weight-selection benchmark for INCENT.")
     ap.add_argument("--input_h5ad", required=True, help="Source slice (.h5ad) to crop/perturb.")
     ap.add_argument("--outdir", default="results/weight_benchmark")
+    ap.add_argument("--use_gpu", choices=["auto", "true", "false"], default="auto",
+                    help="Use CUDA for the alignment OT. 'auto' (default) uses the GPU if available.")
     ap.add_argument("--seed", type=int, default=0)
     args = ap.parse_args()
+
+    if args.use_gpu == "auto":
+        use_gpu = gpu_available()
+    else:
+        use_gpu = (args.use_gpu == "true")
 
     base = sc.read_h5ad(args.input_h5ad)
     res = run_weight_benchmark(
@@ -337,6 +350,7 @@ if __name__ == "__main__":
         test_perturb=DEFAULT_TEST_PERTURB,
         severity_axes=DEFAULT_SEVERITY_AXES,
         baseline_perturb=DEFAULT_BASELINE_PERTURB,
+        align_kwargs={"use_gpu": use_gpu},
         outdir=args.outdir,
         seed=args.seed,
     )
