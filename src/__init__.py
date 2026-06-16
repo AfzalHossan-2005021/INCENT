@@ -22,7 +22,15 @@ from .synthesize import (
 )
 
 from .perturb import (
-    perturb_portion,
+    simulate_adjacent_slice,
+)
+
+from .evaluation import (
+    registration_scores,
+    spatial_coherence,
+    label_transfer_scores,
+    expression_transfer_corr,
+    evaluate_alignment,
 )
 
 __all__ = [
@@ -37,5 +45,10 @@ __all__ = [
     'create_interactive_rectangular_portion',
     'select_rectangular_portion_blocking',
     'preview_crop',
-    'perturb_portion'
+    'simulate_adjacent_slice',
+    'registration_scores',
+    'spatial_coherence',
+    'label_transfer_scores',
+    'expression_transfer_corr',
+    'evaluate_alignment',
 ]
