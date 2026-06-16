@@ -33,6 +33,13 @@ from .evaluation import (
     evaluate_alignment,
 )
 
+from .tuning import (
+    select_alignment_weights,
+    select_weights_unsupervised,
+    make_self_alignment_instances,
+    simplex_grid,
+)
+
 __all__ = [
     'pairwise_align',
     'hierarchical_pairwise_align',
@@ -51,4 +58,8 @@ __all__ = [
     'label_transfer_scores',
     'expression_transfer_corr',
     'evaluate_alignment',
+    'select_alignment_weights',
+    'select_weights_unsupervised',
+    'make_self_alignment_instances',
+    'simplex_grid',
 ]
