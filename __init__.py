@@ -10,7 +10,16 @@ from .src import (
     create_interactive_rectangular_portion,
     select_rectangular_portion_blocking,
     preview_crop,
-    perturb_portion
+    simulate_adjacent_slice,
+    registration_scores,
+    spatial_coherence,
+    label_transfer_scores,
+    expression_transfer_corr,
+    evaluate_alignment,
+    select_alignment_weights,
+    select_weights_unsupervised,
+    make_self_alignment_instances,
+    simplex_grid,
 )
 
 __all__ = [
@@ -25,5 +34,14 @@ __all__ = [
     'create_interactive_rectangular_portion',
     'select_rectangular_portion_blocking',
     'preview_crop',
-    'perturb_portion'
+    'simulate_adjacent_slice',
+    'registration_scores',
+    'spatial_coherence',
+    'label_transfer_scores',
+    'expression_transfer_corr',
+    'evaluate_alignment',
+    'select_alignment_weights',
+    'select_weights_unsupervised',
+    'make_self_alignment_instances',
+    'simplex_grid',
 ]
