@@ -186,6 +186,7 @@ def hierarchical_pairwise_align(
     alpha: float = 0.5,
     beta: float = 0.5,
     gamma: float = 0.25,
+    alpha_cluster: float = 0.5,
     delta: float = 0.75,
     numItermax: int = 100000,
     use_gpu: bool = True,
@@ -227,7 +228,7 @@ def hierarchical_pairwise_align(
         S = select_coarsen_length(
             sliceA, sliceB,
             spatial_key=spatial_key, use_rep=use_rep, label_key=label_key,
-            alpha=alpha, delta=delta,
+            alpha=alpha_cluster, delta=delta,
         )
         print(f"Coarsening scale (auto, matchability sweep): S={S:.4g}")
     else:
@@ -282,7 +283,7 @@ def hierarchical_pairwise_align(
     C_B = compute_cluster_structural_matrix(centroidsB)
     
     print("--- [HOT] Step 4: Run Coarse Partial FGW ---")
-    Pi_cluster = run_coarse_partial_fgw(M_cluster, C_A, C_B, p_A, p_B, alpha=alpha)
+    Pi_cluster = run_coarse_partial_fgw(M_cluster, C_A, C_B, p_A, p_B, alpha=alpha_cluster)
     
     if visualize_clusters:
         visualize_cluster_mapping(centroidsA, centroidsB, Pi_cluster)

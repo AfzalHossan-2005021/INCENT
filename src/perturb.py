@@ -1,108 +1,157 @@
 """
-perturb.py
+adjacent_slice.py
 ===================
-Seeded, reproducible perturbation of a cropped self-alignment-test portion.
+Simulate an *adjacent serial section* from a cut section of a MERFISH slice.
 
-Designed to sit downstream of ``synthesize.create_interactive_rectangular_portion``
-(or ``core.create_random_rectangular_portion``) and *upstream* of
-``pairwise_align`` / ``hierarchical_pairwise_align``.  It deliberately does NOT
-touch the GUI/crop path, so the crop stays deterministic and the perturbation is
-independently seedable and sweepable.
+This is a **cell-preserving proxy**: it takes a section (a crop of a parent
+slice), drops some cells, geometrically displaces the survivors the way a
+~10 um-offset serial section would differ, and adds molecular noise -- while
+retaining a known 1:1 correspondence to the parent (gold ground truth for
+scoring).
 
-Three perturbations are applied, in this fixed order:
+Expression / PCA consistency
+----------------------------
+The INCENT pipeline consumes BOTH ``.X`` (read directly in ``hierarchical.py``
+when ``feature_key="X"`` and in the notebook) AND ``obsm["X_pca"]``.  They are
+two views of the SAME expression state and must stay consistent.  Therefore:
 
-    1. Random cell dropout        — Bernoulli(keep) over cells, breaks the 1:1
-                                     correspondence and forces partial alignment.
-    2. Per-cell coordinate jitter — N(0, sigma^2 I) added to a *random fraction*
-                                     of the surviving cells (segmentation noise).
-    3. Additional rigid transform — a single global rotation theta (optional
-                                     reflection) + translation t applied to all
-                                     surviving coordinates.
+    * the Gaussian noise is added to ``.X`` (the single source of truth),
+    * ``.X`` is overwritten with the noised expression,
+    * ``X_pca`` is recomputed as a JOINT PCA *of that same noised* ``.X``.
 
-So, for each surviving cell:
+So ``X_pca == jointPCA(preprocess(.X))`` by construction and the two cannot
+disagree.  The original (pre-noise) expression is preserved in
+``layers["X_unperturbed"]`` for provenance.
 
-    X_perturbed = (X_unperturbed + D) @ A.T + b
+Pipeline (in order)
+-------------------
+    1. Random cell dropout              Bernoulli(keep) over cells.
+    2. Smooth non-rigid warp            thin-plate-spline displacement field.
+    3. Per-cell jitter                  N(0, sigma^2 I) (offset cutting plane).
+    4. Collision resolution             iterative push-apart so NO two cells are
+                                        closer than d_min  ->  no cell touches.
+    5. Rigid transform                  rotation (+ optional reflection) + shift
+                                        (distance-preserving -> no-touch holds).
+    6. Cell-type- & gene-aware noise    Gaussian noise added to .X, scaled per
+                                        gene *within each cell type*
+                                        (sigma_{i,g} = alpha * std of gene g
+                                        among cells of i's cell type).
+    7. Combined (joint) PCA             one PCA fit on  reference U simulated,
+                                        FROM the (now noised) .X, written into
+                                        obsm["X_pca"] of BOTH.
+    8. Annotation (label) noise         a fraction of cell-type labels reassigned
+                                        to a different type (annotation error);
+                                        the TRUE labels used by step 6 are kept
+                                        in obs[celltype_key + "_clean"].
+    9. Spurious (birth) cells           optional unmatched cells appended as
+                                        realistic clutter; they have no parent
+                                        (spatial_unperturbed = NaN) and are
+                                        flagged obs["adjacent_is_birth"].
 
-where ``D`` is the (mostly zero) per-cell jitter displacement, ``A`` is the 2x2
-linear part (rotation, optionally reflected; det = -1 iff reflected) and ``b`` is
-the offset that folds in the rotation pivot and translation.
+Set ``pca_preprocess`` to match how your existing ``X_pca`` was produced
+(``"lognorm"`` = normalize_total + log1p, the scanpy default; ``"log1p"``;
+``"none"`` = PCA directly on ``.X``).  Because the joint PCA regenerates the
+embedding for BOTH slices from scratch, the pair is internally comparable
+regardless of the chosen preprocess.
 
-Rotation convention is identical to ``synthesize.py`` / ``core.py``:
-    R(theta) = [[cos, -sin], [sin, cos]]
-    world->local (their masking) : (coords - center) @ R
-    local->world (their overlay) : local @ R.T + center
-so the *forward* rotation applied here uses ``@ A.T`` (= ``@ R.T`` for the pure
-rotation case), and the stored theta composes consistently with
-``window_angle_radians``.
+Rotation convention matches ``core.py`` / ``synthesize.py``:
+    R(theta) = [[cos, -sin], [sin, cos]];  forward map on rows: X @ A.T + b.
 
-Ground truth (everything an alignment scorer needs) is written so the perturbed
-portion is self-contained:
+Ground truth written onto the returned slice
+--------------------------------------------
+    obsm["spatial_unperturbed"]             (N,2) parent-frame coords (gold target;
+                                            NaN for birth cells, which have no parent)
+    obsm["adjacent_displacement_prerigid"]  (N,2) net warp+jitter+collision shift
+    layers["X_unperturbed"]                 pre-noise expression
+    obs ["adjacent_kept"]                    provenance flag
+    obs [celltype_key + "_clean"]            true labels before annotation noise
+    obs ["adjacent_label_flipped"]           which labels were corrupted (step 8)
+    obs ["adjacent_is_birth"]                spurious unmatched cells (step 9); exclude
+                                            these from correspondence scoring
+    uns["self_alignment_test"]["adjacent_simulation"]  full provenance.
 
-    portion.obsm["spatial_unperturbed"]          (N,2) parent-frame coords = the
-                                                   gold target an aligner must
-                                                   recover (equals the cell's
-                                                   coordinate in the parent slice).
-    portion.obsm["perturb_jitter_displacement"]  (N,2) the D vector (0 where not jittered)
-    portion.obs ["perturb_jittered"]             (N,)  bool, which cells were jittered
-    portion.uns["self_alignment_test"]["perturbation"]  scalar/array provenance
-                                                   incl. A, b, theta, t, pivot,
-                                                   reflect, dropout rate, sigma,
-                                                   fraction, and the RNG seed.
-
-The exact transform recoverable by a *rigid* aligner is (A, b); the jitter is
-irreducible noise and therefore sets the floor on achievable registration error.
-
-Example
--------
-::
-
-    from synthesize import create_interactive_rectangular_portion
-    from perturb    import perturb_portion
-
-    selector = create_interactive_rectangular_portion(adata)
-    portion  = selector.extract()
-
-    pert = perturb_portion(
-        portion,
-        seed=0,
-        rotation_range=(-30.0, 30.0),   # theta sampled here if rotation_deg is None
-        translation_scale=0.10,         # |t| ~ fraction of bbox diagonal
-        dropout_rate=0.10,              # remove ~10% of cells
-        jitter_fraction=0.30,           # 30% of survivors get jittered
-        jitter_sigma=5.0,               # micron (sub-cell-diameter for MERFISH)
-    )
-    # pass `pert` as one slice and the parent `adata` as the other:
-    # hierarchical_pairwise_align(sliceA=pert, sliceB=adata, ...)
+Note (state in the paper): matched cells are known parent cells (a z-displaced
+same-cell model). Weaker / more realistic correspondence is obtained by raising
+``dropout_rate`` (deletions), ``birth_rate`` (spurious unmatched cells), and
+``label_flip_rate`` (annotation error); these break the strict 1:1 mapping while
+the matched subset retains exact ground truth.
 """
 
 from __future__ import annotations
 
+import warnings
 from typing import Optional, Sequence, Tuple, Union
 
 import numpy as np
-import scanpy as sc
+import scipy.sparse as sp
+from scipy.spatial import cKDTree
+from scipy.interpolate import RBFInterpolator
+from sklearn.decomposition import PCA
+import anndata as ad
 from anndata import AnnData
+import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
 
 
 # ----------------------------------------------------------------------------
-# Geometry helpers (convention identical to synthesize.py / core.py)
+# Small helpers
 # ----------------------------------------------------------------------------
+
+def _to_dense(X) -> np.ndarray:
+    return np.asarray(X.toarray() if sp.issparse(X) else X, dtype=np.float64)
+
+
+def _sanitize(M: np.ndarray, name: str) -> np.ndarray:
+    """Replace non-finite entries (NaN/inf) with 0, warning how many were found."""
+    M = np.asarray(M, dtype=np.float64)
+    bad = ~np.isfinite(M)
+    nbad = int(bad.sum())
+    if nbad:
+        warnings.warn(
+            f"{name} contained {nbad} non-finite value(s) (NaN/inf); replaced with 0. "
+            f"Check upstream preprocessing.", UserWarning, stacklevel=3)
+        M = np.where(bad, 0.0, M)
+    return M
+
+
+def _has_negatives(M: np.ndarray, tol: float = 1e-6) -> bool:
+    finite = M[np.isfinite(M)]
+    return bool(finite.size and finite.min() < -tol)
+
+
+def _log_normalize(counts: np.ndarray, target_sum: float = 1e4) -> np.ndarray:
+    """
+    Library-size normalize to ``target_sum`` then log1p (scanpy convention).
+
+    Defensive: non-finite values are zeroed and negatives are clipped to 0 before
+    normalization so the function never emits NaN.  (Negatives indicate the input
+    is not count data; the caller should use ``pca_preprocess='none'`` instead --
+    ``simulate_adjacent_slice`` detects this and falls back automatically.)
+    """
+    counts = _sanitize(counts, "expression matrix").clip(min=0.0)
+    libsize = counts.sum(axis=1, keepdims=True)
+    libsize[libsize <= 0] = 1.0
+    return np.log1p(counts / libsize * target_sum)
+
+
+def _preprocess_for_pca(M: np.ndarray, mode: str, target_sum: float) -> np.ndarray:
+    """Map an expression matrix into the space PCA is fit on (always finite)."""
+    M = _sanitize(M, "PCA input")
+    if mode == "none":
+        return M
+    if mode == "log1p":
+        return np.log1p(np.clip(M, 0.0, None))
+    if mode == "lognorm":
+        return _log_normalize(M, target_sum)
+    raise ValueError(f"pca_preprocess must be 'none', 'log1p', or 'lognorm'; got {mode!r}.")
+
 
 def _rotation_matrix(angle_rad: float) -> np.ndarray:
-    """2x2 counter-clockwise rotation matrix R(theta) = [[c,-s],[s,c]]."""
     c, s = np.cos(angle_rad), np.sin(angle_rad)
     return np.array([[c, -s], [s, c]], dtype=np.float64)
 
 
 def _linear_part(angle_rad: float, reflect: bool) -> np.ndarray:
-    """
-    2x2 linear map ``A`` for the rigid (or, if ``reflect``, improper-rigid) transform.
-
-    A = R(theta)              (proper rotation,  det +1)
-    A = R(theta) @ diag(1,-1) (with reflection,  det -1)
-
-    Forward map on row-vector coordinates is ``X @ A.T``.
-    """
     A = _rotation_matrix(angle_rad)
     if reflect:
         A = A @ np.array([[1.0, 0.0], [0.0, -1.0]], dtype=np.float64)
@@ -110,272 +159,605 @@ def _linear_part(angle_rad: float, reflect: bool) -> np.ndarray:
 
 
 def invert_rigid(A: np.ndarray, b: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-    """
-    Invert the affine map ``X' = X @ A.T + b``.
-
-    Returns (A_inv, b_inv) such that ``X = X' @ A_inv.T + b_inv``.  Useful for an
-    alignment scorer: apply this to the perturbed coords to recover the parent
-    frame (up to the jitter noise floor).
-    """
+    """Invert ``X' = X @ A.T + b`` -> (A_inv, b_inv) with ``X = X' @ A_inv.T + b_inv``."""
     A_inv = np.linalg.inv(A)
-    b_inv = -b @ A_inv.T
-    return A_inv, b_inv
+    return A_inv, -b @ A_inv.T
 
 
-def _get_xy(adata: AnnData, spatial_key: str) -> np.ndarray:
-    if spatial_key not in adata.obsm:
-        raise KeyError(
-            f"spatial_key '{spatial_key}' not in adata.obsm "
-            f"(available: {list(adata.obsm.keys())})."
-        )
-    coords = np.asarray(adata.obsm[spatial_key], dtype=np.float64)
-    if coords.ndim != 2 or coords.shape[1] < 2:
-        raise ValueError(
-            f"adata.obsm['{spatial_key}'] must be (N, 2+); got {coords.shape}."
-        )
-    return coords[:, :2].copy()
+def _nn_distances(coords: np.ndarray) -> np.ndarray:
+    tree = cKDTree(coords)
+    d, _ = tree.query(coords, k=2)
+    return d[:, 1]
 
 
-def _resolve_pivot(
-    pivot: Union[str, Sequence[float]],
-    coords: np.ndarray,
-    meta: dict,
-) -> np.ndarray:
-    """Resolve 'centroid' | 'window_center' | (px, py) into a (2,) array."""
+# ----------------------------------------------------------------------------
+# Geometry primitives
+# ----------------------------------------------------------------------------
+
+def _smooth_warp(coords, amplitude, n_control, rng):
+    """Thin-plate-spline warp from a coarse grid of random control displacements."""
+    mins, maxs = coords.min(0), coords.max(0)
+    pad = 0.05 * np.maximum(maxs - mins, 1e-9)
+    gx = np.linspace(mins[0] - pad[0], maxs[0] + pad[0], n_control)
+    gy = np.linspace(mins[1] - pad[1], maxs[1] + pad[1], n_control)
+    GX, GY = np.meshgrid(gx, gy)
+    ctrl = np.column_stack([GX.ravel(), GY.ravel()])
+    disp_ctrl = rng.normal(0.0, amplitude, size=ctrl.shape)
+    rbf = RBFInterpolator(ctrl, disp_ctrl, kernel="thin_plate_spline", smoothing=0.0)
+    return coords + rbf(coords), ctrl, disp_ctrl
+
+
+def _resolve_collisions(coords, d_min, max_iter, rng):
+    """Push apart any pair closer than ``d_min`` (Jacobi soft repulsion)."""
+    coords = coords.copy()
+    iters = 0
+    for iters in range(1, max_iter + 1):
+        tree = cKDTree(coords)
+        pairs = tree.query_pairs(r=d_min, output_type="ndarray")
+        if pairs.shape[0] == 0:
+            break
+        i, j = pairs[:, 0], pairs[:, 1]
+        delta = coords[j] - coords[i]
+        dist = np.linalg.norm(delta, axis=1)
+        zero = dist < 1e-12
+        if zero.any():
+            ang = rng.uniform(0, 2 * np.pi, size=int(zero.sum()))
+            delta[zero] = np.column_stack([np.cos(ang), np.sin(ang)]) * 1e-6
+            dist[zero] = 1e-6
+        unit = delta / dist[:, None]
+        push = 0.5 * (d_min - dist)[:, None] * unit * 1.05
+        disp = np.zeros_like(coords)
+        np.add.at(disp, i, -push)
+        np.add.at(disp, j, push)
+        coords = coords + disp
+    final_min = float(_nn_distances(coords).min()) if len(coords) > 1 else np.inf
+    return coords, iters, final_min
+
+
+def _resolve_pivot(pivot, coords, meta):
     if isinstance(pivot, str):
         if pivot == "centroid":
-            return coords.mean(axis=0)
+            return coords.mean(0)
         if pivot == "window_center":
             wc = meta.get("window_center")
-            if wc is None:
-                return coords.mean(axis=0)
-            return np.asarray(wc, dtype=np.float64)[:2]
-        raise ValueError(
-            f"pivot string must be 'centroid' or 'window_center'; got {pivot!r}."
-        )
-    p = np.asarray(pivot, dtype=np.float64).ravel()
+            return coords.mean(0) if wc is None else np.asarray(wc, float)[:2]
+        raise ValueError("pivot must be 'centroid', 'window_center', or (x, y).")
+    p = np.asarray(pivot, float).ravel()
     if p.shape != (2,):
-        raise ValueError(f"pivot coordinate must have length 2; got shape {p.shape}.")
+        raise ValueError(f"pivot coordinate must have length 2; got {p.shape}.")
     return p
+
+
+# ----------------------------------------------------------------------------
+# Expression noise: cell-type- and gene-aware (operates in .X's native space)
+# ----------------------------------------------------------------------------
+
+def _celltype_gene_aware_noise(E, cell_types, alpha, min_group_cells, rng, nonneg):
+    """
+    Add Gaussian noise to expression ``E`` (cells x genes) in ITS OWN units, with
+    per-gene std measured *within each cell type*:
+
+        sigma_{i,g} = alpha * std_g( cells sharing i's cell type )
+
+    Std is measured on the clean ``E``.  Cell types smaller than
+    ``min_group_cells`` (or absent annotation) fall back to the global per-gene
+    std.  If ``nonneg`` the result is clipped at 0.
+    """
+    E = _sanitize(E, "expression matrix (noise)")
+    n, g = E.shape
+    global_std = E.std(axis=0, ddof=1) if n > 1 else np.zeros(g)
+    sigma = np.empty((n, g), dtype=np.float64)
+    info = {"groups": {}, "fallback_global_for": []}
+
+    if cell_types is None:
+        sigma[:] = alpha * global_std
+        info["fallback_global_for"].append("<all: no celltype key>")
+    else:
+        for ct in np.unique(cell_types):
+            idx = np.flatnonzero(cell_types == ct)
+            if idx.size >= max(min_group_cells, 2):
+                std_g = E[idx].std(axis=0, ddof=1)
+            else:
+                std_g = global_std
+                info["fallback_global_for"].append(str(ct))
+            sigma[idx] = alpha * std_g
+            info["groups"][str(ct)] = int(idx.size)
+
+    sigma = np.nan_to_num(sigma, nan=0.0)
+    E_noised = E + rng.standard_normal(size=E.shape) * sigma
+    if nonneg:
+        E_noised = np.clip(E_noised, 0.0, None)
+    info["alpha"] = float(alpha)
+    info["mean_sigma"] = float(sigma.mean())
+    info["nonneg_clip"] = bool(nonneg)
+    return E_noised, info
+
+
+# ----------------------------------------------------------------------------
+# Annotation noise & spurious (birth) cells  --  ground-truth-preserving
+# ----------------------------------------------------------------------------
+
+def _apply_label_noise(labels, rng, flip_rate):
+    """
+    Annotation-error model: reassign a fraction of cell-type labels to a
+    *different* type, uniformly at random.
+
+    This corrupts only the annotation the aligner reads; the upstream expression
+    noise is computed from the TRUE cell types, so label noise is an independent
+    nuisance axis that lets the cell-type cost weight (beta) be tested against
+    realistic mislabelling rather than a perfect oracle. Returns ``(labels,
+    flipped_mask)`` and is a no-op (empty flip) when fewer than two types exist.
+    """
+    labels = np.asarray(labels, dtype=object).copy()
+    flipped = np.zeros(labels.shape[0], dtype=bool)
+    if flip_rate <= 0.0:
+        return labels, flipped
+    types = np.unique(labels)
+    if types.size < 2:
+        return labels, flipped
+    n_flip = int(round(flip_rate * labels.shape[0]))
+    if n_flip <= 0:
+        return labels, flipped
+    idx = rng.choice(labels.shape[0], size=n_flip, replace=False)
+    for i in idx:
+        others = types[types != labels[i]]
+        labels[i] = others[rng.integers(others.size)]
+    flipped[idx] = True
+    return labels, flipped
+
+
+def _make_spurious_cells(sim, rng, n_birth, spatial_key, median_nn, offset_scale, seed_tag):
+    """
+    Build ``n_birth`` unmatched 'birth' cells (GT-safe independent-resampling proxy).
+
+    Each birth copies a random simulated cell (so its expression / label / X_pca
+    stay valid and in the shared embedding) and is scattered locally by a small
+    Gaussian offset. Births carry **no parent**: ``spatial_unperturbed`` is NaN
+    and ``obs['adjacent_is_birth']`` is True, so a scorer drops them from the
+    correspondence metrics while they still act as realistic clutter that the
+    aligner must cope with. Returns an ``AnnData`` (``n_birth`` rows) or ``None``.
+    """
+    if n_birth <= 0:
+        return None
+    src = rng.integers(0, sim.n_obs, size=n_birth)
+    births = sim[src].copy()
+    births.obs_names = [f"spurious_{seed_tag}_{i}" for i in range(n_birth)]
+
+    coords = np.asarray(births.obsm[spatial_key], dtype=np.float64).copy()
+    coords[:, :2] += rng.normal(0.0, max(offset_scale * median_nn, 1e-9), size=(n_birth, 2))
+    births.obsm[spatial_key] = coords
+
+    births.obsm["spatial_unperturbed"] = np.full((n_birth, 2), np.nan, dtype=np.float64)
+    births.obsm["adjacent_displacement_prerigid"] = np.zeros((n_birth, 2), dtype=np.float64)
+    births.obs["adjacent_kept"] = np.zeros(n_birth, dtype=bool)
+    births.obs["adjacent_is_birth"] = np.ones(n_birth, dtype=bool)
+    births.obs["adjacent_label_flipped"] = np.zeros(n_birth, dtype=bool)
+    return births
+
+
+# ----------------------------------------------------------------------------
+# Combined (joint) PCA  --  writes a shared X_pca into BOTH slices in place
+# ----------------------------------------------------------------------------
+
+def recompute_combined_pca(
+    adata_a: AnnData,
+    adata_b: AnnData,
+    *,
+    mat_a: Optional[np.ndarray] = None,
+    mat_b: Optional[np.ndarray] = None,
+    n_pcs: int = 50,
+    scale: bool = False,
+    preprocess: str = "lognorm",
+    target_sum: float = 1e4,
+    layer: Optional[str] = None,
+    key: str = "X_pca",
+) -> PCA:
+    """
+    Fit ONE PCA on the concatenation of two slices' expression and write the
+    shared embedding into ``obsm[key]`` of BOTH (in place).  When ``mat_a`` /
+    ``mat_b`` are not given, they are built from each slice's CURRENT ``.X`` (or
+    ``layer``) via ``_preprocess_for_pca`` on the shared gene set -- so calling
+    this after modifying ``.X`` keeps ``X`` and ``X_pca`` consistent.
+    """
+    if mat_a is None or mat_b is None:
+        common = [g for g in adata_a.var_names if g in set(adata_b.var_names)]
+        if not common:
+            raise ValueError("Slices share no genes; cannot build a joint PCA.")
+        if mat_a is None:
+            Xa = _to_dense(adata_a[:, common].layers[layer] if layer else adata_a[:, common].X)
+            mat_a = _preprocess_for_pca(Xa, preprocess, target_sum)
+        if mat_b is None:
+            Xb = _to_dense(adata_b[:, common].layers[layer] if layer else adata_b[:, common].X)
+            mat_b = _preprocess_for_pca(Xb, preprocess, target_sum)
+
+    if mat_a.shape[1] != mat_b.shape[1]:
+        raise ValueError(
+            f"Gene axis mismatch for joint PCA: {mat_a.shape[1]} vs {mat_b.shape[1]}.")
+
+    M = _sanitize(np.vstack([mat_a, mat_b]), "joint PCA matrix")
+    if scale:
+        mu, sd = M.mean(0), M.std(0)
+        sd[sd == 0] = 1.0
+        M = (M - mu) / sd
+        M = _sanitize(M, "scaled PCA matrix")
+
+    npc = int(min(n_pcs, M.shape[0] - 1, M.shape[1]))
+    pca = PCA(n_components=npc, svd_solver="full", random_state=0)
+    Z = pca.fit_transform(M)
+
+    na = mat_a.shape[0]
+    adata_a.obsm[key] = np.ascontiguousarray(Z[:na], dtype=np.float32)
+    adata_b.obsm[key] = np.ascontiguousarray(Z[na:], dtype=np.float32)
+    return pca
 
 
 # ----------------------------------------------------------------------------
 # Main entry point
 # ----------------------------------------------------------------------------
 
-def perturb_portion(
-    portion: AnnData,
+def simulate_adjacent_slice(
+    section: AnnData,
+    reference: Optional[AnnData] = None,
     *,
     spatial_key: str = "spatial",
-    # -- 3. rigid transform ---------------------------------------------------
+    celltype_key: str = "cell_type_annot",
+    # --- 1. dropout ---
+    dropout_rate: float = 0.10,
+    # --- 2. warp ---
+    warp_amplitude: Optional[float] = None,     # um;  None -> 0.025 * bbox diagonal
+    warp_n_control: int = 5,                    # control point grid size (n_control x n_control)
+    # --- 3. jitter ---
+    jitter_sigma: Optional[float] = None,       # um;  None -> 0.25 * median NN dist
+    jitter_fraction: float = 1.0,
+    # --- 4. no-touch ---
+    min_dist: Optional[float] = None,
+    min_dist_quantile: float = 0.05,
+    hardcore_diameter: Optional[float] = None,
+    collision_max_iter: int = 100000,
+    # --- 5. rigid ---
     rotation_deg: Optional[float] = None,
     rotation_range: Tuple[float, float] = (-30.0, 30.0),
     translation: Optional[Sequence[float]] = None,
-    translation_scale: float = 0.10,
+    translation_scale: float = 0.5,
     reflect: bool = False,
     pivot: Union[str, Sequence[float]] = "centroid",
-    # -- 1. dropout -----------------------------------------------------------
-    dropout_rate: float = 0.05,
-    # -- 2. jitter ------------------------------------------------------------
-    jitter_fraction: float = 0.10,
-    jitter_sigma: float = 5.0,
-    # -- bookkeeping ----------------------------------------------------------
-    min_cells: Optional[int] = None,
+    # --- 6. expression noise (added to .X in its native units) ---
+    expr_alpha: float = 1.0,              # noise scale relative to gene std within cell type
+    min_group_cells: int = 20,
+    expression_layer: Optional[str] = None,      # source expression; None -> .X
+    nonneg_clip: Union[bool, str] = "auto",       # auto: clip iff data is non-negative
+    # --- 7. joint PCA (FROM the noised .X) ---
+    recompute_pca: bool = True,
+    pca_preprocess: str = "auto",                # auto: 'lognorm' if count-like else 'none'
+    n_pcs: int = 50,
+    scale_before_pca: bool = False,
+    target_sum: float = 1e4,
+    # --- 8. annotation noise & spurious (birth) cells (default off) ---
+    label_flip_rate: float = 0.0,        # fraction of labels reassigned to a different type
+    birth_rate: float = 0.0,             # spurious unmatched cells, as a fraction of survivors
+    birth_offset_scale: float = 2.0,     # birth scatter, in units of median NN distance
+    # --- bookkeeping ---
+    min_cells: int = 4,
     seed: Optional[int] = None,
-    inplace: bool = False,
 ) -> AnnData:
     """
-    Apply dropout + per-cell jitter (on a fraction) + an additional rigid
-    transform to a cropped self-alignment-test portion, recording full ground
-    truth.
+    Turn a cut ``section`` into a simulated adjacent serial section, keeping
+    ``.X`` and ``obsm["X_pca"]`` mutually consistent (X_pca is the joint PCA of
+    the noised ``.X``).
 
-    Parameters
-    ----------
-    portion : AnnData
-        A crop produced by the self-alignment harness.  Its coordinates are
-        assumed to live in the *parent* frame (i.e. ``obsm[spatial_key]`` of a
-        cropped cell equals that cell's coordinate in the full slice).
-    spatial_key : str
-        Key in ``obsm`` holding (N, 2+) coordinates.
-    rotation_deg : float or None
-        theta in **degrees**.  If ``None``, sampled uniformly from ``rotation_range``.
-    rotation_range : (float, float)
-        Inclusive degree range used when ``rotation_deg is None``.
-    translation : (float, float) or None
-        Absolute translation **t** in micron.  If ``None``, each component is
-        sampled uniformly from ``+/- translation_scale * bbox_diagonal``.
-    translation_scale : float
-        Fraction of the coordinate bounding-box diagonal used when sampling **t**.
-    reflect : bool
-        If ``True``, include a reflection (improper rigid, det A = -1).  Useful for
-        stress-testing methods that cannot resolve chirality.
-    pivot : {'centroid', 'window_center'} or (float, float)
-        Rotation pivot.  ``'window_center'`` reads
-        ``uns['self_alignment_test']['window_center']`` and falls back to the
-        centroid if absent.
-    dropout_rate : float in [0, 1)
-        Probability of *removing* each cell (Bernoulli).  ``0`` keeps all cells.
-    jitter_fraction : float in [0, 1]
-        Fraction of the *surviving* cells (chosen at random, without replacement)
-        to which Gaussian jitter is applied.
-    jitter_sigma : float
-        Std-dev (micron, per axis) of the isotropic Gaussian jitter N(0, sigma^2 I).
-    min_cells : int or None
-        Minimum number of surviving cells required.  If ``None``, taken from
-        ``uns['self_alignment_test']`` (key ``min_cells``) or defaults to 4.
-    seed : int or None
-        Seed for a single ``numpy.random.default_rng`` driving every random draw
-        (sampled rotation/translation, dropout, jitter selection, jitter noise),
-        in that order.  Pass an int for full reproducibility.
-    inplace : bool
-        If ``True``, modify and return ``portion`` directly; otherwise operate on
-        a copy (default).
+    See the module docstring for the full step list, conventions, and ground
+    truth.  Key expression/PCA parameters:
+
+    expr_alpha : float
+        Noise scale; per cell i and gene g the std is ``expr_alpha * std_g`` over
+        cells of i's cell type (std measured on the chosen expression matrix in
+        its native units).
+    expression_layer : str or None
+        Source expression to perturb; ``None`` uses ``.X``.  The noised result is
+        written back to that same location (``.X`` and, if given, the layer), and
+        the clean original is saved to ``layers["X_unperturbed"]``.
+    nonneg_clip : bool
+        Clip noised expression at 0 (appropriate for counts / log-normalized
+        data; set False if your expression representation can be negative).
+    pca_preprocess : {'lognorm', 'log1p', 'none'}
+        How the joint PCA maps expression -> PCA space.  Set this to match how
+        your existing ``X_pca`` was produced.  ``'lognorm'`` = normalize_total +
+        log1p (scanpy default); ``'none'`` = PCA directly on ``.X``.
+    reference : AnnData or None
+        Clean partner for the joint PCA; ``obsm['X_pca']`` is written into it in
+        place so both slices share the embedding.  ``None`` -> clean copy of the
+        input section.
 
     Returns
     -------
     AnnData
-        The perturbed portion with ground truth in ``obsm`` / ``obs`` / ``uns``
-        (see module docstring).
-
-    Raises
-    ------
-    ValueError
-        On out-of-range parameters or if fewer than ``min_cells`` survive dropout.
+        Simulated section with noised ``.X``, a consistent shared ``X_pca``, and
+        full ground truth.
     """
-    # -- validate -------------------------------------------------------------
     if not (0.0 <= dropout_rate < 1.0):
         raise ValueError(f"dropout_rate must be in [0, 1); got {dropout_rate}.")
     if not (0.0 <= jitter_fraction <= 1.0):
         raise ValueError(f"jitter_fraction must be in [0, 1]; got {jitter_fraction}.")
-    if jitter_sigma < 0.0:
-        raise ValueError(f"jitter_sigma must be >= 0; got {jitter_sigma}.")
+    if expr_alpha < 0:
+        raise ValueError(f"expr_alpha must be >= 0; got {expr_alpha}.")
+    if not (0.0 <= label_flip_rate <= 1.0):
+        raise ValueError(f"label_flip_rate must be in [0, 1]; got {label_flip_rate}.")
+    if birth_rate < 0:
+        raise ValueError(f"birth_rate must be >= 0; got {birth_rate}.")
 
     rng = np.random.default_rng(seed)
+    meta = dict(section.uns.get("self_alignment_test", {}))
 
-    meta_full = dict(portion.uns.get("self_alignment_test", {}))
-    if min_cells is None:
-        min_cells = int(meta_full.get("min_cells", 4))
+    full_coords = np.asarray(section.obsm[spatial_key], dtype=np.float64)[:, :2]
+    n_full = full_coords.shape[0]
+    if n_full < min_cells:
+        raise ValueError(f"section has {n_full} cells (< min_cells={min_cells}).")
 
-    coords_in = _get_xy(portion, spatial_key)          # parent-frame, (N0, 2)
-    n_in = coords_in.shape[0]
+    mins, maxs = full_coords.min(0), full_coords.max(0)
+    bbox_diag = float(np.linalg.norm(maxs - mins))
+    nn_full = _nn_distances(full_coords)
+    median_nn = float(np.median(nn_full))
 
-    # -- resolve the rigid transform parameters (sample BEFORE dropout so the --
-    #    transform is independent of which cells survive) ----------------------
+    if warp_amplitude is None:
+        warp_amplitude = 0.025 * bbox_diag
+    if jitter_sigma is None:
+        jitter_sigma = 0.25 * median_nn
+    if min_dist is None:
+        min_dist = float(np.quantile(nn_full, min_dist_quantile))
+    if hardcore_diameter is not None:
+        min_dist = float(min(min_dist, hardcore_diameter))
+
+    # sample rigid transform up front (independent of which cells survive)
     if rotation_deg is None:
-        lo, hi = float(rotation_range[0]), float(rotation_range[1])
-        rotation_deg = float(rng.uniform(lo, hi))
+        rotation_deg = float(rng.uniform(*rotation_range))
     angle_rad = float(np.radians(rotation_deg))
-
     if translation is None:
-        mins = coords_in.min(axis=0)
-        maxs = coords_in.max(axis=0)
-        diag = float(np.linalg.norm(maxs - mins))
-        amp = translation_scale * diag
+        amp = translation_scale * bbox_diag
         t = rng.uniform(-amp, amp, size=2).astype(np.float64)
     else:
-        t = np.asarray(translation, dtype=np.float64).ravel()
+        t = np.asarray(translation, float).ravel()
         if t.shape != (2,):
-            raise ValueError(f"translation must have length 2; got shape {t.shape}.")
+            raise ValueError(f"translation must have length 2; got {t.shape}.")
+    A = _linear_part(angle_rad, reflect)
+    p = _resolve_pivot(pivot, full_coords, meta)
+    b = (p + t) - p @ A.T
 
-    p = _resolve_pivot(pivot, coords_in, meta_full)
-    A = _linear_part(angle_rad, reflect)               # 2x2 linear part
-    # X' = (X - p) @ A.T + p + t  ==  X @ A.T + b,  with:
-    b = (p + t) - p @ A.T                               # (2,)
-
-    # -- 1. dropout (Bernoulli keep) ------------------------------------------
-    if dropout_rate > 0.0:
-        keep = rng.random(n_in) >= dropout_rate
-    else:
-        keep = np.ones(n_in, dtype=bool)
+    # -- 1. dropout --
+    keep = (rng.random(n_full) >= dropout_rate) if dropout_rate > 0 \
+        else np.ones(n_full, dtype=bool)
     kept_pos = np.flatnonzero(keep)
-    n_out = kept_pos.size
-    if n_out < min_cells:
+    if kept_pos.size < min_cells:
         raise ValueError(
-            f"Only {n_out} cell(s) survive dropout_rate={dropout_rate} "
-            f"(minimum: {min_cells}).  Lower dropout_rate or enlarge the crop."
-        )
+            f"Only {kept_pos.size} cells survive dropout_rate={dropout_rate} "
+            f"(min_cells={min_cells}). Lower dropout_rate.")
+    sim = section[kept_pos].copy()
+    coords0 = full_coords[kept_pos]
+    n = coords0.shape[0]
 
-    # subset (preserves X, layers, obs, var, obsm, obs_names -> correspondence)
-    if inplace:
-        out = portion
-        out._inplace_subset_obs(kept_pos)
+    # -- 2-4. warp -> jitter -> collision-resolve (pre-rigid frame) --
+    warped, ctrl_pts, ctrl_disp = _smooth_warp(coords0, warp_amplitude, warp_n_control, rng)
+    jit = np.zeros((n, 2), dtype=np.float64)
+    if jitter_sigma > 0 and jitter_fraction > 0:
+        n_jit = int(round(jitter_fraction * n))
+        if n_jit > 0:
+            sel = rng.choice(n, size=n_jit, replace=False)
+            jit[sel] = rng.normal(0.0, jitter_sigma, size=(n_jit, 2))
+    jittered = warped + jit
+    resolved, n_iter, final_min = _resolve_collisions(jittered, min_dist, collision_max_iter, rng)
+    if final_min < min_dist - 1e-9:
+        warnings.warn(
+            f"Collision resolution did not fully converge in {collision_max_iter} "
+            f"iters (min dist {final_min:.4g} < d_min {min_dist:.4g}). Increase "
+            f"collision_max_iter or lower jitter/warp amplitude.", UserWarning, stacklevel=2)
+
+    # -- 5. rigid (distance-preserving -> no-touch guarantee survives) --
+    final_coords = resolved @ A.T + b
+    new_spatial = np.asarray(sim.obsm[spatial_key], dtype=np.float64).copy()
+    new_spatial[:, :2] = final_coords
+    sim.obsm[spatial_key] = new_spatial
+
+    # -- 6. expression noise: add to .X (single source of truth) --
+    E_clean = _to_dense(sim.layers[expression_layer] if expression_layer else sim.X)
+    E_clean = _sanitize(E_clean, "section .X")
+    cell_types = (sim.obs[celltype_key].astype(str).to_numpy()
+                  if celltype_key in sim.obs.columns else None)
+    if cell_types is None:
+        warnings.warn(
+            f"celltype_key '{celltype_key}' not in obs; expression noise falls back "
+            f"to global per-gene std (gene-aware only).", UserWarning, stacklevel=2)
+
+    # Auto-detect the expression representation.  Negatives => .X is already
+    # normalized/scaled (not counts): do NOT clip the noise and do NOT log-transform
+    # before PCA.  Decided once and applied to both slices for consistency.
+    if reference is None:
+        reference = section.copy()
+    common = [g for g in reference.var_names if g in set(sim.var_names)]
+    if not common:
+        raise ValueError("reference and section share no genes for joint PCA.")
+    ref_expr = _sanitize(
+        _to_dense(reference[:, common].layers[expression_layer] if expression_layer
+                  else reference[:, common].X), "reference .X")
+    data_has_neg = _has_negatives(E_clean) or _has_negatives(ref_expr)
+
+    eff_nonneg = (not data_has_neg) if nonneg_clip == "auto" else bool(nonneg_clip)
+    eff_preprocess = pca_preprocess
+    if eff_preprocess == "auto":
+        eff_preprocess = "none" if data_has_neg else "lognorm"
+    elif eff_preprocess in ("lognorm", "log1p") and data_has_neg:
+        warnings.warn(
+            f"pca_preprocess='{eff_preprocess}' assumes non-negative counts, but the "
+            f"expression contains negative values (already normalized/scaled). Falling "
+            f"back to 'none' (PCA directly on .X).", UserWarning, stacklevel=2)
+        eff_preprocess = "none"
+
+    E_noised, noise_info = _celltype_gene_aware_noise(
+        E_clean, cell_types, expr_alpha, min_group_cells, rng, eff_nonneg)
+
+    sim.layers["X_unperturbed"] = E_clean.astype(np.float32)   # provenance
+    sim.X = E_noised.astype(np.float32)                        # noised .X is canonical
+    if expression_layer is not None:
+        sim.layers[expression_layer] = E_noised.astype(np.float32)
+
+    # -- 7. joint PCA computed FROM the noised .X (consistency guarantee) --
+    pca_info = None
+    if recompute_pca:
+        mat_ref = _preprocess_for_pca(ref_expr, eff_preprocess, target_sum)
+        # sim's noised expression on the shared genes, in reference gene order
+        sim_idx = {g: k for k, g in enumerate(sim.var_names)}
+        cols = [sim_idx[g] for g in common]
+        mat_sim = _preprocess_for_pca(E_noised[:, cols], eff_preprocess, target_sum)
+
+        pca = recompute_combined_pca(
+            reference, sim, mat_a=mat_ref, mat_b=mat_sim,
+            n_pcs=n_pcs, scale=scale_before_pca, key="X_pca")
+        pca_info = {
+            "n_pcs": int(pca.n_components_),
+            "pca_preprocess": eff_preprocess,
+            "scale_before_pca": bool(scale_before_pca),
+            "n_shared_genes": int(len(common)),
+            "fit_on": "reference + simulated (joint), from noised .X",
+            "explained_variance_ratio_sum": float(pca.explained_variance_ratio_.sum()),
+            "consistency": "X_pca == jointPCA(preprocess(.X))",
+        }
+
+    # -- 8. annotation noise: corrupt the labels the aligner READS (expression
+    #       noise above used the TRUE cell types, so this is an independent axis) --
+    n_flipped = 0
+    if celltype_key in sim.obs.columns:
+        labels_clean = sim.obs[celltype_key].astype(str).to_numpy()
+        sim.obs[celltype_key + "_clean"] = labels_clean
+        if label_flip_rate > 0.0:
+            labels_noised, flip_mask = _apply_label_noise(labels_clean, rng, label_flip_rate)
+            sim.obs[celltype_key] = labels_noised.astype(str)
+            n_flipped = int(flip_mask.sum())
+        else:
+            flip_mask = np.zeros(n, dtype=bool)
+        sim.obs["adjacent_label_flipped"] = flip_mask
     else:
-        out = portion[kept_pos].copy()
+        sim.obs["adjacent_label_flipped"] = np.zeros(n, dtype=bool)
 
-    coords_kept = coords_in[kept_pos]                   # (N_out, 2) parent frame
-    n = coords_kept.shape[0]
-
-    # -- 2. per-cell jitter on a random fraction of survivors -----------------
-    n_jit = int(round(jitter_fraction * n))
-    jittered = np.zeros(n, dtype=bool)
-    disp = np.zeros((n, 2), dtype=np.float64)
-    if n_jit > 0 and jitter_sigma > 0.0:
-        jit_idx = rng.choice(n, size=n_jit, replace=False)
-        disp[jit_idx] = rng.normal(0.0, jitter_sigma, size=(n_jit, 2))
-        jittered[jit_idx] = True
-
-    coords_jittered = coords_kept + disp
-
-    # -- 3. apply the global rigid transform ----------------------------------
-    coords_out = coords_jittered @ A.T + b
-
-    # write coords back (preserve any extra columns beyond xy)
-    new_spatial = np.asarray(out.obsm[spatial_key], dtype=np.float64).copy()
-    new_spatial[:, :2] = coords_out
-    out.obsm[spatial_key] = new_spatial
-
-    # -- ground truth ----------------------------------------------------------
-    gt_unperturbed = np.asarray(out.obsm[spatial_key], dtype=np.float64).copy()
-    gt_unperturbed[:, :2] = coords_kept          # parent-frame gold target
-    out.obsm["spatial_unperturbed"] = gt_unperturbed
-    out.obsm["perturb_jitter_displacement"] = disp
-    out.obs["perturb_jittered"] = jittered
+    # -- ground truth & provenance --
+    gt = np.asarray(sim.obsm[spatial_key], dtype=np.float64).copy()
+    gt[:, :2] = coords0
+    sim.obsm["spatial_unperturbed"] = gt
+    sim.obsm["adjacent_displacement_prerigid"] = (resolved - coords0).astype(np.float64)
+    sim.obs["adjacent_kept"] = np.ones(n, dtype=bool)
+    sim.obs["adjacent_is_birth"] = np.zeros(n, dtype=bool)
 
     A_inv, b_inv = invert_rigid(A, b)
-    meta_full["perturbation"] = {
-        "seed": seed,
-        "apply_order": ["dropout", "jitter", "rigid"],
-        # forward affine  X_perturbed = X_unperturbed @ A.T + b  (jitter excluded)
-        "affine_A": A,
-        "affine_b": b,
-        "affine_A_inv": A_inv,
-        "affine_b_inv": b_inv,
-        # human-readable rigid params
-        "rotation_deg": rotation_deg,
-        "rotation_radians": angle_rad,
+    meta["adjacent_simulation"] = {
+        "seed": (-1 if seed is None else seed),
+        "apply_order": ["dropout", "warp", "jitter", "collision_resolve",
+                        "rigid", "expr_noise(.X)", "joint_pca(from .X)",
+                        "label_noise", "birth_cells"],
+        "model": "cell_preserving_z_displaced",
+        "affine_A": A, "affine_b": b, "affine_A_inv": A_inv, "affine_b_inv": b_inv,
+        "rotation_deg": float(rotation_deg), "rotation_radians": angle_rad,
         "translation": [float(t[0]), float(t[1])],
-        "pivot": [float(p[0]), float(p[1])],
-        "reflect": bool(reflect),
+        "pivot": [float(p[0]), float(p[1])], "reflect": bool(reflect),
         "is_proper_rigid": bool(round(float(np.linalg.det(A))) == 1),
-        # dropout
+        "warp_amplitude": float(warp_amplitude), "warp_n_control": int(warp_n_control),
+        "warp_control_points": ctrl_pts, "warp_control_displacements": ctrl_disp,
+        "jitter_sigma": float(jitter_sigma), "jitter_fraction": float(jitter_fraction),
+        "min_dist": float(min_dist), "min_dist_quantile": float(min_dist_quantile),
+        "hardcore_diameter": ("" if hardcore_diameter is None else float(hardcore_diameter)),
+        "collision_iterations": int(n_iter),
+        "final_min_pairwise_distance": float(final_min),
+        "no_touch_satisfied": bool(final_min >= min_dist - 1e-9),
         "dropout_rate": float(dropout_rate),
-        "n_obs_input": int(n_in),
-        "n_obs_output": int(n_out),
+        "n_obs_input": int(n_full), "n_obs_output": int(n),
         "dropout_kept_positions": kept_pos.astype(np.int64),
-        # jitter
-        "jitter_fraction": float(jitter_fraction),
-        "jitter_sigma": float(jitter_sigma),
-        "n_jittered": int(jittered.sum()),
-        # where to find per-cell ground truth
+        "label_flip_rate": float(label_flip_rate),
+        "n_labels_flipped": int(n_flipped),
+        "birth_rate": float(birth_rate),
+        "birth_offset_scale": float(birth_offset_scale),
+        "expr_noise": noise_info,
+        "expression_layer": (expression_layer if expression_layer is not None else ""), "target_sum": float(target_sum),
+        "combined_pca": (pca_info if pca_info is not None else {}),
         "ground_truth_keys": {
-            "spatial_unperturbed": "obsm['spatial_unperturbed']",
-            "jitter_displacement": "obsm['perturb_jitter_displacement']",
-            "jittered_mask": "obs['perturb_jittered']",
-            "correspondence": "obs_names match the parent slice",
+            "spatial_unperturbed": "obsm['spatial_unperturbed'] (NaN for birth cells)",
+            "prerigid_displacement": "obsm['adjacent_displacement_prerigid']",
+            "expression_pre_noise": "layers['X_unperturbed']",
+            "noised_expression": ".X (canonical)",
+            "shared_embedding": "obsm['X_pca'] (both slices, derived from .X)",
+            "clean_labels": f"obs['{celltype_key}_clean']",
+            "label_flipped_mask": "obs['adjacent_label_flipped']",
+            "birth_mask": "obs['adjacent_is_birth'] (exclude from correspondence scoring)",
+            "correspondence": "obs_names match the parent slice (birth cells: 'spurious_*', no parent)",
         },
     }
-    out.uns["self_alignment_test"] = meta_full
-    return out
+
+    # -- spurious (birth) cells: unmatched clutter appended after all GT is set --
+    n_birth = int(round(birth_rate * n))
+    meta["adjacent_simulation"]["n_birth"] = int(n_birth)
+    sim.uns["self_alignment_test"] = meta
+    if n_birth <= 0:
+        return sim
+
+    births = _make_spurious_cells(
+        sim, rng, n_birth, spatial_key, median_nn, birth_offset_scale,
+        (-1 if seed is None else seed))
+    assert births is not None  # n_birth > 0 here, so _make_spurious_cells returns rows
+    # anndata.concat drops .uns; reattach the provenance afterwards.
+    combined = ad.concat([sim, births], axis=0, join="outer", uns_merge=None)
+    combined.uns["self_alignment_test"] = meta
+    return combined
+
+def show_slice(_slice, spatial_key: str = "spatial", label_key: str = "cell_type_annot",
+               point_size: float = 3.0, alpha: float = 1.0, title: Optional[str] = None):
+    coords = np.asarray(_slice.obsm[spatial_key], dtype=np.float64)[:, :2]
+
+    if label_key in _slice.obs.columns:
+        labels = _slice.obs[label_key].astype(str).values
+        unique = sorted(set(labels))
+        cmap = plt.get_cmap("tab20", max(len(unique), 1))
+        lbl2idx = {l: i for i, l in enumerate(unique)}
+        colors = np.array([cmap(lbl2idx[l]) for l in labels])
+        legend_handles = [
+            mpatches.Patch(color=cmap(lbl2idx[l]), label=l)
+            for l in unique[:20]
+        ]
+        if len(unique) > 20:
+            legend_handles.append(
+                mpatches.Patch(color="none", label=f"… +{len(unique)-20} more"))
+    else:
+        colors = np.full((len(coords), 4), [0.5, 0.5, 0.5, 0.6])
+        legend_handles = None
+
+    fig, ax = plt.subplots(figsize=(8, 7))
+    ax.scatter(coords[:, 0], coords[:, 1], c=colors, s=point_size, alpha=alpha,
+               linewidths=0, rasterized=True)
+    ax.set_aspect("equal", adjustable="datalim")
+    ax.set_xlabel("X coordinate (µm)", fontsize=9)
+    ax.set_ylabel("Y coordinate (µm)", fontsize=9)
+    ax.set_title(title or f"Slice  ·  {_slice.n_obs:,} cells", fontsize=10)
+    if legend_handles:
+        ax.legend(handles=legend_handles, loc="upper right", fontsize=6,
+                  markerscale=2, framealpha=0.6, title=label_key, title_fontsize=7)
+    plt.tight_layout()
+    plt.show()
 
 
 # main function
 if __name__ == "__main__":
-    data_dir = "../data/synthetic/"
-    data_file="adata4wk_donor_id_1_slice_0_corpped.h5ad"
+    import scanpy as sc
+    import argparse
+    import sys
 
-    adata = sc.read_h5ad(data_dir + data_file)
+    parser = argparse.ArgumentParser(description="Simulate an adjacent slice from a cut section.")
+    parser.add_argument("--input_h5ad", default="results/adata24wk_donor_id_12_slice_0_left_hemi.h5ad", help="Path to input section .h5ad file.")
+    parser.add_argument("--reference_h5ad", default="adata24wk_donor_id_12_slice_0.h5ad", help="Path to reference slice .h5ad file for joint PCA.")
+    parser.add_argument("--output_h5ad", default="adata24wk_donor_id_12_slice_0_cropped_perturbed.h5ad", help="Path to output simulated adjacent slice .h5ad file.")
+    parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility.")
+    args = parser.parse_args()
 
-    perturbed = perturb_portion(adata, seed=0)
-
-    # save the perturbed portion for later use (e.g. in pairwise_align):
-    perturbed.write_h5ad(data_dir + data_file.replace(".h5ad", "_perturbed.h5ad"))
+    try:
+        adata = sc.read_h5ad(args.input_h5ad)
+        reference = sc.read_h5ad(args.reference_h5ad)
+        sim = simulate_adjacent_slice(adata, reference=reference, seed=args.seed)
+        show_slice(sim)
+        sim.write_h5ad(args.output_h5ad)
+        print(f"Simulated adjacent slice written to {args.output_h5ad}.")
+    except Exception as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)

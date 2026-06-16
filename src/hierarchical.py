@@ -249,13 +249,10 @@ def compute_cluster_structural_matrix(centroids):
     return C_graph
 
 
-def run_coarse_partial_fgw(M_cluster, C_A, C_B, p_A, p_B, alpha=0.5, m=None, reg_m=1.0):
+def run_coarse_partial_fgw(M_cluster, C_A, C_B, p_A, p_B, alpha=0.5, reg_m=1.0):
     """
     Solves cluster-level partial/unbalanced FGW.
     """
-    if m is None:
-        m = min(np.sum(p_A), np.sum(p_B)) * 0.999
-
     scale = max(C_A.max(), C_B.max()) + 1e-8
         
     C_A_norm = C_A / scale
