@@ -36,8 +36,10 @@ from .evaluation import (
 from .tuning import (
     select_alignment_weights,
     select_weights_unsupervised,
+    select_coarse_weights,
     make_self_alignment_instances,
     simplex_grid,
+    gpu_available,
 )
 
 __all__ = [
@@ -60,6 +62,8 @@ __all__ = [
     'evaluate_alignment',
     'select_alignment_weights',
     'select_weights_unsupervised',
+    'select_coarse_weights',
     'make_self_alignment_instances',
     'simplex_grid',
+    'gpu_available',
 ]

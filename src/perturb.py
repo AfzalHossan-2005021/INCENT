@@ -165,6 +165,7 @@ def invert_rigid(A: np.ndarray, b: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
 
 
 def _nn_distances(coords: np.ndarray) -> np.ndarray:
+    """Return the distance to each point's nearest neighbor (excluding self, K=2)."""
     tree = cKDTree(coords)
     d, _ = tree.query(coords, k=2)
     return d[:, 1]
@@ -215,6 +216,7 @@ def _resolve_collisions(coords, d_min, max_iter, rng):
 
 
 def _resolve_pivot(pivot, coords, meta):
+    """Resolve the pivot point for the rigid transform."""
     if isinstance(pivot, str):
         if pivot == "centroid":
             return coords.mean(0)
@@ -416,7 +418,7 @@ def simulate_adjacent_slice(
     collision_max_iter: int = 100000,
     # --- 5. rigid ---
     rotation_deg: Optional[float] = None,
-    rotation_range: Tuple[float, float] = (-30.0, 30.0),
+    rotation_range: Tuple[float, float] = (-180.0, 180.0),
     translation: Optional[Sequence[float]] = None,
     translation_scale: float = 0.5,
     reflect: bool = False,

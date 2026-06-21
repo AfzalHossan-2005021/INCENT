@@ -6,7 +6,7 @@ from anndata import AnnData
 from numpy.typing import NDArray
 from typing import Optional, Tuple, Union
 from scipy.spatial import cKDTree, Voronoi
-from sklearn.metrics.pairwise import euclidean_distances, cosine_distances
+from sklearn.metrics.pairwise import cosine_distances
 
 from .clustering import cluster_cells_spatial
 from .hierarchical import (
@@ -590,16 +590,16 @@ def pairwise_align(
     
 
     # ────────────────────── Calculate gene expression dissimilarity ──────────────────────
-    cosine_dist_gene_expr = calculate_gene_expression_cosine_distance(sliceA, sliceB, use_rep, eps=epsilon)
+    # Computed on the active backend (GPU when available); returns a backend tensor.
+    M_gene = calculate_gene_expression_cosine_distance(sliceA, sliceB, use_rep, nx=nx, data_type=data_type, eps=epsilon)
 
 
     # ────────────────────── Calculate cell-type mismatch penalty ──────────────────────
-    cell_type_mismatch = calculate_cell_type_mismatch(sliceA, sliceB)
+    cell_type_mismatch = to_backend(calculate_cell_type_mismatch(sliceA, sliceB), nx, data_type=data_type)
 
 
-    # Combine gene expression dissimilarity and cell-type mismatch penalty into a single cost matrix M1
-    M1_combined = (1 - beta - gamma) * cosine_dist_gene_expr + beta * cell_type_mismatch
-    M1 = to_backend(M1_combined, nx, data_type=data_type)
+    # Combine gene expression dissimilarity and cell-type mismatch penalty into a single cost matrix M1 (on backend)
+    M1 = (1 - beta - gamma) * M_gene + beta * cell_type_mismatch
 
 
     # ────────────────────── Calculate neighborhood dissimilarity ──────────────────────
@@ -1036,9 +1036,27 @@ def neighborhood_distribution_multiscale(
     return X, {"scales": meta_blocks}
 
 
+def _pairwise_euclidean_backend(X, nx):
+    """
+    Pairwise Euclidean distance matrix of ``X`` (n, d) computed on the active POT
+    backend. When ``nx`` is the torch backend and ``X`` lives on CUDA, the whole
+    O(n^2) computation runs on the GPU and never materializes an n x n matrix on the
+    host -- avoiding both the CPU compute and the host->device transfer that
+    ``sklearn.euclidean_distances`` + ``to_backend`` incurred.
+    """
+    sq = nx.sum(X ** 2, axis=1)
+    D2 = sq[:, None] + sq[None, :] - 2.0 * (X @ X.T)
+    D2 = nx.maximum(D2, 0.0)  # guard tiny negatives from float round-off before sqrt
+    return nx.sqrt(D2)
+
+
 def calculate_spatial_distance(sliceA, sliceB, nx, data_type=np.float32, spatial_key = 'spatial', eps=1e-8, norm_k=3):
     """
     Calculate spatial distance between cells in a slice, normalized by robust local spacing.
+
+    The pairwise distances are computed directly on the active backend (GPU when
+    ``nx`` is the torch backend), so no n x n matrix is built on the CPU or copied
+    to the device.
 
     Args:
         sliceA: First slice for which to calculate spatial distance.
@@ -1049,60 +1067,64 @@ def calculate_spatial_distance(sliceA, sliceB, nx, data_type=np.float32, spatial
         eps: Small constant to avoid division by zero.
         norm_k: Kth neighbor to use for characteristic spacing estimation.
     Returns:
-    D_A, D_B: Pairwise spatial distance matrices.
+    D_A, D_B: Pairwise spatial distance matrices (backend tensors).
     """
-    
+
     print("Calculating spatial distance between cells in slice A and slice B")
 
     coordinates_A = np.asarray(sliceA.obsm[spatial_key], dtype=np.float64)
     coordinates_B = np.asarray(sliceB.obsm[spatial_key], dtype=np.float64)
-
-    D_A = euclidean_distances(coordinates_A, coordinates_A)
-    D_B = euclidean_distances(coordinates_B, coordinates_B)
 
     # Normalize by local characteristic spacing instead of global max tissue diameter
     scale_A = estimate_characteristic_spacing(sliceA, k=norm_k, spatial_key=spatial_key)
     scale_B = estimate_characteristic_spacing(sliceB, k=norm_k, spatial_key=spatial_key)
     scale = max(scale_A, scale_B, eps)
 
-    D_A = D_A / scale
-    D_B = D_B / scale
+    coords_A = to_backend(coordinates_A, nx, data_type=data_type)
+    coords_B = to_backend(coordinates_B, nx, data_type=data_type)
 
-    D_A = to_backend(D_A, nx, data_type=data_type)
-    D_B = to_backend(D_B, nx, data_type=data_type)
+    D_A = _pairwise_euclidean_backend(coords_A, nx) / scale
+    D_B = _pairwise_euclidean_backend(coords_B, nx) / scale
 
     return D_A, D_B
 
 
-def calculate_gene_expression_cosine_distance(sliceA, sliceB, use_rep, eps = 1e-6):
+def calculate_gene_expression_cosine_distance(sliceA, sliceB, use_rep, nx=None, data_type=np.float32, eps = 1e-6):
     """
     Calculate cosine distance between gene expression profiles of slice A and slice B.
-    
+
     Args:
     sliceA: First slice.
     sliceB: Second slice.
     use_rep: If ``None``, uses ``slice.X`` to calculate dissimilarity
                 between spots, otherwise uses the representation given by ``slice.obsm[use_rep]``.
+    nx: Optional POT backend. If given, the cosine distance is computed on that
+        backend (GPU when it is the torch backend) and a backend tensor is
+        returned. If ``None`` (default), the CPU/sklearn path is used and a numpy
+        array is returned (backward compatible).
+    data_type: Data type for backend tensors (when ``nx`` is given).
     eps: Small constant to add to data matrices to avoid zero vectors.
-    
+
     Returns:
     cosine_dist_gene_expr: Cosine distance matrix between gene expression profiles of slice A and slice B.
     """
-    
+
     print("Calculating cosine distance between gene expression profiles of slice A and slice B")
-    
+
     # Extract and prepare data matrices for cosine distance calculation
-    A_X = extract_data_matrix(sliceA, use_rep)
-    B_X = extract_data_matrix(sliceB, use_rep)
+    A_X = to_dense_array(extract_data_matrix(sliceA, use_rep)) + eps
+    B_X = to_dense_array(extract_data_matrix(sliceB, use_rep)) + eps
 
-    # Convert to dense arrays and add small constant to avoid zero vectors
-    A_X = to_dense_array(A_X) + eps
-    B_X = to_dense_array(B_X) + eps
+    if nx is None:
+        # CPU path: sklearn's optimized, numerically stable cosine_distances.
+        return cosine_distances(A_X, B_X)
 
-    # Use sklearn's optimized and numerically stable cosine_distances
-    cosine_dist_gene_expr = cosine_distances(A_X, B_X)
-
-    return cosine_dist_gene_expr
+    # Backend path: normalize rows then 1 - cosine similarity, all on device.
+    A = to_backend(A_X, nx, data_type=data_type)
+    B = to_backend(B_X, nx, data_type=data_type)
+    A = A / nx.sqrt(nx.sum(A ** 2, axis=1, keepdims=True))
+    B = B / nx.sqrt(nx.sum(B ** 2, axis=1, keepdims=True))
+    return 1.0 - (A @ B.T)
 
 
 def calculate_cell_type_mismatch(sliceA, sliceB):

@@ -91,10 +91,12 @@ def grid_sweep_full(
 
 
 def robustness_curves(
-    base,
+    section,
+    reference,
     best_weights,
     severity_axes,
     *,
+    crops=None,
     baseline_perturb,
     aligner=_default_aligner,
     n_instances=2,
@@ -104,7 +106,8 @@ def robustness_curves(
     seed=0,
 ):
     """For each severity axis, sweep its values (others at baseline), regenerate
-    instances, align at ``best_weights``, and record mean registration + coherence."""
+    instances from the supplied crop(s), align at ``best_weights``, and record mean
+    registration + coherence."""
     curves = {}
     for ai, (axis, values) in enumerate(severity_axes.items()):
         pts = []
@@ -112,7 +115,8 @@ def robustness_curves(
             pk = dict(baseline_perturb)
             pk[axis] = v
             inst = make_self_alignment_instances(
-                base, n_instances=n_instances, perturb_kwargs=pk, seed=seed + 100 * ai)
+                section=section, reference=reference, crops=crops,
+                n_instances=n_instances, perturb_kwargs=pk, seed=seed + 100 * ai)
             regs, cohs = [], []
             for sim, ref in inst:
                 pi = _align(aligner, sim, ref, best_weights, align_kwargs, True)
@@ -170,8 +174,10 @@ def _sensitivity_weight_list(best, alpha_grid, simplex_step, delta_value):
 
 
 def run_weight_benchmark(
-    base,
+    section,
+    reference,
     *,
+    crops=None,
     dev_perturb: dict,
     test_perturb: dict,
     severity_axes: dict,
@@ -208,19 +214,22 @@ def run_weight_benchmark(
 
     # A. select robust defaults on the development split
     sel = select_alignment_weights(
-        base, n_instances=n_dev_instances, perturb_kwargs=dev_perturb,
+        section=section, reference=reference, crops=crops,
+        n_instances=n_dev_instances, perturb_kwargs=dev_perturb,
         align_kwargs=align_kwargs, seed=seed, **(selection_kwargs or {}))
     best = sel["best"]
 
     # B. generalization on a held-out instance split (different seed + severities)
     test_inst = make_self_alignment_instances(
-        base, n_instances=n_test_instances, perturb_kwargs=test_perturb, seed=seed + 7)
+        section=section, reference=reference, crops=crops,
+        n_instances=n_test_instances, perturb_kwargs=test_perturb, seed=seed + 7)
     gen_row = grid_sweep_full(test_inst, [best], aligner=aligner, align_kwargs=align_kwargs,
                               label_key=label_key, spatial_key=spatial_key)[0]
 
     # C. robustness to each nuisance severity axis
     curves = robustness_curves(
-        base, best, severity_axes, baseline_perturb=baseline_perturb, aligner=aligner,
+        section, reference, best, severity_axes, crops=crops,
+        baseline_perturb=baseline_perturb, aligner=aligner,
         n_instances=n_robust_instances, align_kwargs=align_kwargs,
         label_key=label_key, spatial_key=spatial_key, seed=seed + 13)
 
@@ -331,7 +340,10 @@ if __name__ == "__main__":
     import scanpy as sc
 
     ap = argparse.ArgumentParser(description="Synthetic weight-selection benchmark for INCENT.")
-    ap.add_argument("--input_h5ad", required=True, help="Source slice (.h5ad) to crop/perturb.")
+    ap.add_argument("--reference_h5ad", required=True, help="Full parent slice (.h5ad).")
+    ap.add_argument("--section_h5ad", required=True,
+                    help="Manually cropped section (.h5ad, e.g. from synthesize.py); "
+                         "parent-frame coords with obs_names subsetting the reference.")
     ap.add_argument("--outdir", default="results/weight_benchmark")
     ap.add_argument("--use_gpu", choices=["auto", "true", "false"], default="auto",
                     help="Use CUDA for the alignment OT. 'auto' (default) uses the GPU if available.")
@@ -343,9 +355,11 @@ if __name__ == "__main__":
     else:
         use_gpu = (args.use_gpu == "true")
 
-    base = sc.read_h5ad(args.input_h5ad)
+    reference = sc.read_h5ad(args.reference_h5ad)
+    section = sc.read_h5ad(args.section_h5ad)
     res = run_weight_benchmark(
-        base,
+        section,
+        reference,
         dev_perturb=DEFAULT_DEV_PERTURB,
         test_perturb=DEFAULT_TEST_PERTURB,
         severity_axes=DEFAULT_SEVERITY_AXES,
