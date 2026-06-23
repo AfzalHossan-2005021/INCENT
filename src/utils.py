@@ -175,68 +175,6 @@ def fused_gromov_wasserstein_incent(M, C1, C2, p, q, G_init = None, alpha = 0.1,
         return cg(p, q, (1-alpha)*M, alpha, f, df, G0=G0, line_search=line_search, numItermax=numItermax, numItermaxEmd=numItermaxEmd, stopThr=tol_rel, stopThr2=tol_abs, verbose=verbose, log=log, nx=nx, **kwargs)
 
 
-def kl_divergence_corresponding_backend(X, Y):
-    """
-    Returns pairwise KL divergence (over all pairs of samples) of two matrices X and Y.
-
-    Takes advantage of POT backend to speed up computation.
-
-    Args:
-        X: np array with dim (n_samples by n_features)
-        Y: np array with dim (m_samples by n_features)
-
-    Returns:
-        D: np array with dim (n_samples by m_samples). Pairwise KL divergence matrix.
-    """
-    assert X.shape[1] == Y.shape[1], "X and Y do not have the same number of features."
-
-    nx = ot.backend.get_backend(X,Y)
-
-    epsilon = 1e-12
-
-    X = X/(nx.sum(X,axis=1, keepdims=True) + epsilon)
-    Y = Y/(nx.sum(Y,axis=1, keepdims=True) + epsilon)
-    log_X = nx.log(X + epsilon)
-    log_Y = nx.log(Y + epsilon)
-    X_log_X = nx.einsum('ij,ij->i',X,log_X)
-    X_log_X = nx.reshape(X_log_X,(1,X_log_X.shape[0]))
-
-    X_log_Y = nx.einsum('ij,ij->i',X,log_Y)
-    X_log_Y = nx.reshape(X_log_Y,(1,X_log_Y.shape[0]))
-    D = X_log_X.T - X_log_Y.T
-    return D
-
-
-def jensenshannon_distance_1_vs_many_backend(X, Y):
-    """
-    Returns pairwise Jensenshannon distance (over all pairs of samples) of two matrices X and Y.
-
-    Takes advantage of POT backend to speed up computation.
-
-    Args:
-        X: np array with dim (n_samples by n_features)
-        Y: np array with dim (m_samples by n_features)
-
-    Returns:
-        D: np array with dim (n_samples by m_samples). Pairwise KL divergence matrix.
-    """
-    assert X.shape[1] == Y.shape[1], "X and Y do not have the same number of features."
-    assert X.shape[0] == 1
-    # device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-
-    nx = ot.backend.get_backend(X,Y)        # np or torch depending upon gpu availability
-    X = nx.concatenate([X] * Y.shape[0], axis=0) # broadcast X
-    X = X/(nx.sum(X,axis=1, keepdims=True) + 1e-12)   # normalize
-    Y = Y/(nx.sum(Y,axis=1, keepdims=True) + 1e-12)   # normalize
-    M = (X + Y) / 2.0
-    kl_X_M = kl_divergence_corresponding_backend(X, M)
-    kl_Y_M = kl_divergence_corresponding_backend(Y, M)
-    # Clip small negative values due to floating point error before sqrt
-    js_sq = (kl_X_M + kl_Y_M) / 2.0
-    js_dist = nx.sqrt(nx.maximum(js_sq, 0.0)).T[0]
-    return js_dist
-
-
 def _is_oom_error(err) -> bool:
     """True if an exception is an out-of-memory error (CUDA or host)."""
     if isinstance(err, MemoryError):
@@ -255,16 +193,27 @@ def _empty_cuda_cache(nx):
             pass
 
 
-def _auto_js_block(n, m, F, X, nx, mem_fraction, dtype_bytes=4):
+def _elem_bytes(x, default=4):
+    """Bytes per element of a numpy array or torch tensor (for memory budgeting)."""
+    try:
+        return int(x.dtype.itemsize)        # numpy
+    except AttributeError:
+        try:
+            return int(x.element_size())    # torch
+        except Exception:
+            return default
+
+
+def _auto_js_block(n, m, F, X, nx, mem_fraction):
     """
     Choose a row-block size so the (block, m, F) intermediates fit in memory.
 
     On the torch/CUDA backend the budget is a fraction of the *currently free*
-    device memory (queried per call); otherwise a conservative fixed budget is
-    used. The per-pair JS computation keeps roughly two (block, m, F) tensors
-    live (``M`` and ``log M``), so ``mem_fraction`` leaves ample headroom -- and
-    the caller additionally halves the block on any OOM, so an over-estimate
-    self-corrects.
+    device memory (queried per call), scaled by the tensor's actual element size;
+    otherwise a conservative fixed budget is used. The per-pair JS computation
+    keeps roughly two (block, m, F) tensors live (``M`` and ``log M``), so
+    ``mem_fraction`` leaves ample headroom -- and the caller additionally halves
+    the block on any OOM, so an over-estimate self-corrects.
     """
     budget_elems = None
     if nx.__class__.__name__ == "TorchBackend":
@@ -272,11 +221,11 @@ def _auto_js_block(n, m, F, X, nx, mem_fraction, dtype_bytes=4):
             import torch
             if getattr(X, "is_cuda", False):
                 free, _ = torch.cuda.mem_get_info(X.device)
-                budget_elems = int(mem_fraction * free / dtype_bytes)
+                budget_elems = int(mem_fraction * free / _elem_bytes(X))
         except Exception:
             budget_elems = None
     if budget_elems is None:
-        budget_elems = 30_000_000  # ~120 MB per (block, m, F) tensor on CPU/unknown
+        budget_elems = 30_000_000  # element budget per (block, m, F) tensor on CPU/unknown
     per_row = max(int(m) * int(F), 1)
     return int(max(1, min(int(n), budget_elems // per_row)))
 
@@ -333,6 +282,9 @@ def jensenshannon_divergence_backend(X, Y, block=None, mem_fraction=0.25, eps=1e
             start = stop
         except (RuntimeError, MemoryError) as err:
             if _is_oom_error(err) and (stop - start) > 1:
+                # drop references to the large (block, m, F) tensors so the
+                # smaller retry can actually reclaim their memory.
+                M = logM = None
                 _empty_cuda_cache(nx)
                 block = max(1, (stop - start) // 2)
                 continue
