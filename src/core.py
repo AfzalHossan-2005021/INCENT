@@ -16,7 +16,7 @@ from .hierarchical import (
     compute_pairwise_mutual_information_contribution,
     extract_continuous_macro_section,
     fit_weighted_rigid_transform,
-    run_coarse_partial_fgw,
+    run_coarse_fugw,
 )
 from .utils import (
     select_backend,
@@ -150,7 +150,7 @@ def select_coarsen_length(
         )
         C_A = compute_cluster_structural_matrix(cache_A.centroids)
         C_B = compute_cluster_structural_matrix(cache_B.centroids)
-        Pi = run_coarse_partial_fgw(M_cluster, C_A, C_B, cache_A.masses, cache_B.masses, alpha=alpha)
+        Pi = run_coarse_fugw(M_cluster, C_A, C_B, cache_A.masses, cache_B.masses, alpha=alpha)
 
         mi, resid = _coarse_matchability(Pi, cache_A.centroids, cache_B.centroids)
         scored.append((S, mi, resid))
@@ -282,7 +282,7 @@ def hierarchical_pairwise_align(
     C_B = compute_cluster_structural_matrix(centroidsB)
     
     print("--- [HOT] Step 4: Run Coarse Partial FGW ---")
-    Pi_cluster = run_coarse_partial_fgw(M_cluster, C_A, C_B, p_A, p_B, alpha=alpha_cluster)
+    Pi_cluster = run_coarse_fugw(M_cluster, C_A, C_B, p_A, p_B, alpha=alpha_cluster)
     
     if visualize_clusters:
         visualize_cluster_mapping(centroidsA, centroidsB, Pi_cluster)

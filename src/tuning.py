@@ -39,7 +39,7 @@ from .hierarchical import (
     build_slice_cluster_cache,
     compute_cluster_feature_costs,
     compute_cluster_structural_matrix,
-    run_coarse_partial_fgw,
+    run_coarse_fugw,
     extract_continuous_macro_section,
 )
 from .perturb import simulate_adjacent_slice
@@ -255,7 +255,7 @@ def _coarse_overlap_f1(sim, ref, pc, alpha_cluster, delta, *, spatial_key, label
     M_cluster = compute_cluster_feature_costs(
         pc["cache_A"].mu_expr, pc["cache_A"].mu_struct,
         pc["cache_B"].mu_expr, pc["cache_B"].mu_struct, delta=delta)
-    Pi_cluster = run_coarse_partial_fgw(
+    Pi_cluster = run_coarse_fugw(
         M_cluster, pc["C_A"], pc["C_B"], pc["cache_A"].masses, pc["cache_B"].masses,
         alpha=alpha_cluster)
     try:
