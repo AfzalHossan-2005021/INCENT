@@ -429,17 +429,65 @@ def hierarchical_pairwise_align(
         sliceA_shadow = sliceA[idx_A_shadow].copy()
         sliceB_shadow = sliceB[idx_B_shadow].copy()
         
-        # Scaling the decay dynamically based on the width of the shadow
-        sigma_A = max(1e-5, np.max(dist_A[idx_A_shadow]))
-        sigma_B = max(1e-5, np.max(dist_B[idx_B_shadow]))
-        
-        weight_A_shadow = np.exp(- (dist_A[idx_A_shadow]**2) / (2 * sigma_A**2))
-        weight_B_shadow = np.exp(- (dist_B[idx_B_shadow]**2) / (2 * sigma_B**2))
+        # ── Per-cluster spatial bandwidths ───────────────────────────────────────
+        # Mean L2 displacement of cells from their cluster centroid is the natural
+        # scale for the Gaussian soft-membership kernel — data-adaptive, no free
+        # parameters. Guards against singleton clusters (distance = 0).
+        coords_A_orig = np.asarray(sliceA.obsm[spatial_key])
+        coords_B_orig = np.asarray(sliceB.obsm[spatial_key])
 
-        G_init_shadow = np.outer(weight_A_shadow, weight_B_shadow)
-        G_init_sum = np.sum(G_init_shadow)
-        if G_init_sum > 0:
-            G_init_shadow /= G_init_sum
+        sigma_A_clust = np.array([
+            max(float(np.mean(np.linalg.norm(
+                coords_A_orig[labelsA == cA] - centroidsA[cA], axis=1
+            ))) if np.any(labelsA == cA) else 1e-8, 1e-8)
+            for cA in range(Pi_cluster.shape[0])
+        ])
+        sigma_B_clust = np.array([
+            max(float(np.mean(np.linalg.norm(
+                coords_B_orig[labelsB == cB] - centroidsB[cB], axis=1
+            ))) if np.any(labelsB == cB) else 1e-8, 1e-8)
+            for cB in range(Pi_cluster.shape[1])
+        ])
+
+        # ── Soft Gaussian cluster memberships for shadow cells ────────────────────
+        # s_A[i, cA] = p(cell i belongs to cluster cA) under an isotropic Gaussian
+        # model fitted per cluster; rows are normalized to sum to 1.
+        coords_As = coords_A_orig[idx_A_shadow]   # (nA_shadow, 2)
+        coords_Bs = coords_B_orig[idx_B_shadow]   # (nB_shadow, 2)
+
+        dA2 = np.sum((coords_As[:, None, :] - centroidsA[None, :, :]) ** 2, axis=2)   # (nA_s, C_A)
+        dB2 = np.sum((coords_Bs[:, None, :] - centroidsB[None, :, :]) ** 2, axis=2)   # (nB_s, C_B)
+
+        log_SA = -0.5 * dA2 / (sigma_A_clust[None, :] ** 2)
+        log_SA -= log_SA.max(axis=1, keepdims=True)   # numerical stability
+        S_A = np.exp(log_SA)
+        S_A /= S_A.sum(axis=1, keepdims=True) + 1e-12
+
+        log_SB = -0.5 * dB2 / (sigma_B_clust[None, :] ** 2)
+        log_SB -= log_SB.max(axis=1, keepdims=True)
+        S_B = np.exp(log_SB)
+        S_B /= S_B.sum(axis=1, keepdims=True) + 1e-12
+
+        # Maximum-entropy cell-level lifting of the coarse unbalanced plan:
+        #   G_init[i,j] = Σ_{cA,cB}  s_A[i,cA] · Pi_cluster[cA,cB] · s_B[j,cB]
+        # Border cells inherit coupling from adjacent matched clusters proportionally;
+        # interior cells behave like hard block assignment. fused_gromov_wasserstein_incent
+        # normalizes G_init by its total sum internally, so no explicit rescaling needed.
+        G_init_shadow = S_A @ Pi_cluster @ S_B.T   # (nA_shadow, nB_shadow)
+
+        # ── Confidence-weighted marginals ─────────────────────────────────────────
+        # Encode proximity to the trusted biological core as the FGW marginals rather
+        # than baking it into G_init. This separates the structural prior (G_init)
+        # from the confidence prior (how much mass each shadow cell contributes).
+        # 95th-percentile sigma is robust to outlier shadow cells; max() is not.
+        sigma_A_conf = max(float(np.percentile(dist_A[idx_A_shadow], 95)), 1e-5)
+        sigma_B_conf = max(float(np.percentile(dist_B[idx_B_shadow], 95)), 1e-5)
+
+        weight_A_shadow = np.exp(-(dist_A[idx_A_shadow] ** 2) / (2.0 * sigma_A_conf ** 2))
+        weight_B_shadow = np.exp(-(dist_B[idx_B_shadow] ** 2) / (2.0 * sigma_B_conf ** 2))
+
+        a_dist = weight_A_shadow / weight_A_shadow.sum()
+        b_dist = weight_B_shadow / weight_B_shadow.sum()
 
         if visualize_clusters:
                 visualize_global_overlap_projection(
@@ -460,6 +508,8 @@ def hierarchical_pairwise_align(
             beta=beta,
             gamma=gamma,
             G_init=G_init_shadow,
+            a_distribution=a_dist,
+            b_distribution=b_dist,
             numItermax=numItermax,
             use_gpu=use_gpu,
             verbose=verbose,
