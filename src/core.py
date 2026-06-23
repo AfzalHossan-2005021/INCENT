@@ -532,7 +532,7 @@ def pairwise_align(
     G_init = None,
     a_distribution = None,
     b_distribution = None,
-    numItermax: int = 6000,
+    numItermax: int = 10000,
     use_gpu: bool = False,
     data_type = np.float32,
     epsilon: float = 1e-6,
@@ -590,19 +590,15 @@ def pairwise_align(
 
     # ────────────────────── Calculate gene expression dissimilarity ──────────────────────
     # Computed on the active backend (GPU when available); returns a backend tensor.
-    M_gene = calculate_gene_expression_cosine_distance(sliceA, sliceB, use_rep, nx=nx, data_type=data_type, eps=epsilon)
+    gene_cos_dist = calculate_gene_expression_cosine_distance(sliceA, sliceB, use_rep, nx=nx, data_type=data_type, eps=epsilon)
 
 
     # ────────────────────── Calculate cell-type mismatch penalty ──────────────────────
     cell_type_mismatch = to_backend(calculate_cell_type_mismatch(sliceA, sliceB), nx, data_type=data_type)
 
 
-    # Combine gene expression dissimilarity and cell-type mismatch penalty into a single cost matrix M1 (on backend)
-    M1 = (1 - beta - gamma) * M_gene + beta * cell_type_mismatch
-
-
     # ────────────────────── Calculate neighborhood dissimilarity ──────────────────────
-    js_dist_neighborhood = calculate_neighborhood_dissimilarity(
+    neighborhood_jsd = to_backend(calculate_neighborhood_dissimilarity(
         sliceA,
         sliceB,
         radius=radius,                 # optional; if None derived from characteristic spacing
@@ -611,11 +607,12 @@ def pairwise_align(
         eps=epsilon,
         n_shells=3,
         harmonics=(0, 1, 2),
-        harmonic_weights=None,
         distance_decay="linear",
         include_self=False,
-    )
-    M2 = to_backend(js_dist_neighborhood, nx, data_type=data_type)
+    ), nx, data_type=data_type)
+
+    # Combine gene expression dissimilarity, cell-type mismatch penalty and neighborhood dissimilarity into a single cost matrix M (on backend)
+    M = (1 - beta - gamma) * gene_cos_dist + beta * cell_type_mismatch + gamma * neighborhood_jsd
 
     # init distributions
     if a_distribution is None:
@@ -635,7 +632,7 @@ def pairwise_align(
     if G_init is not None:
         G_init = to_backend(G_init, nx, data_type=data_type)
 
-    pi = fused_gromov_wasserstein_incent(M1 + gamma * M2, D_A, D_B, a, b, G_init = G_init, alpha= alpha, numItermax=numItermax, verbose=verbose, **kwargs)
+    pi = fused_gromov_wasserstein_incent(M, D_A, D_B, a, b, G_init = G_init, alpha= alpha, numItermax=numItermax, verbose=verbose, **kwargs)
     pi = nx.to_numpy(pi)
 
     if isinstance(nx, ot.backend.TorchBackend):
@@ -759,7 +756,7 @@ def equal_area_shell_edges(radius, n_shells):
     return radius * np.sqrt(np.linspace(0.0, 1.0, n_shells + 1))
 
 
-def distance_weights(dist, radius, mode="linear", sigma=None):
+def distance_weights(dist, radius, mode="linear"):
     """
     Distance weighting for neighbors inside a radius.
     """
@@ -770,9 +767,7 @@ def distance_weights(dist, radius, mode="linear", sigma=None):
         return np.maximum(0.0, 1.0 - dist / radius)
 
     if mode == "gaussian":
-        s = radius / 2.0 if sigma is None else float(sigma)
-        if s <= 0:
-            raise ValueError("sigma must be > 0")
+        s = radius / 2.0
         return np.exp(-(dist ** 2) / (2.0 * s * s))
 
     raise ValueError("distance_decay must be one of: None, 'uniform', 'linear', 'gaussian'")
@@ -783,11 +778,8 @@ def neighborhood_distribution_fourier(
     radius,
     cell_types=None,
     n_shells=3,
-    shell_edges=None,
     harmonics=(0, 1, 2),
-    harmonic_weights=None,
     distance_decay="linear",
-    sigma=None,
     include_self=False,
     area_normalize=True,
     add_empty_bin=True,
@@ -836,21 +828,7 @@ def neighborhood_distribution_fourier(
     if 0 not in harmonics:
         harmonics = (0,) + harmonics
 
-    if harmonic_weights is None:
-        harmonic_weights = {}
-    else:
-        harmonic_weights = {int(k): float(v) for k, v in harmonic_weights.items()}
-
-    if shell_edges is None:
-        shell_edges = equal_area_shell_edges(radius, n_shells)
-    else:
-        shell_edges = np.asarray(shell_edges, dtype=np.float64)
-        if not np.isclose(shell_edges[0], 0.0):
-            raise ValueError("shell_edges must start at 0")
-        if not np.isclose(shell_edges[-1], radius):
-            raise ValueError("shell_edges must end at radius")
-        if np.any(np.diff(shell_edges) <= 0):
-            raise ValueError("shell_edges must be strictly increasing")
+    shell_edges = equal_area_shell_edges(radius, n_shells)
 
     n_cells = coords.shape[0]
     n_types = len(cell_types)
@@ -901,7 +879,7 @@ def neighborhood_distribution_fourier(
                 features[i, -1] = 1.0
             continue
 
-        w = distance_weights(dist, radius=radius, mode=distance_decay, sigma=sigma)
+        w = distance_weights(dist, radius=radius, mode=distance_decay)
         group_idx = label_idx[nbr] * n_shells_eff + shell_idx
 
         local = np.zeros((n_groups, n_harm), dtype=np.float64)
@@ -912,7 +890,6 @@ def neighborhood_distribution_fourier(
                 mag = np.bincount(group_idx, weights=w, minlength=n_groups).astype(np.float64)
                 if area_normalize:
                     mag = mag / np.maximum(group_area, 1e-12)
-                mag *= harmonic_weights.get(m, 1.0)
                 local[:, h_pos] = mag
                 h_pos += 1
             else:
@@ -923,8 +900,6 @@ def neighborhood_distribution_fourier(
                 magnitude = np.sqrt(real ** 2 + imag ** 2)
                 if area_normalize:
                     magnitude = magnitude / np.maximum(group_area, 1e-12)
-
-                magnitude *= harmonic_weights.get(m, 1.0)
 
                 local[:, h_pos] = magnitude
                 h_pos += 1
@@ -1086,9 +1061,7 @@ def calculate_neighborhood_dissimilarity(
     eps=1e-8,
     n_shells=3,
     harmonics=(0, 1, 2),
-    harmonic_weights=None,
     distance_decay="linear",
-    sigma=None,
     include_self=False,
     spatial_key="spatial",
     label_key="cell_type_annot",
@@ -1125,9 +1098,7 @@ def calculate_neighborhood_dissimilarity(
             cell_types=all_types,
             n_shells=n_shells,
             harmonics=harmonics,
-            harmonic_weights=harmonic_weights,
             distance_decay=distance_decay,
-            sigma=sigma,
             include_self=include_self,
             area_normalize=True,
             add_empty_bin=False,
