@@ -170,7 +170,11 @@ def select_coarsen_length(
         if not np.isfinite(lo) or hi - lo < 1e-12:
             base = np.zeros_like(x, dtype=np.float64)
         else:
-            base = (np.nan_to_num(y, nan=lo) - lo) / (hi - lo)
+            # Non-finite entries (e.g. inf rigid residual from too few cluster pairs)
+            # are filled with the worst value for that direction so they score 0,
+            # not the best value that nan_to_num(nan=lo) would wrongly assign.
+            nan_fill = lo if higher_is_better else hi
+            base = (np.nan_to_num(y, nan=nan_fill) - lo) / (hi - lo)
         return base if higher_is_better else (1.0 - base)
 
     combined = _minmax(mi_arr, True) + _minmax(resid_arr, False)
@@ -187,6 +191,7 @@ def hierarchical_pairwise_align(
     gamma: float = 0.25,
     alpha_cluster: float = 0.5,
     delta: float = 0.75,
+    reg_m: float = 1.0,
     numItermax: int = 100000,
     use_gpu: bool = True,
     coarsen_scale: Optional[float] = None,
@@ -210,6 +215,16 @@ def hierarchical_pairwise_align(
     magic-number cluster count and no per-call resolution knob.
 
     Args:
+        use_rep: Representation used for cluster-level feature extraction in the
+            coarse stage (default ``"X_pca"``). The fine-level ``pairwise_align``
+            always uses raw ``slice.X`` for gene expression; this two-stage design
+            is intentional — PCA gives a compact, noise-reduced signal for
+            mesoregion matching, while raw counts preserve the full expression
+            profile for cell-level cost computation.
+        reg_m: Marginal-relaxation penalty for the unbalanced coarse FGW
+            (``reg_marginals`` in POT). Higher values enforce tighter marginal
+            constraints (closer to balanced transport); lower values allow more
+            mass to be dropped from non-overlapping clusters. Default 1.0.
         coarsen_scale: Optional hard override of the supercell seed spacing (a
             physical length in coordinate units). When ``None`` the scale is
             derived from the slices' intrinsic geometry.
@@ -281,8 +296,8 @@ def hierarchical_pairwise_align(
     C_A = compute_cluster_structural_matrix(centroidsA)
     C_B = compute_cluster_structural_matrix(centroidsB)
     
-    print("--- [HOT] Step 4: Run Coarse Partial FGW ---")
-    Pi_cluster = run_coarse_fugw(M_cluster, C_A, C_B, p_A, p_B, alpha=alpha_cluster)
+    print("--- [HOT] Step 4: Run Coarse FUGW ---")
+    Pi_cluster = run_coarse_fugw(M_cluster, C_A, C_B, p_A, p_B, alpha=alpha_cluster, reg_m=reg_m)
     
     if visualize_clusters:
         visualize_cluster_mapping(centroidsA, centroidsB, Pi_cluster)
@@ -366,7 +381,13 @@ def hierarchical_pairwise_align(
 
     print("--- [HOT] Step 7: Global Refinement via Overlap Projection ---")
     try:
-        # 1. Geometrically align full slices using the partial block solution
+        # 1. Geometrically align full slices using the partial block solution.
+        # stack_slices_pairwise hard-codes obsm['spatial']; bridge the gap by
+        # temporarily exposing the user's key under that name, then restoring it.
+        _key_is_nonstandard = (spatial_key != "spatial")
+        if _key_is_nonstandard:
+            sliceA = sliceA.copy(); sliceA.obsm["spatial"] = sliceA.obsm[spatial_key]
+            sliceB = sliceB.copy(); sliceB.obsm["spatial"] = sliceB.obsm[spatial_key]
         aligned_slices = stack_slices_pairwise([sliceA, sliceB], [pi_full], output_params=False)
         if visualize_clusters:
             visualize_alignment_with_anchors(
@@ -375,8 +396,8 @@ def hierarchical_pairwise_align(
                 spatial_key=spatial_key,
             )
         
-        coords_A_aligned = np.asarray(aligned_slices[0].obsm[spatial_key])
-        coords_B_aligned = np.asarray(aligned_slices[1].obsm[spatial_key])
+        coords_A_aligned = np.asarray(aligned_slices[0].obsm["spatial"])
+        coords_B_aligned = np.asarray(aligned_slices[1].obsm["spatial"])
         
         # 2. Determine overlapping regions based on Morphological Rasterization (Exact Shadow)
         # Replaces soft radius (KDTree) or rigid boundaries (Convex Hull) with a grid footprint
@@ -398,18 +419,22 @@ def hierarchical_pairwise_align(
         # Build 2D occupancy maps
         max_idx_A = grid_A.max(axis=0)
         max_idx_B = grid_B.max(axis=0)
-        grid_bounds = np.maximum(max_idx_A, max_idx_B) + 5  # pad for safety
-        
-        from scipy.ndimage import binary_dilation
+        # +2 guarantees the dilation (1 pixel each side) never touches the array edge.
+        grid_bounds = np.maximum(max_idx_A, max_idx_B) + 2
+
+        from scipy.ndimage import binary_dilation, generate_binary_structure
         mask_A = np.zeros(grid_bounds, dtype=bool)
         mask_B = np.zeros(grid_bounds, dtype=bool)
-        
+
         mask_A[tuple(grid_A.T)] = True
         mask_B[tuple(grid_B.T)] = True
-        
-        # Dilate footprint slightly to connect cellular gaps mathematically without bloating the tissue
-        mask_A_dilated = binary_dilation(mask_A, iterations=1)
-        mask_B_dilated = binary_dilation(mask_B, iterations=1)
+
+        # Cross (diamond) structuring element: expands by exactly 1 pixel along
+        # the cardinal axes, avoiding the diagonal over-reach of the default
+        # full-connectivity (square) element.
+        cross = generate_binary_structure(2, 1)
+        mask_A_dilated = binary_dilation(mask_A, structure=cross, iterations=1)
+        mask_B_dilated = binary_dilation(mask_B, structure=cross, iterations=1)
         
         # The exact, topological shadow intersection of both tissues
         overlap_mask = mask_A_dilated & mask_B_dilated
@@ -524,7 +549,16 @@ def hierarchical_pairwise_align(
         return pi_full_final
         
     except Exception as e:
-        print(f"Global refinement failed: {e}. Returning block-restricted pi_full.")
+        import traceback
+        import warnings
+        warnings.warn(
+            f"[HOT] Global refinement failed and fell back to the block-restricted "
+            f"coarse plan. Downstream results may be degraded.\n"
+            f"Cause: {type(e).__name__}: {e}\n"
+            f"{traceback.format_exc()}",
+            RuntimeWarning,
+            stacklevel=2,
+        )
         return pi_full
 
 
