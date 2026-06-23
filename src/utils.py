@@ -87,38 +87,71 @@ def _default_fgw_tol(x, fallback=1e-9):
     return fallback       # float64 / double
 
 
-def fused_gromov_wasserstein_incent(M, C1, C2, p, q, G_init = None, alpha = 0.1, armijo=False, log=False, numItermax=6000, numItermaxEmd=100000, tol_rel=None, tol_abs=None, verbose=False, **kwargs):
+def fused_gromov_wasserstein_incent(M, C1, C2, p, q, G_init = None, alpha = 0.1, armijo=False, log=False, numItermax=10000, numItermaxEmd=100000, tol_rel=None, tol_abs=None, verbose=False, **kwargs):
     """
-    This method is written by Anup Bhowmik, CSE, BUET
+    Fused Gromov-Wasserstein optimal transport with an optional warm-start coupling.
 
-    Adapted fused_gromov_wasserstein with the added capability of defining a G_init (inital mapping).
-    Also added capability of utilizing different POT backends to speed up computation.
-    
-    For more info, see: https://pythonot.github.io/gen_modules/ot.gromov.html
+    Minimizes, over couplings ``T`` with marginals ``p`` and ``q``, a fused objective
+    trading off a linear feature cost against a Gromov-Wasserstein (GW) structural
+    cost::
 
-    # M: combined cost matrix (M1 + gamma * M2)
-    # C1: spatial distance matrix of slice 1
-    # C2: spatial distance matrix of slice 2
+        argmin_T  (1 - alpha) * <M, T>_F  +  alpha * GW(C1, C2, T)
 
-    # p: initial distribution(uniform) of sliceA spots
-    # q: initial distribution(uniform) of sliceB spots
+    using POT's conditional-gradient solver (:func:`ot.optim.cg`). The GW term and
+    its gradient are supplied as the closures ``f`` and ``df`` below, and the line
+    search is either Armijo or the closed-form Gromov-Wasserstein step. Beyond a
+    plain POT call, this wrapper adds: (i) an optional ``G_init`` warm-start,
+    (ii) convergence tolerances that default to the working float precision, and
+    (iii) execution on whatever backend/device the inputs live on (NumPy, or PyTorch
+    on GPU when the inputs are CUDA tensors).
 
-    # how did they incorporate the spatial data in the fused gromov wasserstein?
-    # C1: spatial distance matrix of slice 1
-    # C2: spatial distance matrix of slice 2
-    # p: gene expression distribution of slice 1 (initial distribution is uniform)
-    # q: gene expression distribution of slice 2
-    # G_init: initial pi matrix mapping
-    # loss_fun: loss function to use (square loss)
-    # alpha: step size
-    # armijo: whether to use armijo line search
-    # log: whether to print log
-    # numItermax: maximum number of iterations
-    # tol_rel: relative tolerance
-    # tol_abs: absolute tolerance
-    # use_gpu: whether to use gpu
-    # **kwargs: additional arguments for ot.gromov.fgw
+    Parameters
+    ----------
+    M : array-like, shape (n, m)
+        Linear feature cost between source and target points (backend tensor or
+        NumPy array), e.g. the combined expression/cell-type/neighborhood cost.
+    C1 : array-like, shape (n, n)
+        Source intra-domain structure matrix (e.g. spatial distances); symmetric.
+    C2 : array-like, shape (m, m)
+        Target intra-domain structure matrix; symmetric.
+    p : array-like, shape (n,)
+        Source marginal (mass) distribution.
+    q : array-like, shape (m,)
+        Target marginal (mass) distribution.
+    G_init : array-like, shape (n, m), optional
+        Initial coupling for the conditional gradient. It is mass-normalized and used
+        as the starting point ``G0``; ``None`` uses the outer product ``p (x) q``.
+    alpha : float, default 0.1
+        Trade-off in ``[0, 1]``: weight ``alpha`` on the GW structural term and
+        ``1 - alpha`` on the linear feature term.
+    armijo : bool, default False
+        If ``True`` use an Armijo line search; otherwise the closed-form GW line
+        search (:func:`ot.gromov.solve_gromov_linesearch`).
+    log : bool, default False
+        If ``True`` also return POT's solver log dict (which includes ``fgw_dist``).
+    numItermax : int, default 10000
+        Maximum number of conditional-gradient iterations.
+    numItermaxEmd : int, default 100000
+        Maximum iterations of the inner exact-OT (EMD) subproblem.
+    tol_rel, tol_abs : float, optional
+        Relative / absolute stopping thresholds. ``None`` (default) selects a value
+        matched to the cost dtype (~1e-6 for float32, 1e-9 for float64), since a
+        1e-9 threshold is unreachable in float32 (see :func:`_default_fgw_tol`).
+    verbose : bool, default False
+        Print solver progress.
+    **kwargs
+        Additional keyword arguments forwarded to :func:`ot.optim.cg`.
 
+    Returns
+    -------
+    T : backend array, shape (n, m)
+        The optimal coupling. If ``log=True``, returns ``(T, log_dict)`` instead.
+
+    Notes
+    -----
+    GPU: the computation runs on the backend/device of the inputs, so passing PyTorch
+    CUDA tensors (as the pipeline does when ``use_gpu=True``) keeps the whole solve
+    on the GPU.
     """
 
     p, q = ot.utils.list_to_array(p, q)
@@ -164,11 +197,8 @@ def fused_gromov_wasserstein_incent(M, C1, C2, p, q, G_init = None, alpha = 0.1,
    
         res, log = cg(p, q, (1-alpha)*M, alpha, f, df, G0=G0, line_search=line_search, numItermax=numItermax, numItermaxEmd=numItermaxEmd, stopThr=tol_rel, stopThr2=tol_abs, verbose=verbose, log=log, nx=nx, **kwargs)
 
-        fgw_dist = log['loss'][-1]
+        log['fgw_dist'] = log['loss'][-1]
 
-        log['fgw_dist'] = fgw_dist
-        log['u'] = log['u']
-        log['v'] = log['v']
         return res, log
 
     else:
