@@ -1080,6 +1080,13 @@ def calculate_spatial_distance(sliceA, sliceB, nx, data_type=np.float32, spatial
     scale_B = estimate_characteristic_spacing(sliceB, k=norm_k, spatial_key=spatial_key)
     scale = max(scale_A, scale_B, eps)
 
+    # Center each slice (translation-invariant -> identical distances) before casting
+    # to the backend dtype. With global coordinates far from the origin, the
+    # Gram-matrix distance trick (|x|^2+|y|^2-2x.y) loses catastrophic precision in
+    # float32; centering keeps magnitudes small so float32 stays accurate.
+    coordinates_A = coordinates_A - coordinates_A.mean(axis=0)
+    coordinates_B = coordinates_B - coordinates_B.mean(axis=0)
+
     coords_A = to_backend(coordinates_A, nx, data_type=data_type)
     coords_B = to_backend(coordinates_B, nx, data_type=data_type)
 
