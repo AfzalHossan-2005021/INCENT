@@ -601,10 +601,13 @@ def pairwise_align(
     neighborhood_jsd = to_backend(calculate_neighborhood_dissimilarity(
         sliceA,
         sliceB,
-        radius=radius,                 # optional; if None derived from characteristic spacing
+        radius=radius,                 # optional single radius; else multiscale radii are derived
         nx=nx,
         data_type=data_type,
         eps=epsilon,
+        radii=None,                    # or pass an explicit list, e.g. [20, 35, 50]
+        radius_k=3,
+        radius_multipliers=(2.5, 4.0, 5.0),
         n_shells=3,
         harmonics=(0, 1, 2),
         distance_decay="linear",
@@ -934,6 +937,80 @@ def neighborhood_distribution_fourier(
     return features, metadata
 
 
+def default_radii_from_spacing(sliceA, sliceB, k=3, multipliers=(2.5, 4.0, 5.0), spatial_key="spatial"):
+    """Multiscale neighborhood radii as multiples of the shared characteristic spacing."""
+    sA = estimate_characteristic_spacing(sliceA, k=k, spatial_key=spatial_key)
+    sB = estimate_characteristic_spacing(sliceB, k=k, spatial_key=spatial_key)
+    base = max(sA, sB)
+    return [m * base for m in multipliers]
+
+
+def neighborhood_distribution_multiscale(
+    adata,
+    radii,
+    cell_types=None,
+    n_shells=3,
+    harmonics=(0, 1, 2),
+    distance_decay="linear",
+    include_self=False,
+    area_normalize=True,
+    add_empty_bin_per_scale=False,
+    l1_normalize_within_scale=True,
+    final_l1_normalize=True,
+    dtype=np.float32,
+    spatial_key="spatial",
+    label_key="cell_type_annot",
+    return_metadata=False,
+):
+    """
+    Concatenate rotation- and reflection-invariant descriptors across multiple radii.
+
+    Each radius's descriptor is built (and L1-normalized within scale) by
+    :func:`neighborhood_distribution_fourier`; the per-scale blocks are concatenated
+    and optionally re-normalized. Independent fine- and broad-scale views, each
+    normalized in its own right, make the Jensen-Shannon neighborhood cost more
+    discriminative than a single radius.
+    """
+    radii = [float(r) for r in radii]
+    if any(r <= 0 for r in radii):
+        raise ValueError("all radii must be > 0")
+
+    blocks = []
+    meta_blocks = []
+    for r in radii:
+        feat, meta = neighborhood_distribution_fourier(
+            adata,
+            radius=r,
+            cell_types=cell_types,
+            n_shells=n_shells,
+            harmonics=harmonics,
+            distance_decay=distance_decay,
+            include_self=include_self,
+            area_normalize=area_normalize,
+            add_empty_bin=add_empty_bin_per_scale,
+            l1_normalize=l1_normalize_within_scale,
+            dtype=np.float64,
+            spatial_key=spatial_key,
+            label_key=label_key,
+            return_metadata=True,
+        )
+        blocks.append(feat)
+        meta_blocks.append({"radius": r, **meta})
+
+    X = np.concatenate(blocks, axis=1)
+
+    if final_l1_normalize:
+        row_sums = X.sum(axis=1, keepdims=True)
+        nz = row_sums[:, 0] > 0
+        X[nz] /= row_sums[nz]
+
+    X = X.astype(dtype, copy=False)
+
+    if not return_metadata:
+        return X
+    return X, {"scales": meta_blocks}
+
+
 def _pairwise_euclidean_backend(X, nx):
     """
     Pairwise Euclidean distance matrix of ``X`` (n, d) computed on the active POT
@@ -1059,6 +1136,9 @@ def calculate_neighborhood_dissimilarity(
     nx=None,
     data_type=np.float32,
     eps=1e-8,
+    radii=None,
+    radius_k=3,
+    radius_multipliers=(2.5, 4.0, 5.0),
     n_shells=3,
     harmonics=(0, 1, 2),
     distance_decay="linear",
@@ -1067,42 +1147,47 @@ def calculate_neighborhood_dissimilarity(
     label_key="cell_type_annot",
 ):
     """
-    Neighborhood dissimilarity from a single-radius, equal-area-shell, rotation- and
-    reflection-invariant descriptor, scored by Jensen-Shannon distance.
+    Neighborhood dissimilarity from multiscale, equal-area-shell, rotation- and
+    reflection-invariant descriptors, scored by Jensen-Shannon distance.
 
-    Each cell's neighborhood within ``radius`` is summarized as a distribution over
-    (cell type x equal-area radial shell x angular harmonic). A single radius with
-    several concentric equal-area shells captures the full radial profile while
-    counting each neighbor exactly once; the per-cell descriptors of the two slices
-    are then compared with the Jensen-Shannon distance.
+    Each cell's neighborhood is summarized, at several radii, as a distribution over
+    (cell type x equal-area radial shell x angular harmonic); the per-radius blocks
+    are L1-normalized within scale and concatenated. Multiple radii give independent
+    fine- and broad-scale views (each normalized in its own right), which is more
+    discriminative for the JS neighborhood cost than a single radius.
 
-    When ``radius`` is ``None`` it defaults to ``NEIGHBORHOOD_OUTER_MULTIPLIER`` times
-    the shared characteristic cell spacing (the mesoscale used elsewhere in the
-    pipeline). Returns the (n, m) JS-distance matrix, or the raw descriptors
-    ``(featA, featB)`` when ``nx is None``.
+    Radii are chosen as (priority): the explicit ``radii`` list; else a single
+    ``radius`` if given; else ``radius_multipliers`` times the shared characteristic
+    cell spacing (the pipeline default). Returns the (n, m) JS-distance matrix, or
+    the raw descriptors ``(featA, featB)`` when ``nx is None``.
     """
     all_types = np.array(sorted(
         set(sliceA.obs[label_key].astype(str)) |
         set(sliceB.obs[label_key].astype(str))
     ), dtype=str)
 
-    if radius is None:
-        sA = estimate_characteristic_spacing(sliceA, spatial_key=spatial_key)
-        sB = estimate_characteristic_spacing(sliceB, spatial_key=spatial_key)
-        radius = NEIGHBORHOOD_OUTER_MULTIPLIER * max(sA, sB)
+    if radii is None:
+        if radius is not None:
+            radii = [float(radius)]
+        else:
+            radii = default_radii_from_spacing(
+                sliceA, sliceB, k=radius_k,
+                multipliers=radius_multipliers, spatial_key=spatial_key,
+            )
 
     def _descriptor(adata):
-        return neighborhood_distribution_fourier(
+        return neighborhood_distribution_multiscale(
             adata,
-            radius=radius,
+            radii=radii,
             cell_types=all_types,
             n_shells=n_shells,
             harmonics=harmonics,
             distance_decay=distance_decay,
             include_self=include_self,
             area_normalize=True,
-            add_empty_bin=False,
-            l1_normalize=True,
+            add_empty_bin_per_scale=False,
+            l1_normalize_within_scale=True,
+            final_l1_normalize=True,
             dtype=np.float32,
             spatial_key=spatial_key,
             label_key=label_key,
@@ -1111,7 +1196,7 @@ def calculate_neighborhood_dissimilarity(
     featA = _descriptor(sliceA)
     featB = _descriptor(sliceB)
 
-    # Empty-neighborhood cells (no neighbors within `radius`) have an all-zero
+    # Empty-neighborhood cells (no neighbors within any radius) have an all-zero
     # descriptor. Assign them a uniform distribution (an uninformative prior) so the
     # Jensen-Shannon distance is defined; every other row is left exact.
     def _fill_empty_uniform(feat):
