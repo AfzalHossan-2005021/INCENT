@@ -1,9 +1,9 @@
 import ot
 import torch
+import warnings
 
 import numpy as np
 import scipy.sparse as sp
-from tqdm import tqdm
 
 from ot.optim import line_search_armijo, cg
 from ot.gromov import solve_gromov_linesearch
@@ -230,37 +230,150 @@ def _auto_js_block(n, m, F, X, nx, mem_fraction):
     return int(max(1, min(int(n), budget_elems // per_row)))
 
 
-def jensenshannon_divergence_backend(X, Y, block=None, mem_fraction=0.25, eps=1e-12):
+def _safe_log(r, nx):
     """
-    Pairwise Jensen-Shannon distance matrix (n x m) of row-distributions X, Y.
+    Backend ``log`` realizing the exact convention ``log(0) -> 0``.
 
-    Computed in row-blocks that are each fully vectorized on the active POT backend
-    (GPU when available) -- this removes the per-row Python loop while bounding the
-    peak ``(block, m, F)`` intermediate so CUDA does not run out of memory. The
-    block size is derived from free device memory (see :func:`_auto_js_block`); on a
-    CUDA OOM the block is halved and retried, so the computation always completes.
-
-    Exactness note: JSD needs the entropy of the midpoint ``M = (p + q) / 2``, whose
-    ``sum_f M log M`` term does not factorize across pairs, so an exact pairwise JSD
-    must form an ``(n, m, F)`` quantity -- hence chunking rather than a single
-    vectorized expression. The per-row ``sum_f p log p`` terms DO factorize and are
-    precomputed once.
+    The zero entries it covers are always multiplied by a zero weight downstream,
+    so this gives the exact ``0 * log 0 = 0`` limit with **no epsilon bias** (and
+    no NaN/inf from ``0 * -inf``). For ``r > 0`` it is just ``log(r)``.
     """
-    assert X.shape[1] == Y.shape[1], "X and Y do not have the same number of features."
+    posf = (r > 0) * 1.0
+    return nx.log(r + (1.0 - posf))     # r>0 -> log(r); r==0 -> log(1) = 0
+
+
+def _xlogx(r, nx):
+    """Elementwise ``r * log(r)`` with the exact convention ``0 * log 0 = 0``."""
+    return r * _safe_log(r, nx)
+
+
+def _normalize_rows(A, nx):
+    """
+    L1-normalize the rows of a nonnegative matrix to probability distributions.
+
+    A zero-mass row is mapped to an all-zero row (its denominator is forced to 1)
+    instead of producing ``0/0``; the returned row sums let the caller flag those
+    degenerate rows afterwards.
+
+    Returns ``(A_normalized, row_sums)``.
+    """
+    s = nx.sum(A, axis=1)                                 # (n,)
+    denom = (s + (1.0 - (s > 0) * 1.0))[:, None]          # = s where s > 0, else 1
+    return A / denom, s
+
+
+def _js_distance_block(Xb, Y, xlox_b, yloy, nx):
+    """
+    Jensen-Shannon distance of one block of source rows against all targets.
+
+    Parameters
+    ----------
+    Xb : (b, F) backend array
+        Block of already-normalized source distributions.
+    Y : (m, F) backend array
+        All already-normalized target distributions.
+    xlox_b : (b,) backend array
+        Precomputed ``sum_f p log p`` for the block's rows (exact ``0 log 0 = 0``).
+    yloy : (m,) backend array
+        Precomputed ``sum_f q log q`` for the targets.
+    nx : ot.backend.Backend
+        Active POT backend.
+
+    Returns
+    -------
+    (b, m) backend array
+        ``sqrt(JSD(p, q))`` for each (block source ``p``, target ``q``) pair, via the
+        KL form ``JSD = 1/2[(sum p log p - sum p log M) + (sum q log q - sum q log M)]``
+        with midpoint ``M = (p + q) / 2``.
+    """
+    M = (Xb[:, None, :] + Y[None, :, :]) * 0.5            # (b, m, F)
+    logM = _safe_log(M, nx)                               # log(0) -> 0 (weighted by 0)
+    # einsum contracts over features without materializing the (b, m, F) products.
+    sum_p_logM = nx.einsum("bf,bmf->bm", Xb, logM)
+    sum_q_logM = nx.einsum("mf,bmf->bm", Y, logM)
+    kl_p = xlox_b[:, None] - sum_p_logM
+    kl_q = yloy[None, :] - sum_q_logM
+    return nx.sqrt(nx.maximum(0.5 * (kl_p + kl_q), 0.0))
+
+
+def jensenshannon_divergence_backend(X, Y, block=None, mem_fraction=0.25):
+    """
+    Pairwise Jensen-Shannon distance matrix between two sets of row-distributions.
+
+    Returns ``D`` with ``D[i, j] = sqrt(JSD(X[i], Y[j]))``, the metric
+    Jensen-Shannon *distance* (natural log / nats), for every pair of rows. Rows are
+    L1-normalized to probability distributions first, and the computation runs on the
+    active POT backend (NumPy, or PyTorch on GPU when available).
+
+    Parameters
+    ----------
+    X : array-like, shape (n, F)
+        Source distributions, one per row; nonnegative. NumPy array or backend tensor.
+    Y : array-like, shape (m, F)
+        Target distributions, one per row; nonnegative, same feature dimension as ``X``.
+    block : int, optional
+        Number of source rows processed per vectorized chunk. If ``None`` (default),
+        it is auto-sized from free device memory (see Notes).
+    mem_fraction : float, default 0.25
+        Fraction of free CUDA memory the auto block size may target. Lower it if you
+        observe OOM-retries; ignored on CPU.
+
+    Returns
+    -------
+    backend array, shape (n, m)
+        Jensen-Shannon distances. Any row/column whose input did not sum to positive
+        mass is returned as ``NaN`` (its distribution is undefined).
+
+    Raises
+    ------
+    ValueError
+        If ``X`` and ``Y`` have different feature dimensions.
+
+    Warns
+    -----
+    RuntimeWarning
+        If any input row has zero total mass (its outputs are set to ``NaN``).
+
+    Notes
+    -----
+    Formula. Uses the KL form ``JSD = 1/2 KL(p||M) + 1/2 KL(q||M)`` with
+    ``M = (p + q) / 2`` rather than the algebraically-equal entropy identity
+    ``H(M) - H(p)/2 - H(q)/2``; the latter cancels catastrophically when ``p ~ q``
+    (the common near-zero-distance regime in alignment), while the KL form stays
+    accurate there.
+
+    Exactness. The convention ``0 * log 0 = 0`` is applied exactly (via
+    :func:`_safe_log`), with no epsilon smoothing, so the result is unbiased and
+    matches ``scipy.spatial.distance.jensenshannon`` to machine precision. Wherever
+    ``p_f > 0`` the midpoint ``M_f >= p_f / 2 > 0``, so every needed log is finite;
+    the only clamp covers features where both ``p`` and ``q`` vanish (weighted by 0).
+
+    Memory. The cross term ``sum_f p log M`` cannot be factorized over pairs, so an
+    exact pairwise JSD must form an ``(n, m, F)`` quantity. Source rows are therefore
+    processed in blocks (only the factorizable ``sum_f p log p`` terms are precomputed
+    once). The block size targets ``mem_fraction`` of free CUDA memory; on a CUDA
+    out-of-memory error the block is halved and retried, so the call always completes.
+
+    See Also
+    --------
+    scipy.spatial.distance.jensenshannon : single-pair reference implementation.
+    """
+    if X.shape[1] != Y.shape[1]:
+        raise ValueError(
+            f"X and Y must have the same number of features; got {X.shape[1]} and {Y.shape[1]}."
+        )
 
     nx = ot.backend.get_backend(X, Y)
+    n, F, m = int(X.shape[0]), int(X.shape[1]), int(Y.shape[0])
 
-    X = X / (nx.sum(X, axis=1, keepdims=True) + eps)
-    Y = Y / (nx.sum(Y, axis=1, keepdims=True) + eps)
+    X, sx = _normalize_rows(X, nx)
+    Y, sy = _normalize_rows(Y, nx)
 
-    n, F = int(X.shape[0]), int(X.shape[1])
-    m = int(Y.shape[0])
+    # Factorizable per-row terms sum_f p log p (exact 0 log 0 = 0), computed once.
+    xlox = nx.sum(_xlogx(X, nx), axis=1)                  # (n,)
+    yloy = nx.sum(_xlogx(Y, nx), axis=1)                  # (m,)
 
     out = nx.zeros((n, m), type_as=X)
-    # Factorizable per-row entropies, computed once.
-    xlox = nx.sum(X * nx.log(X + eps), axis=1)          # (n,)
-    yloy = nx.sum(Y * nx.log(Y + eps), axis=1)          # (m,)
-
     if block is None:
         block = _auto_js_block(n, m, F, X, nx, mem_fraction)
 
@@ -268,27 +381,28 @@ def jensenshannon_divergence_backend(X, Y, block=None, mem_fraction=0.25, eps=1e
     while start < n:
         stop = min(start + block, n)
         try:
-            Xb = X[start:stop]                                  # (b, F)
-            M = (Xb[:, None, :] + Y[None, :, :]) * 0.5          # (b, m, F)
-            logM = nx.log(M + eps)                              # (b, m, F)
-            # KL(p||M) = sum_f p log p - sum_f p log M ; same for q. einsum avoids
-            # materializing the (b, m, F) elementwise products.
-            sum_x_logM = nx.einsum("bf,bmf->bm", Xb, logM)
-            sum_y_logM = nx.einsum("mf,bmf->bm", Y, logM)
-            kl_x = xlox[start:stop][:, None] - sum_x_logM
-            kl_y = yloy[None, :] - sum_y_logM
-            out[start:stop] = nx.sqrt(nx.maximum(0.5 * (kl_x + kl_y), 0.0))
-            del M, logM, sum_x_logM, sum_y_logM, kl_x, kl_y
+            out[start:stop] = _js_distance_block(X[start:stop], Y, xlox[start:stop], yloy, nx)
             start = stop
         except (RuntimeError, MemoryError) as err:
             if _is_oom_error(err) and (stop - start) > 1:
-                # drop references to the large (block, m, F) tensors so the
-                # smaller retry can actually reclaim their memory.
-                M = logM = None
+                # the block's (b, m, F) tensors are freed when this handler exits
+                # (their frame is released on `continue`); empty_cache returns that
+                # memory to the allocator before the smaller retry.
                 _empty_cuda_cache(nx)
                 block = max(1, (stop - start) // 2)
                 continue
             raise
+
+    # Zero-mass rows/cols are undefined distributions -> NaN (scipy-consistent).
+    n_degenerate = float(nx.sum(1.0 - (sx > 0) * 1.0)) + float(nx.sum(1.0 - (sy > 0) * 1.0))
+    if n_degenerate > 0:
+        warnings.warn(
+            "jensenshannon_divergence_backend: some input rows have zero total mass "
+            "(undefined distribution); their JS distances are set to NaN.",
+            RuntimeWarning, stacklevel=2,
+        )
+        out[(sx <= 0), :] = float("nan")
+        out[:, (sy <= 0)] = float("nan")
 
     return out
 

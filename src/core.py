@@ -1232,11 +1232,18 @@ def calculate_neighborhood_dissimilarity(
         label_key=label_key,
     )
 
-    # Add epsilon, THEN renormalize.
-    featA = featA + eps
-    featB = featB + eps
-    featA = featA / featA.sum(axis=1, keepdims=True)
-    featB = featB / featB.sum(axis=1, keepdims=True)
+    # Empty-neighborhood cells (no neighbors within the radii) have an all-zero
+    # descriptor. Assign them a uniform distribution (an uninformative prior) so the
+    # Jensen-Shannon distance is defined; every other row is left EXACT.
+    def _fill_empty_uniform(feat):
+        empty = feat.sum(axis=1) <= eps
+        if np.any(empty):
+            feat = feat.copy()
+            feat[empty] = 1.0 / feat.shape[1]
+        return feat
+
+    featA = _fill_empty_uniform(featA)
+    featB = _fill_empty_uniform(featB)
 
     if nx is None:
         return featA, featB
