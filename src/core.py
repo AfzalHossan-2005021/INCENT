@@ -131,6 +131,7 @@ def select_coarsen_length(
         set(sliceA.obs[label_key].astype(str)) | set(sliceB.obs[label_key].astype(str))
     ), dtype=str)
 
+    _, nx = select_backend(use_gpu, gpu_verbose=False)
     scored = []  # (S, mi, resid)
     for S in candidates:
         labelsA = cluster_cells_spatial(sliceA, spatial_key=spatial_key, coarsen_length=S)
@@ -147,7 +148,7 @@ def select_coarsen_length(
             label_key=label_key, all_types=all_types,
         )
         M_cluster = compute_cluster_feature_costs(
-            cache_A.mu_expr, cache_A.mu_struct, cache_B.mu_expr, cache_B.mu_struct, delta=delta,
+            cache_A.mu_expr, cache_A.mu_struct, cache_B.mu_expr, cache_B.mu_struct, delta=delta, nx=nx,
         )
         C_A = compute_cluster_structural_matrix(cache_A.centroids)
         C_B = compute_cluster_structural_matrix(cache_B.centroids)
@@ -293,7 +294,8 @@ def hierarchical_pairwise_align(
     )
     
     print("--- [HOT] Step 3: Compute Cluster Costs and Structures ---")
-    M_cluster = compute_cluster_feature_costs(mu_exprA, mu_structA, mu_exprB, mu_structB, delta=delta)
+    _, nx_coarse = select_backend(use_gpu, gpu_verbose=False)
+    M_cluster = compute_cluster_feature_costs(mu_exprA, mu_structA, mu_exprB, mu_structB, delta=delta, nx=nx_coarse)
     C_A = compute_cluster_structural_matrix(centroidsA)
     C_B = compute_cluster_structural_matrix(centroidsB)
     
@@ -455,51 +457,47 @@ def hierarchical_pairwise_align(
         sliceA_shadow = sliceA[idx_A_shadow].copy()
         sliceB_shadow = sliceB[idx_B_shadow].copy()
         
-        # ── Per-cluster spatial bandwidths ───────────────────────────────────────
-        # Mean L2 displacement of cells from their cluster centroid is the natural
-        # scale for the Gaussian soft-membership kernel — data-adaptive, no free
-        # parameters. Guards against singleton clusters (distance = 0).
         coords_A_orig = np.asarray(sliceA.obsm[spatial_key])
         coords_B_orig = np.asarray(sliceB.obsm[spatial_key])
 
-        sigma_A_clust = np.array([
-            max(float(np.mean(np.linalg.norm(
-                coords_A_orig[labelsA == cA] - centroidsA[cA], axis=1
-            ))) if np.any(labelsA == cA) else 1e-8, 1e-8)
-            for cA in range(Pi_cluster.shape[0])
-        ])
-        sigma_B_clust = np.array([
-            max(float(np.mean(np.linalg.norm(
-                coords_B_orig[labelsB == cB] - centroidsB[cB], axis=1
-            ))) if np.any(labelsB == cB) else 1e-8, 1e-8)
-            for cB in range(Pi_cluster.shape[1])
-        ])
+        # Vectorized per-cluster spatial bandwidth (replaces per-cluster Python loop)
+        cell_dists_A = np.linalg.norm(coords_A_orig - centroidsA[labelsA], axis=1)
+        clust_sum_A = np.bincount(labelsA.astype(int), weights=cell_dists_A, minlength=Pi_cluster.shape[0])
+        clust_cnt_A = np.bincount(labelsA.astype(int), minlength=Pi_cluster.shape[0]).astype(np.float64)
+        sigma_A_clust = np.maximum(clust_sum_A / np.maximum(clust_cnt_A, 1.0), 1e-8)
 
-        # ── Soft Gaussian cluster memberships for shadow cells ────────────────────
-        # s_A[i, cA] = p(cell i belongs to cluster cA) under an isotropic Gaussian
-        # model fitted per cluster; rows are normalized to sum to 1.
+        cell_dists_B = np.linalg.norm(coords_B_orig - centroidsB[labelsB], axis=1)
+        clust_sum_B = np.bincount(labelsB.astype(int), weights=cell_dists_B, minlength=Pi_cluster.shape[1])
+        clust_cnt_B = np.bincount(labelsB.astype(int), minlength=Pi_cluster.shape[1]).astype(np.float64)
+        sigma_B_clust = np.maximum(clust_sum_B / np.maximum(clust_cnt_B, 1.0), 1e-8)
+
         coords_As = coords_A_orig[idx_A_shadow]   # (nA_shadow, 2)
         coords_Bs = coords_B_orig[idx_B_shadow]   # (nB_shadow, 2)
 
-        dA2 = np.sum((coords_As[:, None, :] - centroidsA[None, :, :]) ** 2, axis=2)   # (nA_s, C_A)
-        dB2 = np.sum((coords_Bs[:, None, :] - centroidsB[None, :, :]) ** 2, axis=2)   # (nB_s, C_B)
+        # GPU-accelerated Gaussian soft memberships and G_init_shadow
+        coords_As_t = to_backend(coords_As, nx_coarse, data_type=np.float32)
+        coords_Bs_t = to_backend(coords_Bs, nx_coarse, data_type=np.float32)
+        centroids_A_t = to_backend(centroidsA, nx_coarse, data_type=np.float32)
+        centroids_B_t = to_backend(centroidsB, nx_coarse, data_type=np.float32)
+        sigma_A_t = to_backend(sigma_A_clust, nx_coarse, data_type=np.float32)
+        sigma_B_t = to_backend(sigma_B_clust, nx_coarse, data_type=np.float32)
+        Pi_cluster_t = to_backend(Pi_cluster, nx_coarse, data_type=np.float32)
 
-        log_SA = -0.5 * dA2 / (sigma_A_clust[None, :] ** 2)
-        log_SA -= log_SA.max(axis=1, keepdims=True)   # numerical stability
-        S_A = np.exp(log_SA)
-        S_A /= S_A.sum(axis=1, keepdims=True) + 1e-12
+        diff_A = coords_As_t[:, None, :] - centroids_A_t[None, :, :]
+        dA2 = nx_coarse.sum(diff_A ** 2, axis=2)
+        log_SA = -0.5 * dA2 / (sigma_A_t[None, :] ** 2)
+        log_SA = log_SA - nx_coarse.max(log_SA, axis=1)[:, None]
+        S_A = nx_coarse.exp(log_SA)
+        S_A = S_A / (nx_coarse.sum(S_A, axis=1)[:, None] + 1e-12)
 
-        log_SB = -0.5 * dB2 / (sigma_B_clust[None, :] ** 2)
-        log_SB -= log_SB.max(axis=1, keepdims=True)
-        S_B = np.exp(log_SB)
-        S_B /= S_B.sum(axis=1, keepdims=True) + 1e-12
+        diff_B = coords_Bs_t[:, None, :] - centroids_B_t[None, :, :]
+        dB2 = nx_coarse.sum(diff_B ** 2, axis=2)
+        log_SB = -0.5 * dB2 / (sigma_B_t[None, :] ** 2)
+        log_SB = log_SB - nx_coarse.max(log_SB, axis=1)[:, None]
+        S_B = nx_coarse.exp(log_SB)
+        S_B = S_B / (nx_coarse.sum(S_B, axis=1)[:, None] + 1e-12)
 
-        # Maximum-entropy cell-level lifting of the coarse unbalanced plan:
-        #   G_init[i,j] = Σ_{cA,cB}  s_A[i,cA] · Pi_cluster[cA,cB] · s_B[j,cB]
-        # Border cells inherit coupling from adjacent matched clusters proportionally;
-        # interior cells behave like hard block assignment. fused_gromov_wasserstein_incent
-        # normalizes G_init by its total sum internally, so no explicit rescaling needed.
-        G_init_shadow = S_A @ Pi_cluster @ S_B.T   # (nA_shadow, nB_shadow)
+        G_init_shadow = nx_coarse.to_numpy(S_A @ Pi_cluster_t @ S_B.T)
 
         # ── Confidence-weighted marginals ─────────────────────────────────────────
         # Encode proximity to the trusted biological core as the FGW marginals rather

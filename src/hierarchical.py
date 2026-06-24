@@ -8,11 +8,10 @@ from scipy.optimize import linear_sum_assignment
 from scipy.spatial import cKDTree
 from scipy.sparse.csgraph import dijkstra
 from scipy.spatial import Delaunay
-from sklearn.metrics.pairwise import cosine_distances
 from scipy.special import rel_entr
 from scipy.stats import rankdata
 from ot.gromov import fused_unbalanced_gromov_wasserstein
-from .utils import select_backend, to_backend
+from .utils import select_backend, to_backend, jensenshannon_divergence_backend
 
 
 class AmbiguousAlignmentWarning(UserWarning):
@@ -190,37 +189,52 @@ def build_slice_cluster_cache(
     )
 
 
-def compute_cluster_feature_costs(mu_expr_A, mu_struct_A, mu_expr_B, mu_struct_B, delta=0.5):
+def compute_cluster_feature_costs(mu_expr_A, mu_struct_A, mu_expr_B, mu_struct_B, delta=0.5, nx=None):
     """
     Compute inter-cluster cost matrix M_cluster between two slices.
-    
+
     Args:
         mu_expr_A: np.ndarray (C_A, D) mean expression for slice A
         mu_struct_A: np.ndarray (C_A, M) structural features for slice A
         mu_expr_B: np.ndarray (C_B, D) mean expression for slice B
         mu_struct_B: np.ndarray (C_B, M) structural features for slice B
         delta: weight for structural distance (expression distance is 1 - delta)
+        nx: Optional POT backend. Uses GPU when a TorchBackend is supplied;
+            defaults to NumpyBackend (CPU) when None.
     Returns:
         M_cluster: np.ndarray (C_A, C_B) cost matrix
     """
-
-    if(delta > 1.0 or delta < 0.0):
+    if delta > 1.0 or delta < 0.0:
         raise ValueError("Delta must be between 0 and 1.")
-    
-    # Cosine distance for continuous expression
-    M_expr = cosine_distances(mu_expr_A, mu_expr_B)
-            
-    # Jensen-Shannon for nonnegative invariant structural descriptors
-    M_struct = np.zeros((mu_struct_A.shape[0], mu_struct_B.shape[0]))
-    
-    for i in range(mu_struct_A.shape[0]):
-        for j in range(mu_struct_B.shape[0]):
-            # The descriptors are normalized nonnegative summaries over cell-type-specific structure.
-            M_struct[i, j] = safe_jensenshannon(mu_struct_A[i], mu_struct_B[j])
-    
-    M_cluster = (1.0 - delta) * M_expr + delta * M_struct
 
-    return M_cluster
+    if nx is None:
+        _, nx = select_backend(False, gpu_verbose=False)
+
+    # Cosine distance on backend (GPU when nx is TorchBackend)
+    A = to_backend(np.asarray(mu_expr_A, dtype=np.float64) + 1e-12, nx, data_type=np.float64)
+    B = to_backend(np.asarray(mu_expr_B, dtype=np.float64) + 1e-12, nx, data_type=np.float64)
+    A_norm = A / (nx.sqrt(nx.sum(A ** 2, axis=1, keepdims=True)) + 1e-12)
+    B_norm = B / (nx.sqrt(nx.sum(B ** 2, axis=1, keepdims=True)) + 1e-12)
+    M_expr = nx.to_numpy(1.0 - (A_norm @ B_norm.T))
+
+    # Jensen-Shannon on backend via the batched GPU-aware utility.
+    # Pre-fill all-zero rows (empty clusters) with uniform so JSD stays finite.
+    mu_s_A = np.asarray(mu_struct_A, dtype=np.float64)
+    mu_s_B = np.asarray(mu_struct_B, dtype=np.float64)
+    zero_A = mu_s_A.sum(axis=1) <= 0
+    if zero_A.any():
+        mu_s_A = mu_s_A.copy()
+        mu_s_A[zero_A] = 1.0 / max(mu_s_A.shape[1], 1)
+    zero_B = mu_s_B.sum(axis=1) <= 0
+    if zero_B.any():
+        mu_s_B = mu_s_B.copy()
+        mu_s_B[zero_B] = 1.0 / max(mu_s_B.shape[1], 1)
+    M_struct = nx.to_numpy(jensenshannon_divergence_backend(
+        to_backend(mu_s_A, nx, data_type=np.float64),
+        to_backend(mu_s_B, nx, data_type=np.float64),
+    ))
+
+    return (1.0 - delta) * M_expr + delta * M_struct
 
 
 def compute_cluster_structural_matrix(centroids):
@@ -250,7 +264,7 @@ def compute_cluster_structural_matrix(centroids):
     return C_graph
 
 
-def run_coarse_fugw(M_cluster, C_A, C_B, p_A, p_B, alpha=0.5, reg_m=1.0, use_gpu=False):
+def run_coarse_fugw(M_cluster, C_A, C_B, p_A, p_B, alpha=0.5, reg_m=1.0, max_iter=10000, max_iter_ot=5000, use_gpu=False):
     """
     Solves cluster-level FUGW.
     """
@@ -261,7 +275,7 @@ def run_coarse_fugw(M_cluster, C_A, C_B, p_A, p_B, alpha=0.5, reg_m=1.0, use_gpu
     M_norm = M_cluster / (np.max(M_cluster) + 1e-8)
 
     _, nx = select_backend(use_gpu, gpu_verbose=False)
-    logging.info("Running Unbalanced FGW on %s...", "GPU" if use_gpu else "CPU")
+    logging.info("Running FUGW on %s...", "GPU" if use_gpu else "CPU")
 
     Cx = to_backend(C_A_norm, nx, data_type=np.float64)
     Cy = to_backend(C_B_norm, nx, data_type=np.float64)
@@ -271,7 +285,7 @@ def run_coarse_fugw(M_cluster, C_A, C_B, p_A, p_B, alpha=0.5, reg_m=1.0, use_gpu
 
     # reg_marginals controls how much marginal relaxation is allowed (lower = more mass can be dropped)
     pi_samp, pi_feat = fused_unbalanced_gromov_wasserstein(
-        Cx=Cx, Cy=Cy, wx=wx, wy=wy, M=M, alpha=alpha, reg_marginals=reg_m, max_iter=5000
+        Cx=Cx, Cy=Cy, wx=wx, wy=wy, M=M, alpha=alpha, reg_marginals=reg_m, max_iter=max_iter, max_iter_ot=max_iter_ot
     )
 
     return nx.to_numpy(pi_samp)
