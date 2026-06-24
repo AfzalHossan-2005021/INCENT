@@ -254,17 +254,37 @@ def run_coarse_fugw(M_cluster, C_A, C_B, p_A, p_B, alpha=0.5, reg_m=1.0):
     Solves cluster-level partial/unbalanced FGW.
     """
     scale = max(C_A.max(), C_B.max()) + 1e-8
-        
+
     C_A_norm = C_A / scale
     C_B_norm = C_B / scale
     M_norm = M_cluster / (np.max(M_cluster) + 1e-8)
-    
-    logging.info("Running Unbalanced FGW...")
+
+    try:
+        import torch
+        use_gpu = torch.cuda.is_available()
+    except ImportError:
+        use_gpu = False
+
+    if use_gpu:
+        device = torch.device("cuda")
+        logging.info("Running Unbalanced FGW on GPU...")
+        Cx = torch.tensor(C_A_norm, dtype=torch.float64, device=device)
+        Cy = torch.tensor(C_B_norm, dtype=torch.float64, device=device)
+        M  = torch.tensor(M_norm,   dtype=torch.float64, device=device)
+        wx = torch.tensor(p_A,      dtype=torch.float64, device=device)
+        wy = torch.tensor(p_B,      dtype=torch.float64, device=device)
+    else:
+        logging.info("Running Unbalanced FGW on CPU...")
+        Cx, Cy, M, wx, wy = C_A_norm, C_B_norm, M_norm, p_A, p_B
+
     # reg_marginals controls how much marginal relaxation is allowed (lower = more mass can be dropped)
     pi_samp, pi_feat = fused_unbalanced_gromov_wasserstein(
-        Cx=C_A_norm, Cy=C_B_norm, wx=p_A, wy=p_B, M=M_norm, alpha=alpha, reg_marginals=reg_m, max_iter=5000
+        Cx=Cx, Cy=Cy, wx=wx, wy=wy, M=M, alpha=alpha, reg_marginals=reg_m, max_iter=5000
     )
-    
+
+    if use_gpu:
+        pi_samp = pi_samp.cpu().numpy()
+
     return pi_samp
 
 
