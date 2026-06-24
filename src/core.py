@@ -111,6 +111,7 @@ def select_coarsen_length(
     alpha=0.5,
     delta=0.75,
     multipliers=(0.6, 0.8, 1.0, 1.3, 1.6),
+    use_gpu=False,
 ):
     """
     Pick the supercell seed spacing that maximizes cross-slice cluster matchability.
@@ -150,7 +151,7 @@ def select_coarsen_length(
         )
         C_A = compute_cluster_structural_matrix(cache_A.centroids)
         C_B = compute_cluster_structural_matrix(cache_B.centroids)
-        Pi = run_coarse_fugw(M_cluster, C_A, C_B, cache_A.masses, cache_B.masses, alpha=alpha)
+        Pi = run_coarse_fugw(M_cluster, C_A, C_B, cache_A.masses, cache_B.masses, alpha=alpha, use_gpu=use_gpu)
 
         mi, resid = _coarse_matchability(Pi, cache_A.centroids, cache_B.centroids)
         scored.append((S, mi, resid))
@@ -242,7 +243,7 @@ def hierarchical_pairwise_align(
         S = select_coarsen_length(
             sliceA, sliceB,
             spatial_key=spatial_key, use_rep=use_rep, label_key=label_key,
-            alpha=alpha_cluster, delta=delta,
+            alpha=alpha_cluster, delta=delta, use_gpu=use_gpu,
         )
         print(f"Coarsening scale (auto, matchability sweep): S={S:.4g}")
     else:
@@ -297,7 +298,7 @@ def hierarchical_pairwise_align(
     C_B = compute_cluster_structural_matrix(centroidsB)
     
     print("--- [HOT] Step 4: Run Coarse FUGW ---")
-    Pi_cluster = run_coarse_fugw(M_cluster, C_A, C_B, p_A, p_B, alpha=alpha_cluster, reg_m=reg_m)
+    Pi_cluster = run_coarse_fugw(M_cluster, C_A, C_B, p_A, p_B, alpha=alpha_cluster, reg_m=reg_m, use_gpu=use_gpu)
     
     if visualize_clusters:
         visualize_cluster_mapping(centroidsA, centroidsB, Pi_cluster)

@@ -12,6 +12,7 @@ from sklearn.metrics.pairwise import cosine_distances
 from scipy.special import rel_entr
 from scipy.stats import rankdata
 from ot.gromov import fused_unbalanced_gromov_wasserstein
+from .utils import select_backend, to_backend
 
 
 class AmbiguousAlignmentWarning(UserWarning):
@@ -249,9 +250,9 @@ def compute_cluster_structural_matrix(centroids):
     return C_graph
 
 
-def run_coarse_fugw(M_cluster, C_A, C_B, p_A, p_B, alpha=0.5, reg_m=1.0):
+def run_coarse_fugw(M_cluster, C_A, C_B, p_A, p_B, alpha=0.5, reg_m=1.0, use_gpu=False):
     """
-    Solves cluster-level partial/unbalanced FGW.
+    Solves cluster-level FUGW.
     """
     scale = max(C_A.max(), C_B.max()) + 1e-8
 
@@ -259,33 +260,21 @@ def run_coarse_fugw(M_cluster, C_A, C_B, p_A, p_B, alpha=0.5, reg_m=1.0):
     C_B_norm = C_B / scale
     M_norm = M_cluster / (np.max(M_cluster) + 1e-8)
 
-    try:
-        import torch
-        use_gpu = torch.cuda.is_available()
-    except ImportError:
-        use_gpu = False
+    _, nx = select_backend(use_gpu, gpu_verbose=False)
+    logging.info("Running Unbalanced FGW on %s...", "GPU" if use_gpu else "CPU")
 
-    if use_gpu:
-        device = torch.device("cuda")
-        logging.info("Running Unbalanced FGW on GPU...")
-        Cx = torch.tensor(C_A_norm, dtype=torch.float64, device=device)
-        Cy = torch.tensor(C_B_norm, dtype=torch.float64, device=device)
-        M  = torch.tensor(M_norm,   dtype=torch.float64, device=device)
-        wx = torch.tensor(p_A,      dtype=torch.float64, device=device)
-        wy = torch.tensor(p_B,      dtype=torch.float64, device=device)
-    else:
-        logging.info("Running Unbalanced FGW on CPU...")
-        Cx, Cy, M, wx, wy = C_A_norm, C_B_norm, M_norm, p_A, p_B
+    Cx = to_backend(C_A_norm, nx, data_type=np.float64)
+    Cy = to_backend(C_B_norm, nx, data_type=np.float64)
+    M  = to_backend(M_norm,   nx, data_type=np.float64)
+    wx = to_backend(p_A,      nx, data_type=np.float64)
+    wy = to_backend(p_B,      nx, data_type=np.float64)
 
     # reg_marginals controls how much marginal relaxation is allowed (lower = more mass can be dropped)
     pi_samp, pi_feat = fused_unbalanced_gromov_wasserstein(
         Cx=Cx, Cy=Cy, wx=wx, wy=wy, M=M, alpha=alpha, reg_marginals=reg_m, max_iter=5000
     )
 
-    if use_gpu:
-        pi_samp = pi_samp.cpu().numpy()
-
-    return pi_samp
+    return nx.to_numpy(pi_samp)
 
 
 def compute_pairwise_log_enrichment(pi):
