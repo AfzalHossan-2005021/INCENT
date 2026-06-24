@@ -535,20 +535,14 @@ def collect_candidate_match_pairs(Pi_cluster, valid_A, valid_B):
         np.lexsort((-positive_enrichment, -positive_mi))
     ]
 
-    matches = []
-    mi_signal = []
-    enrichment_signal = []
-    for idx in sorted_idx:
-        u, v = np.unravel_index(idx, Pi_cluster.shape)
-        if not (valid_A[u] and valid_B[v]):
-            continue
+    us, vs = np.unravel_index(sorted_idx, Pi_cluster.shape)
+    valid_mask = valid_A[us] & valid_B[vs]
+    us = us[valid_mask]
+    vs = vs[valid_mask]
 
-        matches.append((u, v))
-        mi_signal.append(float(mi_contrib[u, v]))
-        enrichment_signal.append(float(log_enrichment[u, v]))
-
-    mi_signal = np.asarray(mi_signal, dtype=np.float64)
-    enrichment_signal = np.asarray(enrichment_signal, dtype=np.float64)
+    matches = list(zip(us.tolist(), vs.tolist()))
+    mi_signal = np.asarray(mi_contrib[us, vs], dtype=np.float64)
+    enrichment_signal = np.asarray(log_enrichment[us, vs], dtype=np.float64)
 
     mi_evidence = empirical_logit_evidence(mi_signal, larger_is_better=True)
 
@@ -692,16 +686,63 @@ def build_match_graph(matches, adj_A, adj_B):
     alone.
     """
     num_matches = len(matches)
+    if num_matches == 0:
+        return np.zeros((0, 0), dtype=bool)
+
+    matches_arr = np.asarray(matches, dtype=int)
+    u_arr = matches_arr[:, 0]
+    v_arr = matches_arr[:, 1]
+    n_A = int(adj_A.shape[0])
+    n_B = int(adj_B.shape[0])
+
+    # O(1) pair lookup: pair_to_idx[u, v] → match index, -1 if absent
+    pair_to_idx = np.full((n_A, n_B), -1, dtype=np.intp)
+    pair_to_idx[u_arr, v_arr] = np.arange(num_matches, dtype=np.intp)
+
+    # Pre-group: for each A-cluster, which B-sides appear in the match list?
+    # Sorting once is O(N log N) vs O(N × C_A) for repeated boolean masks.
+    sort_order = np.argsort(u_arr, kind='stable')
+    u_sorted = u_arr[sort_order]
+    v_sorted = v_arr[sort_order]
+    boundaries = np.searchsorted(u_sorted, np.arange(n_A + 1))
+    u_to_vs = {
+        int(u): v_sorted[boundaries[u]:boundaries[u + 1]]
+        for u in range(n_A)
+        if boundaries[u] < boundaries[u + 1]
+    }
+
+    adj_A_arr = np.asarray(adj_A, dtype=bool)
+    adj_B_arr = np.asarray(adj_B, dtype=bool)
+    # Only upper-triangle A-edges (contact graph is sparse: ~6 edges/cluster)
+    rows_A, cols_A = np.where(np.triu(adj_A_arr, k=1))
+
     match_adj = np.zeros((num_matches, num_matches), dtype=bool)
 
-    for i in range(num_matches):
-        u1, v1 = matches[i]
-        for j in range(i + 1, num_matches):
-            u2, v2 = matches[j]
-            if adj_A[u1, u2] and adj_B[v1, v2]:
-                match_adj[i, j] = True
-                match_adj[j, i] = True
+    # For each A-contact edge (u1, u2), check which (v1, v2) pairs are also
+    # B-adjacent. This is O(E_A × |v1s| × |v2s|) with small numpy blocks
+    # rather than O(N²) in pure Python.
+    for u1, u2 in zip(rows_A.tolist(), cols_A.tolist()):
+        v1s = u_to_vs.get(u1)
+        v2s = u_to_vs.get(u2)
+        if v1s is None or v2s is None:
+            continue
 
+        i_pos, j_pos = np.where(adj_B_arr[np.ix_(v1s, v2s)])
+        if i_pos.size == 0:
+            continue
+
+        i_idx = pair_to_idx[u1, v1s[i_pos]]
+        j_idx = pair_to_idx[u2, v2s[j_pos]]
+        valid = (i_idx >= 0) & (j_idx >= 0)
+        i_idx = i_idx[valid]
+        j_idx = j_idx[valid]
+        if i_idx.size == 0:
+            continue
+
+        match_adj[i_idx, j_idx] = True
+        match_adj[j_idx, i_idx] = True
+
+    np.fill_diagonal(match_adj, False)
     return match_adj
 
 
