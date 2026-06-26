@@ -5,8 +5,8 @@ import warnings
 import numpy as np
 import scipy.sparse as sp
 
-from ot.optim import line_search_armijo, cg
-from ot.gromov import solve_gromov_linesearch
+from ot.optim import cg
+from ot.gromov import init_matrix, gwloss, gwggrad, solve_gromov_linesearch
 
 
 def select_backend(use_gpu=False, gpu_verbose=True):
@@ -87,7 +87,7 @@ def _default_fgw_tol(x, fallback=1e-9):
     return fallback       # float64 / double
 
 
-def fused_gromov_wasserstein_incent(M, C1, C2, p, q, G_init = None, alpha = 0.1, armijo=False, log=False, numItermax=10000, numItermaxEmd=100000, tol_rel=None, tol_abs=None, verbose=False, **kwargs):
+def fused_gromov_wasserstein_incent(M, C1, C2, p, q, G_init = None, alpha = 0.1, log=False, numItermax=10000, numItermaxEmd=100000, tol_rel=None, tol_abs=None, verbose=False, **kwargs):
     """
     Fused Gromov-Wasserstein optimal transport with an optional warm-start coupling.
 
@@ -124,9 +124,6 @@ def fused_gromov_wasserstein_incent(M, C1, C2, p, q, G_init = None, alpha = 0.1,
     alpha : float, default 0.1
         Trade-off in ``[0, 1]``: weight ``alpha`` on the GW structural term and
         ``1 - alpha`` on the linear feature term.
-    armijo : bool, default False
-        If ``True`` use an Armijo line search; otherwise the closed-form GW line
-        search (:func:`ot.gromov.solve_gromov_linesearch`).
     log : bool, default False
         If ``True`` also return POT's solver log dict (which includes ``fgw_dist``).
     numItermax : int, default 10000
@@ -171,42 +168,25 @@ def fused_gromov_wasserstein_incent(M, C1, C2, p, q, G_init = None, alpha = 0.1,
         G0 = (1/nx.sum(G_init)) * G_init
     G0 = to_backend(G0, nx)
 
-    # constC[i,j] = sum_k C1[i,k]^2 * p[k]  +  sum_l C2[j,l]^2 * q[l]
-    constC = (
-        nx.outer(nx.dot(C1 ** 2, p), nx.ones(len(q), type_as=q)) +
-        nx.outer(nx.ones(len(p), type_as=p), nx.dot(C2 ** 2, q))
-    )
+    # ── Normalize structural matrices to [0, 1] ──────────────────────────
+    scale = max(nx.max(C1), nx.max(C2)) + 1e-9
+    C1 = C1 / scale
+    C2 = C2 / scale
+
+    constC, hC1, hC2 = init_matrix(C1, C2, p, q, loss_fun="square_loss", nx=nx)
 
     def f(G):
-        # Correct GW loss (square loss, fixed marginals):
-        # L_GW(G) = <constC, G>  -  2 * <C1 G C2, G>
-        return nx.sum(constC * G) - 2.0 * nx.sum(nx.dot(C1, nx.dot(G, C2)) * G)
+        return gwloss(constC, hC1, hC2, G, nx=nx)
 
     def df(G):
-        # Gradient of L_GW w.r.t. G:
-        # dL_GW/dG = constC  -  4 * C1 G C2
-        return constC - 4.0 * nx.dot(C1, nx.dot(G, C2))
+        return gwggrad(constC, hC1, hC2, G, nx=nx)
 
-    if armijo:
-        def line_search(cost, G, deltaG, Mi, cost_G, df_G, **kwargs):
-            alpha_step, fc, cost_new = line_search_armijo(cost, G, deltaG, Mi, cost_G, nx=nx, **kwargs)
-            # Enforce probability simplex limit to avoid negative masses entirely
-            if alpha_step is None: alpha_step = 1.0
-            if alpha_step > 1.0: alpha_step = 1.0
-            if alpha_step < 0.0: alpha_step = 0.0
-            cost_new = cost(G + alpha_step * deltaG)
-            return alpha_step, fc, cost_new
-    else:
-        def line_search(cost, G, deltaG, Mi, cost_G, df_G, **kwargs):
-            # enforce hard bounds natively from solve_1d_linesearch_quad
-            return solve_gromov_linesearch(G, deltaG, cost_G, C1, C2, M=(1-alpha)*M, reg=alpha, alpha_min=0.0, alpha_max=1.0, nx=nx, **kwargs)
+    def line_search(cost, G, deltaG, Mi, cost_G, df_G, **kwargs):        
+        return solve_gromov_linesearch(G, deltaG, cost_G, hC1, hC2, M=(1 - alpha) * M, reg=alpha, nx=nx, **kwargs)
 
     if log:
-   
         res, log = cg(p, q, (1-alpha)*M, alpha, f, df, G0=G0, line_search=line_search, numItermax=numItermax, numItermaxEmd=numItermaxEmd, stopThr=tol_rel, stopThr2=tol_abs, verbose=verbose, log=log, nx=nx, **kwargs)
-
         log['fgw_dist'] = log['loss'][-1]
-
         return res, log
 
     else:
