@@ -171,13 +171,21 @@ def fused_gromov_wasserstein_incent(M, C1, C2, p, q, G_init = None, alpha = 0.1,
         G0 = (1/nx.sum(G_init)) * G_init
     G0 = to_backend(G0, nx)
 
+    # constC[i,j] = sum_k C1[i,k]^2 * p[k]  +  sum_l C2[j,l]^2 * q[l]
+    constC = (
+        nx.outer(nx.dot(C1 ** 2, p), nx.ones(len(q), type_as=q)) +
+        nx.outer(nx.ones(len(p), type_as=p), nx.dot(C2 ** 2, q))
+    )
+
     def f(G):
-        # Base Gromov-Wasserstein term
-        return nx.sum((G @ G.T)  * C1) + nx.sum((G.T @ G)  * C2)
+        # Correct GW loss (square loss, fixed marginals):
+        # L_GW(G) = <constC, G>  -  2 * <C1 G C2, G>
+        return nx.sum(constC * G) - 2.0 * nx.sum(nx.dot(C1, nx.dot(G, C2)) * G)
 
     def df(G):
-        # Gradient of GW term
-        return 2 * (nx.dot(C1, G) + nx.dot(G, C2))
+        # Gradient of L_GW w.r.t. G:
+        # dL_GW/dG = constC  -  4 * C1 G C2
+        return constC - 4.0 * nx.dot(C1, nx.dot(G, C2))
 
     if armijo:
         def line_search(cost, G, deltaG, Mi, cost_G, df_G, **kwargs):
