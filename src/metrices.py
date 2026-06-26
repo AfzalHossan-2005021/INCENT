@@ -82,7 +82,9 @@ def label_transfer_accuracy(
         Cell-type annotation for target slice (sliceB.obs['cell_type_annot']).
     mass_threshold : float in [0, 1)
         Skip source cells whose row mass is below (mass_threshold * mean_row_mass).
-        Default 0.0 evaluates all cells.
+        Zero-mass rows are *always* excluded regardless of this value (a cell with
+        no transported mass has no meaningful argmax prediction).  Default 0.0
+        evaluates all cells that received any mass.
 
     Returns
     -------
@@ -95,12 +97,11 @@ def label_transfer_accuracy(
     labels_A = np.asarray(labels_A)
     labels_B = np.asarray(labels_B)
 
+    row_masses = pi.sum(axis=1)
+    active = row_masses > 0.0                              # always drop zero-mass rows
     if mass_threshold > 0.0:
-        row_masses = pi.sum(axis=1)
         mean_mass = row_masses.mean()
-        active = row_masses >= mass_threshold * mean_mass
-    else:
-        active = np.ones(pi.shape[0], dtype=bool)
+        active &= row_masses >= mass_threshold * mean_mass
 
     n_active = int(active.sum())
     if n_active == 0:
@@ -405,12 +406,10 @@ def _print_metrics(results: Dict, W: int = 82) -> None:
     print(f"\n  {'PRIMARY METRICS  (objective-independent)':}")
     print(f"  {sep}")
     print(_row("Label Transfer Accuracy (LTA)", results.get('lta'), "↑"))
-    print(_row("FOSCTTM (symmetric mean)", results.get('foscttm'), "↓"))
     if results.get('foscttm') is not None:
+        print(_row("FOSCTTM (symmetric mean)", results.get('foscttm'), "↓"))
         print(_row("  FOSCTTM  A→B", results.get('foscttm_A_to_B'), "↓"))
         print(_row("  FOSCTTM  B→A", results.get('foscttm_B_to_A'), "↓"))
-    else:
-        print(f"  {'  FOSCTTM  (requires adjacent_slice ground truth)':<44}")
     print(_row("Geometric Preservation Rate (GPR)", results.get('gpr'), "↑"))
     if results.get('gpr_per_k') is not None:
         for k, v in sorted(results['gpr_per_k'].items()):
@@ -444,7 +443,8 @@ def _print_metrics(results: Dict, W: int = 82) -> None:
         scale = 100.0 if 'cell_type' in k_init else 1.0
         # For lower-is-better metrics: positive % = improvement (value decreased).
         # For higher-is-better metrics: positive % = improvement (value increased).
-        imp = _relative_improvement(v0, v1) if lower_is_better else _relative_improvement(v1, v0)
+        # Both branches normalise against the initial value v0 for consistency.
+        imp = _relative_improvement(v0, v1) if lower_is_better else -_relative_improvement(v0, v1)
         print(f"  {label:<44} {v0*scale:.4f} → {v1*scale:.4f}  ({imp:+.1f}%)  {direction}")
 
     print("=" * W)
