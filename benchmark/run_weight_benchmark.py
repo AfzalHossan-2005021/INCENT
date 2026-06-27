@@ -33,7 +33,6 @@ from src.core import hierarchical_pairwise_align
 from src.tuning import (
     select_alignment_weights,
     make_self_alignment_instances,
-    simplex_grid,
     gpu_available,
     DEFAULT_INIT,
     _quiet,
@@ -181,13 +180,35 @@ def metric_agreement(sweep_rows):
     return out
 
 
+def _offset_simplex_grid(step, offset):
+    """Simplex grid whose individual values run from offset to <1, stepped by step.
+
+    Neither beta nor gamma will equal exactly 0 or 1 as long as offset > 0 and
+    offset + step < 1. With step=0.2 and offset=0.1 the values are
+    {0.1, 0.3, 0.5, 0.7, 0.9}, giving 15 interior points on the simplex.
+    """
+    n = round(1.0 / step)
+    pts = []
+    for i in range(n + 1):
+        beta = offset + i * step
+        if beta >= 1.0 - 1e-9:
+            break
+        for j in range(n + 1):
+            gamma = offset + j * step
+            if gamma >= 1.0 - 1e-9:
+                break
+            if beta + gamma <= 1.0 + 1e-9:
+                pts.append((round(beta, 9), round(gamma, 9)))
+    return pts
+
+
 def _sensitivity_weight_list(best, alpha_grid, simplex_step, delta_value):
     """Weight dicts that vary alpha (others at best) and the feature simplex (others
     at best) — a focused, interpretable sweep for sensitivity + agreement."""
     wl = []
     for a in alpha_grid:
         wl.append({**best, "alpha": float(a)})
-    for (beta, gamma) in simplex_grid(simplex_step):
+    for (beta, gamma) in _offset_simplex_grid(simplex_step, offset=0.1):
         wl.append({**best, "beta": float(beta), "gamma": float(gamma),
                    "delta": float(delta_value)})
     # de-duplicate
@@ -198,6 +219,80 @@ def _sensitivity_weight_list(best, alpha_grid, simplex_step, delta_value):
             seen.add(key)
             uniq.append(w)
     return uniq
+
+
+def _is_stable_pi(pi, min_total_mass=0.05):
+    """Return True if the transport plan is numerically usable.
+
+    Two failure modes at small reg_m:
+    - Solver divergence: pi contains NaN or Inf.
+    - Mass collapse: FUGW dropped nearly all mass so pi.sum() << expected (~1.0).
+      We flag anything below min_total_mass (default 5% of a balanced plan).
+    """
+    if not np.isfinite(pi).all():
+        return False
+    if float(pi.sum()) < min_total_mass:
+        return False
+    return True
+
+
+def reg_m_sensitivity_sweep(
+    instances,
+    reg_m_grid,
+    best_weights,
+    *,
+    aligner=_default_aligner,
+    base_align_kwargs,
+    label_key="cell_type_annot",
+    spatial_key="spatial",
+    min_total_mass=0.05,
+):
+    """Sweep reg_m at fixed best_weights; return one row per value with averaged metrics.
+
+    Each row contains all metric keys from :func:`grid_sweep_full` plus ``reg_m``,
+    ``n_unstable`` (instances whose plan failed the stability check), and
+    ``numerically_stable`` (True only when every instance passed).
+
+    Small reg_m values allow FUGW to drop mass freely; this can produce NaN/Inf
+    or near-zero total mass. Such plans are excluded from metric averaging and
+    counted in ``n_unstable`` rather than silently biasing the scores.
+    """
+    rows = []
+    for reg_m in reg_m_grid:
+        kwargs = {**base_align_kwargs, "reg_m": float(reg_m)}
+        n_unstable = 0
+        mets = []
+        for sim, ref in instances:
+            pi = _align(aligner, sim, ref, best_weights, kwargs, quiet=True)
+            if pi is None:
+                n_unstable += 1
+                continue
+            if not _is_stable_pi(pi, min_total_mass=min_total_mass):
+                n_unstable += 1
+                continue
+            mets.append(evaluate_alignment(
+                pi, sim, ref, sim_axis=0,
+                label_key=label_key, spatial_key=spatial_key,
+            ))
+
+        row: dict = {"n_ok": len(mets), "n_unstable": n_unstable}
+        if mets:
+            keys = set().union(*[m.keys() for m in mets])
+            for k in keys:
+                vals = []
+                for m in mets:
+                    v = m.get(k, np.nan)
+                    if isinstance(v, (int, float, np.floating, np.integer)):
+                        vals.append(float(v))
+                    elif v is None:
+                        vals.append(np.nan)
+                if vals:
+                    row[k] = float(np.nanmean(vals))
+
+        row["reg_m"] = float(reg_m)
+        row["numerically_stable"] = (n_unstable == 0)
+        rows.append(row)
+    return rows
 
 
 def run_weight_benchmark(
@@ -216,7 +311,8 @@ def run_weight_benchmark(
     selection_kwargs: Optional[dict] = None,
     align_kwargs: Optional[dict] = None,
     sensitivity_alpha_grid=(0.1, 0.3, 0.5, 0.7, 0.9),
-    sensitivity_simplex_step: float = 0.25,
+    sensitivity_simplex_step: float = 0.2,
+    reg_m_grid=(0.1, 0.5, 1.0, 5.0, 10.0),
     outdir: Optional[str] = None,
     seed: int = 0,
 ) -> dict:
@@ -267,6 +363,15 @@ def run_weight_benchmark(
                             label_key=label_key, spatial_key=spatial_key)
     agree = metric_agreement(sweep)
 
+    # E. reg_m sensitivity: sweep marginal-relaxation at fixed best weights
+    reg_m_sens = reg_m_sensitivity_sweep(
+        test_inst, reg_m_grid, best,
+        aligner=aligner,
+        base_align_kwargs=align_kwargs,
+        label_key=label_key,
+        spatial_key=spatial_key,
+    )
+
     results = {
         "selection": {"best": best, "best_score": sel["best_score"],
                       "objective_key": sel["objective_key"], "landscape": sel["landscape"]},
@@ -274,10 +379,12 @@ def run_weight_benchmark(
         "robustness": curves,
         "sensitivity": sweep,
         "metric_agreement": agree,
+        "reg_m_sensitivity": reg_m_sens,
         "config": {"dev_perturb": dev_perturb, "test_perturb": test_perturb,
                    "baseline_perturb": baseline_perturb, "severity_axes": severity_axes,
                    "n_dev_instances": n_dev_instances, "n_test_instances": n_test_instances,
-                   "n_robust_instances": n_robust_instances, "seed": seed},
+                   "n_robust_instances": n_robust_instances, "seed": seed,
+                   "reg_m_grid": list(reg_m_grid)},
     }
 
     if outdir:
@@ -350,6 +457,31 @@ def make_benchmark_figures(results, outdir):
         fig.savefig(os.path.join(outdir, "sensitivity_agreement.png"), dpi=150)
         plt.close(fig)
 
+    reg_m_rows = results.get("reg_m_sensitivity", [])
+    if reg_m_rows:
+        stable = [r for r in reg_m_rows if r.get("numerically_stable", True) and r.get("n_ok", 0) > 0]
+        unstable = [r for r in reg_m_rows if not r.get("numerically_stable", True)]
+        fig, ax = plt.subplots(1, 1, figsize=(5, 3.4))
+        if stable:
+            xs = [r["reg_m"] for r in stable]
+            ax.semilogx(xs, [r["gpr"] for r in stable], "o-", label="GPR")
+            lta_vals = [r.get("lta", float("nan")) for r in stable]
+            if any(v == v for v in lta_vals):  # any non-NaN
+                ax.semilogx(xs, lta_vals, "s--", label="LTA", alpha=0.7)
+        for r in unstable:
+            ax.axvline(r["reg_m"], color="red", linestyle=":", linewidth=0.8, alpha=0.6)
+        if unstable:
+            ax.axvline(unstable[0]["reg_m"], color="red", linestyle=":", linewidth=0.8,
+                       alpha=0.6, label="unstable")
+        ax.set_xlabel("reg_m (log scale)")
+        ax.set_ylabel("score")
+        ax.set_ylim(0, 1.02)
+        ax.set_title("reg_m sensitivity", fontsize=9)
+        ax.legend(fontsize=7)
+        fig.tight_layout()
+        fig.savefig(os.path.join(outdir, "reg_m_sensitivity.png"), dpi=150)
+        plt.close(fig)
+
 
 # ----------------------------------------------------------------------------
 # default configuration + CLI
@@ -384,6 +516,12 @@ if __name__ == "__main__":
     ap.add_argument("--use_gpu", choices=["auto", "true", "false"], default="auto",
                     help="Use CUDA for the alignment OT. 'auto' (default) uses the GPU if available.")
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument(
+        "--reg_m_grid", type=float, nargs="+", default=[0.1, 0.5, 1.0, 5.0, 10.0],
+        metavar="V",
+        help="Space-separated reg_m values for the marginal-relaxation sensitivity sweep "
+             "(default: 0.1 0.5 1.0 5.0 10.0).",
+    )
     args = ap.parse_args()
 
     if args.use_gpu == "auto":
@@ -401,6 +539,7 @@ if __name__ == "__main__":
         severity_axes=DEFAULT_SEVERITY_AXES,
         baseline_perturb=DEFAULT_BASELINE_PERTURB,
         align_kwargs={"use_gpu": use_gpu},
+        reg_m_grid=tuple(args.reg_m_grid),
         outdir=args.outdir,
         seed=args.seed,
     )
