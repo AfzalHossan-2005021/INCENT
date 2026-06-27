@@ -24,7 +24,9 @@ GPU: every alignment uses CUDA automatically when available (``use_gpu=gpu_avail
 from __future__ import annotations
 
 import contextlib
+import concurrent.futures
 import os
+from queue import Queue
 from typing import Callable, Optional
 
 import numpy as np
@@ -146,6 +148,29 @@ def _align_score(sliceA, sliceB, weights, align_kwargs, quiet):
 # staged grid search (coordinate ascent over all 5 weights)
 # ----------------------------------------------------------------------------
 
+def _make_device_pool_score(score_fn: Callable, device_ids: list) -> Callable:
+    """Wrap score_fn so each thread grabs a GPU from the pool via torch.cuda.device()."""
+    try:
+        import torch
+    except ImportError:
+        return score_fn
+    if not torch.cuda.is_available():
+        return score_fn
+    pool: Queue = Queue()
+    for did in device_ids:
+        pool.put(did)
+
+    def _wrapped(w):
+        did = pool.get()
+        try:
+            with torch.cuda.device(did):
+                return score_fn(w)
+        finally:
+            pool.put(did)
+
+    return _wrapped
+
+
 def _staged_search(
     score_fn: Callable[[dict], float],
     *,
@@ -155,35 +180,55 @@ def _staged_search(
     simplex_step: float,
     delta_grid,
     refine: bool,
+    n_jobs: int = 1,
+    device_ids=None,
 ):
     best = dict(init)
     landscape = []
 
+    # When multiple GPU devices are available, wrap score_fn so each thread
+    # grabs a device from the pool before running; torch.cuda.device() is
+    # thread-local so two threads can simultaneously use different GPUs.
+    if device_ids and len(device_ids) > 1 and n_jobs > 1:
+        _score = _make_device_pool_score(score_fn, device_ids)
+    else:
+        _score = score_fn
+
+    def _eval_batch(combos: list, stage: str) -> list:
+        """Evaluate a list of weight dicts, sequential or parallel."""
+        if n_jobs == 1 or len(combos) <= 1:
+            pairs = [(_score(w), w) for w in combos]
+        else:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=n_jobs) as pool:
+                scores = list(pool.map(_score, combos))
+            pairs = list(zip(scores, combos))
+        for s, w in pairs:
+            landscape.append({"stage": stage, "score": s, **w})
+        return pairs
+
     def grid_alpha(cur):
-        loc = None
-        for a in alpha_grid:
-            for ac in alpha_cluster_grid:
-                w = {**cur, "alpha": float(a), "alpha_cluster": float(ac)}
-                s = score_fn(w)
-                landscape.append({"stage": "alpha", "score": s, **w})
-                if loc is None or s > loc[0]:
-                    loc = (s, w)
-        return loc
+        combos = [
+            {**cur, "alpha": float(a), "alpha_cluster": float(ac)}
+            for a in alpha_grid
+            for ac in alpha_cluster_grid
+        ]
+        pairs = _eval_batch(combos, "alpha")
+        loc = max(pairs, key=lambda p: p[0])
+        return loc  # (best_score, best_weights)
 
     # Stage A: (alpha, alpha_cluster) at the initial feature weights
-    sA, wA = grid_alpha(best)
+    _, wA = grid_alpha(best)
     best = wA
 
     # Stage B: feature simplex (beta, gamma) x delta at alpha*, alpha_cluster*
-    locB = None
-    for (beta, gamma) in simplex_grid(simplex_step):
-        for d in delta_grid:
-            w = {**best, "beta": float(beta), "gamma": float(gamma), "delta": float(d)}
-            s = score_fn(w)
-            landscape.append({"stage": "feature", "score": s, **w})
-            if locB is None or s > locB[0]:
-                locB = (s, w)
-    best, best_score = locB[1], locB[0]
+    combos_B = [
+        {**best, "beta": float(beta), "gamma": float(gamma), "delta": float(d)}
+        for (beta, gamma) in simplex_grid(simplex_step)
+        for d in delta_grid
+    ]
+    pairs_B = _eval_batch(combos_B, "feature")
+    best_score_B, best_B = max(pairs_B, key=lambda p: p[0])
+    best, best_score = best_B, best_score_B
 
     # Stage C (optional): refine (alpha, alpha_cluster) at the chosen feature weights
     if refine:
@@ -260,6 +305,8 @@ def select_alignment_weights(
     refine: bool = True,
     quiet: bool = True,
     seed: int = 0,
+    n_jobs: int = 1,
+    device_ids=None,
 ) -> dict:
     """
     Select all five weights by maximizing a ground-truth metric over synthetic
@@ -334,6 +381,8 @@ def select_alignment_weights(
             simplex_step=simplex_step,
             delta_grid=delta_grid,
             refine=refine,
+            n_jobs=n_jobs,
+            device_ids=device_ids,
         )
     else:
         best, best_score, landscape = _cell_optuna_search(

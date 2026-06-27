@@ -23,8 +23,10 @@ or call :func:`run_weight_benchmark` directly with an in-memory AnnData.
 
 from __future__ import annotations
 
+import concurrent.futures
 import json
 import os
+from queue import Queue
 from typing import Callable, Optional
 
 import numpy as np
@@ -59,6 +61,54 @@ def _align(aligner, sliceA, sliceB, weights, align_kwargs, quiet):
         return None
 
 
+def _make_device_aware_aligner(aligner: Callable, device_ids: list) -> Callable:
+    """Wrap aligner so each thread picks a GPU from the pool via torch.cuda.device().
+
+    Mirrors _make_device_pool_score in tuning.py but wraps an (sliceA, sliceB, **kw)
+    aligner signature instead of a score_fn. Used for steps B-E where the aligner is
+    called directly (not through _staged_search's score_fn wrapper).
+    Returns the original aligner unchanged when CUDA is not available.
+    """
+    try:
+        import torch
+    except ImportError:
+        return aligner
+    if not torch.cuda.is_available():
+        return aligner
+    pool: Queue = Queue()
+    for did in device_ids:
+        pool.put(did)
+
+    def _wrapped(sliceA, sliceB, **kwargs):
+        did = pool.get()
+        try:
+            with torch.cuda.device(did):
+                return aligner(sliceA, sliceB, **kwargs)
+        finally:
+            pool.put(did)
+
+    return _wrapped
+
+
+def _aggregate_mets(w, mets):
+    """Build a result row from a weight dict and a list of per-instance metric dicts."""
+    row = {**w, "n_ok": len(mets)}
+    if mets:
+        keys = set().union(*[m.keys() for m in mets])
+        for k in keys:
+            vals = []
+            for m in mets:
+                v = m.get(k, np.nan)
+                # skip non-scalar values (lta_detail is a dict, gpr_per_k is a dict)
+                if isinstance(v, (int, float, np.floating, np.integer)):
+                    vals.append(float(v))
+                elif v is None:
+                    vals.append(np.nan)
+            if vals:
+                row[k] = float(np.nanmean(vals))
+    return row
+
+
 def grid_sweep_full(
     instances,
     weight_list,
@@ -68,15 +118,17 @@ def grid_sweep_full(
     label_key="cell_type_annot",
     spatial_key="spatial",
     quiet=True,
+    n_jobs=1,
 ):
     """Evaluate a list of weight dicts on the instances; return one row per weight
     with the full metric battery averaged over instances (NaN-safe).
 
     Non-scalar metric values (lta_detail, gpr_per_k) are silently skipped so the
     row dict contains only float-valued entries suitable for JSON serialisation.
+    With ``n_jobs > 1`` each weight dict is evaluated in a separate thread
+    (instances for a given weight remain sequential to bound memory).
     """
-    rows = []
-    for w in weight_list:
+    def _eval_weight(w):
         mets = []
         for sim, ref in instances:
             pi = _align(aligner, sim, ref, w, align_kwargs, quiet)
@@ -84,22 +136,15 @@ def grid_sweep_full(
                 continue
             mets.append(evaluate_alignment(pi, sim, ref, sim_axis=0,
                                            label_key=label_key, spatial_key=spatial_key))
-        row = {**w, "n_ok": len(mets)}
-        if mets:
-            keys = set().union(*[m.keys() for m in mets])
-            for k in keys:
-                vals = []
-                for m in mets:
-                    v = m.get(k, np.nan)
-                    # skip non-scalar values (lta_detail is a dict, gpr_per_k is a dict)
-                    if isinstance(v, (int, float, np.floating, np.integer)):
-                        vals.append(float(v))
-                    elif v is None:
-                        vals.append(np.nan)
-                if vals:
-                    row[k] = float(np.nanmean(vals))
-        rows.append(row)
-    return rows
+        return w, mets
+
+    if n_jobs == 1:
+        results = [_eval_weight(w) for w in weight_list]
+    else:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=n_jobs) as pool:
+            results = list(pool.map(_eval_weight, weight_list))
+
+    return [_aggregate_mets(w, mets) for w, mets in results]
 
 
 def robustness_curves(
@@ -116,35 +161,56 @@ def robustness_curves(
     label_key="cell_type_annot",
     spatial_key="spatial",
     seed=0,
+    n_jobs=1,
 ):
     """For each severity axis, sweep its values (others at baseline), regenerate
     instances from the supplied crop(s), align at ``best_weights``, and record mean
-    GPR and LTA across instances."""
-    curves = {}
-    for ai, (axis, values) in enumerate(severity_axes.items()):
-        pts = []
-        for v in values:
-            pk = dict(baseline_perturb)
-            pk[axis] = v
-            inst = make_self_alignment_instances(
-                section=section, reference=reference, crops=crops,
-                n_instances=n_instances, perturb_kwargs=pk, seed=seed + 100 * ai)
-            gpr_scores, lta_scores = [], []
-            for sim, ref in inst:
-                pi = _align(aligner, sim, ref, best_weights, align_kwargs, True)
-                if pi is None:
-                    gpr_scores.append(0.0)
-                    continue
-                m = evaluate_alignment(pi, sim, ref, sim_axis=0,
-                                       label_key=label_key, spatial_key=spatial_key)
-                gpr_scores.append(float(m.get("gpr", 0.0)))
-                lta_scores.append(float(m.get("lta", np.nan) or np.nan))
-            pts.append({
-                "value": float(v),
-                "gpr": float(np.nanmean(gpr_scores)) if gpr_scores else 0.0,
-                "lta": float(np.nanmean(lta_scores)) if lta_scores else float("nan"),
-            })
-        curves[axis] = pts
+    GPR and LTA across instances.
+
+    With ``n_jobs > 1`` the (axis, value) evaluations run concurrently in threads.
+    """
+    axis_list = list(severity_axes.items())
+
+    def _eval_point(args):
+        ai, axis, v = args
+        pk = dict(baseline_perturb)
+        pk[axis] = v
+        inst = make_self_alignment_instances(
+            section=section, reference=reference, crops=crops,
+            n_instances=n_instances, perturb_kwargs=pk, seed=seed + 100 * ai)
+        gpr_scores, lta_scores = [], []
+        for sim, ref in inst:
+            pi = _align(aligner, sim, ref, best_weights, align_kwargs, True)
+            if pi is None:
+                gpr_scores.append(0.0)
+                continue
+            m = evaluate_alignment(pi, sim, ref, sim_axis=0,
+                                   label_key=label_key, spatial_key=spatial_key)
+            gpr_scores.append(float(m.get("gpr", 0.0)))
+            lta_scores.append(float(m.get("lta", np.nan) or np.nan))
+        return axis, float(v), {
+            "value": float(v),
+            "gpr": float(np.nanmean(gpr_scores)) if gpr_scores else 0.0,
+            "lta": float(np.nanmean(lta_scores)) if lta_scores else float("nan"),
+        }
+
+    tasks = [
+        (ai, axis, v)
+        for ai, (axis, values) in enumerate(axis_list)
+        for v in values
+    ]
+
+    if n_jobs == 1:
+        raw = [_eval_point(t) for t in tasks]
+    else:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=n_jobs) as pool:
+            raw = list(pool.map(_eval_point, tasks))
+
+    curves: dict = {axis: [] for axis, _ in axis_list}
+    for axis, _, pt in raw:
+        curves[axis].append(pt)
+    for axis in curves:
+        curves[axis].sort(key=lambda p: p["value"])
     return curves
 
 
@@ -246,6 +312,7 @@ def reg_m_sensitivity_sweep(
     label_key="cell_type_annot",
     spatial_key="spatial",
     min_total_mass=0.05,
+    n_jobs=1,
 ):
     """Sweep reg_m at fixed best_weights; return one row per value with averaged metrics.
 
@@ -256,9 +323,9 @@ def reg_m_sensitivity_sweep(
     Small reg_m values allow FUGW to drop mass freely; this can produce NaN/Inf
     or near-zero total mass. Such plans are excluded from metric averaging and
     counted in ``n_unstable`` rather than silently biasing the scores.
+    With ``n_jobs > 1`` each reg_m value is evaluated in a separate thread.
     """
-    rows = []
-    for reg_m in reg_m_grid:
+    def _eval_reg_m(reg_m):
         kwargs = {**base_align_kwargs, "reg_m": float(reg_m)}
         n_unstable = 0
         mets = []
@@ -274,7 +341,6 @@ def reg_m_sensitivity_sweep(
                 pi, sim, ref, sim_axis=0,
                 label_key=label_key, spatial_key=spatial_key,
             ))
-
         row: dict = {"n_ok": len(mets), "n_unstable": n_unstable}
         if mets:
             keys = set().union(*[m.keys() for m in mets])
@@ -288,11 +354,14 @@ def reg_m_sensitivity_sweep(
                         vals.append(np.nan)
                 if vals:
                     row[k] = float(np.nanmean(vals))
-
         row["reg_m"] = float(reg_m)
         row["numerically_stable"] = (n_unstable == 0)
-        rows.append(row)
-    return rows
+        return row
+
+    if n_jobs == 1:
+        return [_eval_reg_m(rm) for rm in reg_m_grid]
+    with concurrent.futures.ThreadPoolExecutor(max_workers=n_jobs) as pool:
+        return list(pool.map(_eval_reg_m, reg_m_grid))
 
 
 def run_weight_benchmark(
@@ -313,6 +382,8 @@ def run_weight_benchmark(
     sensitivity_alpha_grid=(0.1, 0.3, 0.5, 0.7, 0.9),
     sensitivity_simplex_step: float = 0.2,
     reg_m_grid=(0.1, 0.5, 1.0, 5.0, 10.0),
+    n_jobs: int = 1,
+    device_ids=None,
     outdir: Optional[str] = None,
     seed: int = 0,
 ) -> dict:
@@ -322,6 +393,13 @@ def run_weight_benchmark(
     metric battery), ``robustness`` (per-axis curves), ``sensitivity`` (full-battery
     weight sweep), and ``metric_agreement`` (GPR vs label-based proxy agreement).
     If ``outdir`` is given, writes ``results.json`` and figures.
+
+    ``n_jobs`` controls thread-level parallelism for every sweep step.
+    ``device_ids`` is a list of CUDA device indices (e.g. ``[0, 1]``); when
+    multiple devices are given, threads are distributed across GPUs via a Queue-based
+    pool using ``torch.cuda.device()`` context managers (thread-local in PyTorch).
+    With a single GPU ``n_jobs`` is forced to 1; with multiple GPUs ``n_jobs``
+    may equal ``len(device_ids)`` or more (alignment batches stay sequential per thread).
     """
     align_kwargs = dict(align_kwargs or {})
     align_kwargs.setdefault("use_gpu", gpu_available())
@@ -330,16 +408,31 @@ def run_weight_benchmark(
     align_kwargs.setdefault("visualize_clusters", False)
     label_key = align_kwargs.get("label_key", "cell_type_annot")
     spatial_key = align_kwargs.get("spatial_key", "spatial")
+
     if align_kwargs["use_gpu"]:
-        print("[benchmark] GPU (CUDA) enabled for alignment OT.")
+        if device_ids is None:
+            device_ids = [0]
+        n_gpu = len(device_ids)
+        print(f"[benchmark] GPU (CUDA) enabled: {n_gpu} device(s) {device_ids}.")
+        if n_gpu == 1 and n_jobs > 1:
+            print("[benchmark] n_jobs forced to 1: single GPU, concurrent CUDA calls unsafe.")
+            n_jobs = 1
+        elif n_gpu > 1 and n_jobs > 1:
+            print(f"[benchmark] multi-GPU parallel: {n_gpu} GPUs × n_jobs={n_jobs}.")
+            aligner = _make_device_aware_aligner(aligner, device_ids)
     else:
+        device_ids = None
         print("[benchmark] running on CPU (no CUDA device detected or use_gpu=False).")
+
+    if n_jobs > 1:
+        print(f"[benchmark] parallel execution: n_jobs={n_jobs}.")
 
     # A. select robust defaults on the development split
     sel = select_alignment_weights(
         section=section, reference=reference, crops=crops,
         n_instances=n_dev_instances, perturb_kwargs=dev_perturb,
-        align_kwargs=align_kwargs, seed=seed, **(selection_kwargs or {}))
+        align_kwargs=align_kwargs, seed=seed, n_jobs=n_jobs, device_ids=device_ids,
+        **(selection_kwargs or {}))
     best = sel["best"]
 
     # B. generalization on a held-out instance split (different seed + severities)
@@ -347,20 +440,20 @@ def run_weight_benchmark(
         section=section, reference=reference, crops=crops,
         n_instances=n_test_instances, perturb_kwargs=test_perturb, seed=seed + 7)
     gen_row = grid_sweep_full(test_inst, [best], aligner=aligner, align_kwargs=align_kwargs,
-                              label_key=label_key, spatial_key=spatial_key)[0]
+                              label_key=label_key, spatial_key=spatial_key, n_jobs=n_jobs)[0]
 
     # C. robustness to each nuisance severity axis
     curves = robustness_curves(
         section, reference, best, severity_axes, crops=crops,
         baseline_perturb=baseline_perturb, aligner=aligner,
         n_instances=n_robust_instances, align_kwargs=align_kwargs,
-        label_key=label_key, spatial_key=spatial_key, seed=seed + 13)
+        label_key=label_key, spatial_key=spatial_key, seed=seed + 13, n_jobs=n_jobs)
 
     # D. sensitivity + metric agreement on the held-out instances
     wl = _sensitivity_weight_list(best, sensitivity_alpha_grid, sensitivity_simplex_step,
                                   best["delta"])
     sweep = grid_sweep_full(test_inst, wl, aligner=aligner, align_kwargs=align_kwargs,
-                            label_key=label_key, spatial_key=spatial_key)
+                            label_key=label_key, spatial_key=spatial_key, n_jobs=n_jobs)
     agree = metric_agreement(sweep)
 
     # E. reg_m sensitivity: sweep marginal-relaxation at fixed best weights
@@ -370,6 +463,7 @@ def run_weight_benchmark(
         base_align_kwargs=align_kwargs,
         label_key=label_key,
         spatial_key=spatial_key,
+        n_jobs=n_jobs,
     )
 
     results = {
@@ -384,7 +478,8 @@ def run_weight_benchmark(
                    "baseline_perturb": baseline_perturb, "severity_axes": severity_axes,
                    "n_dev_instances": n_dev_instances, "n_test_instances": n_test_instances,
                    "n_robust_instances": n_robust_instances, "seed": seed,
-                   "reg_m_grid": list(reg_m_grid)},
+                   "reg_m_grid": list(reg_m_grid), "n_jobs": n_jobs,
+                   "device_ids": device_ids},
     }
 
     if outdir:
@@ -522,6 +617,18 @@ if __name__ == "__main__":
         help="Space-separated reg_m values for the marginal-relaxation sensitivity sweep "
              "(default: 0.1 0.5 1.0 5.0 10.0).",
     )
+    ap.add_argument(
+        "--n_jobs", type=int, default=1,
+        help="Parallel threads for sweep evaluations (default: 1). "
+             "Forced to 1 with a single GPU; with --device_ids 0 1 n_jobs=2 "
+             "routes each thread to a separate GPU.",
+    )
+    ap.add_argument(
+        "--device_ids", type=int, nargs="+", default=None,
+        metavar="ID",
+        help="CUDA device indices to use (e.g. --device_ids 0 1 for two T4s). "
+             "Defaults to [0] when use_gpu is True. Multi-GPU requires n_jobs>1.",
+    )
     args = ap.parse_args()
 
     if args.use_gpu == "auto":
@@ -540,6 +647,8 @@ if __name__ == "__main__":
         baseline_perturb=DEFAULT_BASELINE_PERTURB,
         align_kwargs={"use_gpu": use_gpu},
         reg_m_grid=tuple(args.reg_m_grid),
+        n_jobs=args.n_jobs,
+        device_ids=args.device_ids,
         outdir=args.outdir,
         seed=args.seed,
     )
