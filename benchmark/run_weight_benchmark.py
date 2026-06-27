@@ -5,8 +5,8 @@ Synthetic, ground-truth-anchored benchmark that (a) selects robust default
 alignment weights, (b) reports their generalization on a held-out instance
 split, (c) measures robustness to every nuisance severity axis, and (d)
 validates the label-free deployment selector by correlating the label-free
-metric (spatial coherence) with the exact registration metric across a weight
-grid.
+metric (GPR / spatial coherence) with the ground-truth metrics (LTA, FOSCTTM)
+across a weight grid.
 
 Everything is built on :func:`perturb.simulate_adjacent_slice` (exact ground
 truth) + the metric battery in :mod:`evaluation` + the staged selector in
@@ -71,7 +71,11 @@ def grid_sweep_full(
     quiet=True,
 ):
     """Evaluate a list of weight dicts on the instances; return one row per weight
-    with the full metric battery averaged over instances (NaN-safe)."""
+    with the full metric battery averaged over instances (NaN-safe).
+
+    Non-scalar metric values (lta_detail, gpr_per_k) are silently skipped so the
+    row dict contains only float-valued entries suitable for JSON serialisation.
+    """
     rows = []
     for w in weight_list:
         mets = []
@@ -85,7 +89,16 @@ def grid_sweep_full(
         if mets:
             keys = set().union(*[m.keys() for m in mets])
             for k in keys:
-                row[k] = float(np.nanmean([m.get(k, np.nan) for m in mets]))
+                vals = []
+                for m in mets:
+                    v = m.get(k, np.nan)
+                    # skip non-scalar values (lta_detail is a dict, gpr_per_k is a dict)
+                    if isinstance(v, (int, float, np.floating, np.integer)):
+                        vals.append(float(v))
+                    elif v is None:
+                        vals.append(np.nan)
+                if vals:
+                    row[k] = float(np.nanmean(vals))
         rows.append(row)
     return rows
 
@@ -107,7 +120,7 @@ def robustness_curves(
 ):
     """For each severity axis, sweep its values (others at baseline), regenerate
     instances from the supplied crop(s), align at ``best_weights``, and record mean
-    registration + coherence."""
+    GPR and LTA across instances."""
     curves = {}
     for ai, (axis, values) in enumerate(severity_axes.items()):
         pts = []
@@ -117,46 +130,60 @@ def robustness_curves(
             inst = make_self_alignment_instances(
                 section=section, reference=reference, crops=crops,
                 n_instances=n_instances, perturb_kwargs=pk, seed=seed + 100 * ai)
-            regs, cohs = [], []
+            gpr_scores, lta_scores = [], []
             for sim, ref in inst:
                 pi = _align(aligner, sim, ref, best_weights, align_kwargs, True)
                 if pi is None:
-                    regs.append(0.0)
+                    gpr_scores.append(0.0)
                     continue
                 m = evaluate_alignment(pi, sim, ref, sim_axis=0,
                                        label_key=label_key, spatial_key=spatial_key)
-                regs.append(float(m.get("reg_soft_corr_mass", 0.0)))
-                cohs.append(float(m.get("coherence", np.nan)))
-            pts.append({"value": float(v),
-                        "reg_soft_corr_mass": float(np.mean(regs)) if regs else 0.0,
-                        "coherence": float(np.nanmean(cohs)) if cohs else float("nan")})
+                gpr_scores.append(float(m.get("gpr", 0.0)))
+                lta_scores.append(float(m.get("lta", np.nan) or np.nan))
+            pts.append({
+                "value": float(v),
+                "gpr": float(np.nanmean(gpr_scores)) if gpr_scores else 0.0,
+                "lta": float(np.nanmean(lta_scores)) if lta_scores else float("nan"),
+            })
         curves[axis] = pts
     return curves
 
 
 def metric_agreement(sweep_rows):
-    """Rank-correlate the label-free metrics against the exact registration metric
-    across a weight grid. High positive Spearman => coherence is a valid label-free
-    proxy, justifying the deployment selector."""
+    """Rank-correlate LTA and expression correlation against GPR across a weight grid.
+
+    GPR is the label-free deployment selector; high positive Spearman with LTA and
+    expr_corr validates that the label-free optimum agrees with label-based ground truth.
+    FOSCTTM is also included (negated, since lower FOSCTTM = better alignment).
+    """
     from scipy.stats import spearmanr
 
-    rows = [r for r in sweep_rows if r.get("n_ok", 0) > 0 and "reg_soft_corr_mass" in r]
+    rows = [r for r in sweep_rows
+            if r.get("n_ok", 0) > 0 and r.get("gpr") is not None]
     if len(rows) < 3:
         return {"n_points": len(rows)}
-    reg = np.array([r["reg_soft_corr_mass"] for r in rows], dtype=float)
+    gpr = np.array([r["gpr"] for r in rows], dtype=float)
     out = {"n_points": len(rows)}
-    for name, key in (("coherence", "coherence"), ("ltari", "ltari"),
-                      ("expr_corr", "expr_corr")):
-        if all(key in r for r in rows):
-            vals = np.array([r[key] for r in rows], dtype=float)
-            rho = spearmanr(reg, vals, nan_policy="omit").correlation
-            out[f"spearman_reg_{name}"] = float(rho) if rho is not None else float("nan")
+    for name, key, negate in [
+        ("lta", "lta", False),
+        ("foscttm", "foscttm", True),   # lower FOSCTTM = better; negate for positive correlation
+        ("expr_corr", "expr_corr", False),
+    ]:
+        valid = [r for r in rows if r.get(key) is not None]
+        if len(valid) < 3:
+            continue
+        gpr_v = np.array([r["gpr"] for r in valid], dtype=float)
+        vals = np.array([r[key] for r in valid], dtype=float)
+        if negate:
+            vals = -vals
+        rho = spearmanr(gpr_v, vals, nan_policy="omit").correlation
+        out[f"spearman_gpr_{name}"] = float(rho) if rho is not None else float("nan")
     return out
 
 
 def _sensitivity_weight_list(best, alpha_grid, simplex_step, delta_value):
     """Weight dicts that vary alpha (others at best) and the feature simplex (others
-    at best) -- a focused, interpretable sweep for sensitivity + agreement."""
+    at best) — a focused, interpretable sweep for sensitivity + agreement."""
     wl = []
     for a in alpha_grid:
         wl.append({**best, "alpha": float(a)})
@@ -197,11 +224,11 @@ def run_weight_benchmark(
     Full benchmark. Returns a JSON-serializable results dict with sections:
     ``selection`` (robust defaults + landscape), ``generalization`` (held-out
     metric battery), ``robustness`` (per-axis curves), ``sensitivity`` (full-battery
-    weight sweep), and ``metric_agreement`` (registration vs label-free proxies).
+    weight sweep), and ``metric_agreement`` (GPR vs label-based proxy agreement).
     If ``outdir`` is given, writes ``results.json`` and figures.
     """
     align_kwargs = dict(align_kwargs or {})
-    align_kwargs.setdefault("use_gpu", gpu_available())  # use CUDA for the FGW OT if present
+    align_kwargs.setdefault("use_gpu", gpu_available())
     align_kwargs.setdefault("gpu_verbose", False)
     align_kwargs.setdefault("verbose", False)
     align_kwargs.setdefault("visualize_clusters", False)
@@ -260,58 +287,67 @@ def run_weight_benchmark(
                       if isinstance(o, (np.floating, np.integer)) else str(o))
         try:
             make_benchmark_figures(results, outdir)
-        except Exception as e:  # plotting is best-effort
+        except Exception as e:
             print(f"[benchmark] figure generation skipped: {e}")
 
     return results
 
 
 def make_benchmark_figures(results, outdir):
-    """Render the headline figures (robustness curves, weight sensitivity, and the
-    registration-vs-coherence agreement scatter) as PNGs in ``outdir``."""
+    """Render headline figures (robustness curves, weight sensitivity, and the
+    GPR vs LTA agreement scatter) as PNGs in ``outdir``."""
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
     os.makedirs(outdir, exist_ok=True)
 
-    # robustness curves
+    # robustness curves: GPR and LTA vs perturbation severity
     curves = results["robustness"]
     if curves:
         n = len(curves)
         fig, axes = plt.subplots(1, n, figsize=(4 * n, 3.2), squeeze=False)
         for ax, (axis, pts) in zip(axes[0], curves.items()):
             xs = [p["value"] for p in pts]
-            ax.plot(xs, [p["reg_soft_corr_mass"] for p in pts], "o-", label="registration")
-            ax.plot(xs, [p["coherence"] for p in pts], "s--", label="coherence", alpha=0.7)
-            ax.set_xlabel(axis); ax.set_ylabel("score"); ax.set_ylim(0, 1.02)
-            ax.set_title(f"robustness: {axis}", fontsize=9); ax.legend(fontsize=7)
-        fig.tight_layout(); fig.savefig(os.path.join(outdir, "robustness_curves.png"), dpi=150)
+            ax.plot(xs, [p["gpr"] for p in pts], "o-", label="GPR")
+            ax.plot(xs, [p.get("lta", float("nan")) for p in pts],
+                    "s--", label="LTA", alpha=0.7)
+            ax.set_xlabel(axis)
+            ax.set_ylabel("score")
+            ax.set_ylim(0, 1.02)
+            ax.set_title(f"robustness: {axis}", fontsize=9)
+            ax.legend(fontsize=7)
+        fig.tight_layout()
+        fig.savefig(os.path.join(outdir, "robustness_curves.png"), dpi=150)
         plt.close(fig)
 
     sweep = results["sensitivity"]
     ok = [r for r in sweep if r.get("n_ok", 0) > 0]
     if ok:
-        # alpha sensitivity (rows where only alpha varies relative to best)
         best = results["selection"]["best"]
         alpha_rows = sorted(
             [r for r in ok if abs(r["beta"] - best["beta"]) < 1e-9
-             and abs(r["gamma"] - best["gamma"]) < 1e-9 and abs(r["delta"] - best["delta"]) < 1e-9],
+             and abs(r["gamma"] - best["gamma"]) < 1e-9
+             and abs(r["delta"] - best["delta"]) < 1e-9],
             key=lambda r: r["alpha"])
         fig, ax = plt.subplots(1, 2, figsize=(9, 3.4))
         if alpha_rows:
             ax[0].plot([r["alpha"] for r in alpha_rows],
-                       [r["reg_soft_corr_mass"] for r in alpha_rows], "o-")
-            ax[0].set_xlabel("alpha"); ax[0].set_ylabel("registration"); ax[0].set_ylim(0, 1.02)
-            ax[0].set_title("alpha sensitivity (plateau?)", fontsize=9)
-        # registration vs coherence agreement
-        reg = [r["reg_soft_corr_mass"] for r in ok if "coherence" in r]
-        coh = [r["coherence"] for r in ok if "coherence" in r]
-        ax[1].scatter(coh, reg, s=18)
-        rho = results["metric_agreement"].get("spearman_reg_coherence", float("nan"))
-        ax[1].set_xlabel("spatial coherence (label-free)"); ax[1].set_ylabel("registration (GT)")
-        ax[1].set_title(f"agreement  rho={rho:.2f}", fontsize=9)
-        fig.tight_layout(); fig.savefig(os.path.join(outdir, "sensitivity_agreement.png"), dpi=150)
+                       [r["gpr"] for r in alpha_rows], "o-")
+            ax[0].set_xlabel("alpha")
+            ax[0].set_ylabel("GPR")
+            ax[0].set_ylim(0, 1.02)
+            ax[0].set_title("alpha sensitivity", fontsize=9)
+        # GPR vs LTA agreement scatter
+        valid = [r for r in ok if r.get("lta") is not None]
+        if valid:
+            ax[1].scatter([r["lta"] for r in valid], [r["gpr"] for r in valid], s=18)
+        rho = results["metric_agreement"].get("spearman_gpr_lta", float("nan"))
+        ax[1].set_xlabel("LTA (label-based)")
+        ax[1].set_ylabel("GPR (label-free)")
+        ax[1].set_title(f"GPR vs LTA  rho={rho:.2f}", fontsize=9)
+        fig.tight_layout()
+        fig.savefig(os.path.join(outdir, "sensitivity_agreement.png"), dpi=150)
         plt.close(fig)
 
 
@@ -369,6 +405,7 @@ if __name__ == "__main__":
         seed=args.seed,
     )
     print("Selected defaults:", res["selection"]["best"])
-    print("Held-out registration:", res["generalization"].get("reg_soft_corr_mass"))
+    print("Held-out GPR:", res["generalization"].get("gpr"))
+    print("Held-out LTA:", res["generalization"].get("lta"))
     print("Metric agreement:", res["metric_agreement"])
     print(f"Results + figures written to {args.outdir}")

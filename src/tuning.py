@@ -7,15 +7,16 @@ Ground-truth-anchored selection of the alignment weights
 Two entry points:
 
 * :func:`select_alignment_weights` -- the **development-time** selector, scored by
-  **registration accuracy** (exact synthetic ground truth; non-circular for every
-  weight). All five weights are swept with the full (GPU-accelerated) alignment via
-  either a staged ``"grid"`` or Optuna ``"bayesopt"`` (fewer evaluations).
+  **1 − FOSCTTM** (fully non-circular: FOSCTTM has no overlap with INCENT's objective
+  components). All five weights are swept with the full (GPU-accelerated) alignment
+  via either a staged ``"grid"`` or Optuna ``"bayesopt"`` (fewer evaluations).
   The simulator's joint PCA writes a shared ``X_pca`` into both the simulated slice
   and the retained ``reference``, so each (sim, ref) pair is already comparable.
 
 * :func:`select_weights_unsupervised` -- the **deployment-time** selector for real
   slice pairs with no ground truth; staged grid scored by label-free **spatial
-  coherence**. The benchmark validates that this optimum tracks the registration one.
+  coherence** (= GPR@k). The benchmark validates that this optimum tracks the
+  development-time 1 − FOSCTTM optimum.
 
 GPU: every alignment uses CUDA automatically when available (``use_gpu=gpu_available()``).
 """
@@ -30,7 +31,7 @@ import numpy as np
 
 from .core import hierarchical_pairwise_align
 from .perturb import simulate_adjacent_slice
-from .evaluation import evaluate_alignment, spatial_coherence
+from .evaluation import evaluate_alignment, geometric_preservation_rate
 
 
 DEFAULT_INIT = {"alpha": 0.5, "beta": 0.5, "gamma": 0.25, "alpha_cluster": 0.5, "delta": 0.75}
@@ -199,7 +200,7 @@ def _staged_search(
 
 def _cell_optuna_search(score_fn, init, *, alpha_cluster_grid, delta_grid, n_trials, seed):
     """Optuna TPE search over all five alignment weights. ``score_fn(weights)->float``
-    is the (GPU-accelerated) registration objective averaged over instances."""
+    is the ground-truth metric (neg_foscttm by default) averaged over instances."""
     try:
         import optuna
     except ImportError as e:
@@ -236,7 +237,7 @@ def _cell_optuna_search(score_fn, init, *, alpha_cluster_grid, delta_grid, n_tri
 
 
 # ----------------------------------------------------------------------------
-# development-time selector  (registration accuracy; non-circular)
+# development-time selector  (FOSCTTM; fully non-circular)
 # ----------------------------------------------------------------------------
 
 def select_alignment_weights(
@@ -247,7 +248,7 @@ def select_alignment_weights(
     n_instances: int = 3,
     perturb_kwargs: Optional[dict] = None,
     max_cells: Optional[int] = None,
-    objective_key: str = "reg_soft_corr_mass",
+    objective_key: str = "neg_foscttm",
     method: str = "grid",
     alpha_cluster_grid=(0.1, 0.3, 0.5, 0.7, 0.9),
     delta_grid=(0.0, 0.25, 0.5, 0.75, 1.0),
@@ -261,7 +262,7 @@ def select_alignment_weights(
     seed: int = 0,
 ) -> dict:
     """
-    Select all five weights by maximizing mean registration accuracy over synthetic
+    Select all five weights by maximizing a ground-truth metric over synthetic
     self-alignment instances scored with the full alignment (real OT).
 
     ``method``:
@@ -270,9 +271,26 @@ def select_alignment_weights(
       * ``"bayesopt"`` -- Optuna TPE over the full continuous 5-weight cube
                           (fewer evaluations; needs ``optuna``).
 
-    Instance source (priority ``crops`` > ``section``+``reference``). ``objective_key``
-    is any key from :func:`evaluation.evaluate_alignment` (default the smooth
-    registration objective). GPU is used automatically when CUDA is available.
+    Instance source (priority ``crops`` > ``section``+``reference``).
+
+    ``objective_key`` is any key from :func:`evaluation.evaluate_alignment`.
+    Default ``'neg_foscttm'`` (= 1 − FOSCTTM, higher is better) is the recommended
+    choice because:
+      * **Fully non-circular** — FOSCTTM has zero overlap with INCENT's objective
+        components (α expression, β cell-type, γ neighbourhood, α_cluster, δ).
+        In contrast, GPR correlates with the γ neighbourhood term and LTA correlates
+        with the β cell-type term; both could bias weight selection toward their
+        respective objective component.
+      * **Exact ground truth** — ``select_alignment_weights`` always creates synthetic
+        instances via ``simulate_adjacent_slice``, so FOSCTTM correspondences are
+        always available and ``neg_foscttm`` is never None here.
+      * **Consistent with the reported metric** — the paper reports FOSCTTM on
+        held-out instances; selecting by ``neg_foscttm`` on training instances is the
+        most coherent methodology for reviewer scrutiny.
+      ``'gpr'`` is a valid alternative when ground truth is uncertain or when you
+      need a result that is also interpretable in the deployment (no-ground-truth) setting.
+
+    GPU is used automatically when CUDA is available.
 
     Returns ``{"best", "best_score", "objective_key", "method",
     "landscape", "per_instance_at_best", "n_instances"}``.
@@ -384,7 +402,7 @@ def select_weights_unsupervised(
         pi = _align_score(sliceA, sliceB, weights, align_kwargs, quiet)
         if pi is None:
             return 0.0
-        c = spatial_coherence(pi, coordsA, coordsB, k=k_coherence)["coherence"]
+        c = geometric_preservation_rate(pi, coordsA, coordsB, k_values=(k_coherence,))["gpr"]
         return 0.0 if c is None or not np.isfinite(c) else float(c)
 
     best, best_score, landscape = _staged_search(
@@ -394,6 +412,6 @@ def select_weights_unsupervised(
     return {
         "best": best,
         "best_score": best_score,
-        "objective_key": "coherence",
+        "objective_key": "gpr",
         "landscape": landscape,
     }
