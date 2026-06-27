@@ -55,8 +55,19 @@ def gpu_available() -> bool:
 
 @contextlib.contextmanager
 def _quiet(enabled: bool):
-    """Silence the aligner's prints during a sweep (it is very verbose)."""
+    """Silence the aligner's prints during a sweep.
+
+    contextlib.redirect_stdout modifies the global sys.stdout and is NOT
+    thread-safe: concurrent threads overwrite each other's saved reference,
+    leaving sys.stdout pointing to a closed file after one thread exits.
+    In worker threads we skip the redirect entirely — HOT prints in core.py
+    are already gated by `if verbose:`, so nothing reaches stdout anyway.
+    """
     if not enabled:
+        yield
+        return
+    import threading
+    if threading.current_thread() is not threading.main_thread():
         yield
         return
     with open(os.devnull, "w") as fnull, contextlib.redirect_stdout(fnull):

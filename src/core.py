@@ -236,20 +236,24 @@ def hierarchical_pairwise_align(
 
     Returns the cell-level alignment pi.
     """
-    print("--- [HOT] Step 1: Clustering Cells into Mesoregions ---")
+    if verbose:
+        print("--- [HOT] Step 1: Clustering Cells into Mesoregions ---")
     if coarsen_scale is not None:
         S = float(coarsen_scale)
-        print(f"Coarsening scale (user-supplied): S={S:.4g}")
+        if verbose:
+            print(f"Coarsening scale (user-supplied): S={S:.4g}")
     elif auto_coarsen_scale:
         S = select_coarsen_length(
             sliceA, sliceB,
             spatial_key=spatial_key, use_rep=use_rep, label_key=label_key,
             alpha=alpha_cluster, delta=delta, use_gpu=use_gpu,
         )
-        print(f"Coarsening scale (auto, matchability sweep): S={S:.4g}")
+        if verbose:
+            print(f"Coarsening scale (auto, matchability sweep): S={S:.4g}")
     else:
         S, s = estimate_coarsen_length(sliceA, sliceB, spatial_key=spatial_key)
-        print(f"Coarsening scale (intrinsic): S={S:.4g} (characteristic spacing s={s:.4g})")
+        if verbose:
+            print(f"Coarsening scale (intrinsic): S={S:.4g} (characteristic spacing s={s:.4g})")
 
     labelsA = cluster_cells_spatial(sliceA, spatial_key=spatial_key, coarsen_length=S)
     labelsB = cluster_cells_spatial(sliceB, spatial_key=spatial_key, coarsen_length=S)
@@ -257,13 +261,15 @@ def hierarchical_pairwise_align(
     # Pre-cache global cell types for cluster structure alignment
     all_types = np.array(sorted(set(sliceA.obs[label_key].astype(str)) | set(sliceB.obs[label_key].astype(str))), dtype=str)
 
-    print(f"Slice A: {len(np.unique(labelsA))} clusters")
-    print(f"Slice B: {len(np.unique(labelsB))} clusters")
+    if verbose:
+        print(f"Slice A: {len(np.unique(labelsA))} clusters")
+        print(f"Slice B: {len(np.unique(labelsB))} clusters")
     
     if visualize_clusters:
         visualize_clustered_slices(sliceA, sliceB, labelsA, labelsB, spatial_key=spatial_key)
     
-    print("--- [HOT] Step 2: Extracting Cluster Features ---")
+    if verbose:
+        print("--- [HOT] Step 2: Extracting Cluster Features ---")
     cache_A = build_slice_cluster_cache(
         sliceA,
         labelsA,
@@ -293,20 +299,23 @@ def hierarchical_pairwise_align(
         cache_B.mu_struct
     )
     
-    print("--- [HOT] Step 3: Compute Cluster Costs and Structures ---")
+    if verbose:
+        print("--- [HOT] Step 3: Compute Cluster Costs and Structures ---")
     _, nx_coarse = select_backend(use_gpu, gpu_verbose=False)
     M_cluster = compute_cluster_feature_costs(mu_exprA, mu_structA, mu_exprB, mu_structB, delta=delta, nx=nx_coarse)
     C_A = compute_cluster_structural_matrix(centroidsA)
     C_B = compute_cluster_structural_matrix(centroidsB)
     
-    print("--- [HOT] Step 4: Run Coarse FUGW ---")
+    if verbose:
+        print("--- [HOT] Step 4: Run Coarse FUGW ---")
     Pi_cluster = run_coarse_fugw(M_cluster, C_A, C_B, p_A, p_B, alpha=alpha_cluster, reg_m=reg_m, use_gpu=use_gpu)
     
     if visualize_clusters:
         visualize_cluster_mapping(centroidsA, centroidsB, Pi_cluster)
 
     # We now prepare the injection into standard cell-level pairwise_align
-    print("--- [HOT] Step 5: Extract Continuous Macro Sections ---")
+    if verbose:
+        print("--- [HOT] Step 5: Extract Continuous Macro Sections ---")
     macro_section = extract_continuous_macro_section(
         sliceA,
         sliceB,
@@ -330,7 +339,7 @@ def hierarchical_pairwise_align(
     dist_B = macro_section.dist_B
     initial_idx_A = macro_section.initial_idx_A
     initial_idx_B = macro_section.initial_idx_B
-    if macro_section.ambiguous:
+    if verbose and macro_section.ambiguous:
         if macro_section.diagnostics.get("macro_hypothesis_ambiguity_detected", False):
             print(
                 "[HOT] Warning: the top expanded macro hypotheses remained ambiguous. "
@@ -341,14 +350,14 @@ def hierarchical_pairwise_align(
                 "[HOT] Warning: the initial macro seed family was ambiguous. "
                 f"Evidence ratio={macro_section.diagnostics.get('seed_evidence_ratio')}."
             )
-    if macro_section.alternative_hypotheses:
+    if verbose and macro_section.alternative_hypotheses:
         print(
             "[HOT] Stored competing macro-overlap hypotheses: "
             f"{len(macro_section.alternative_hypotheses)}. "
             f"Winner came from seed trial {macro_section.diagnostics.get('selected_seed_trial_rank', 1)}."
         )
-    
-    print(f"Selected {len(idx_A)}/{sliceA.shape[0]} cells from A, {len(idx_B)}/{sliceB.shape[0]} cells from B.")
+    if verbose:
+        print(f"Selected {len(idx_A)}/{sliceA.shape[0]} cells from A, {len(idx_B)}/{sliceB.shape[0]} cells from B.")
 
     if visualize_clusters:
         visualize_initial_connected_component(
@@ -360,7 +369,8 @@ def hierarchical_pairwise_align(
         )
         visualize_selected_anchors(sliceA, sliceB, idx_A, idx_B, spatial_key=spatial_key, dist_A=dist_A, dist_B=dist_B)
 
-    print("--- [HOT] Step 6: Synthesizing Cell-Level Footprint from Macro Clusters ---")
+    if verbose:
+        print("--- [HOT] Step 6: Synthesizing Cell-Level Footprint from Macro Clusters ---")
     pi_full = np.zeros((sliceA.shape[0], sliceB.shape[0]), dtype=np.float64)
     
     if len(idx_A) > 0 and len(idx_B) > 0:
@@ -382,7 +392,8 @@ def hierarchical_pairwise_align(
                         grid_A, grid_B = np.ix_(cells_A, cells_B)
                         pi_full[grid_A, grid_B] += block_mass
 
-    print("--- [HOT] Step 7: Global Refinement via Overlap Projection ---")
+    if verbose:
+        print("--- [HOT] Step 7: Global Refinement via Overlap Projection ---")
     try:
         # 1. Geometrically align full slices using the partial block solution.
         # stack_slices_pairwise hard-codes obsm['spatial']; bridge the gap by
@@ -524,7 +535,8 @@ def hierarchical_pairwise_align(
                     spatial_key=spatial_key
                 )
 
-        print(f"--- [HOT] Step 8: Executing Final Base OT on Shadow Portions (A: {len(idx_A_shadow)}, B: {len(idx_B_shadow)}) ---")
+        if verbose:
+            print(f"--- [HOT] Step 8: Executing Final Base OT on Shadow Portions (A: {len(idx_A_shadow)}, B: {len(idx_B_shadow)}) ---")
         pi_shadow_final = pairwise_align(
             sliceA=sliceA_shadow,
             sliceB=sliceB_shadow,
@@ -564,6 +576,7 @@ def hierarchical_pairwise_align(
 def align_multiple_slices(
     slices: list[AnnData],
     spatial_key: str = "spatial",
+    verbose: bool = False,
     **kwargs
 ) -> list[NDArray]:
     """
@@ -585,13 +598,15 @@ def align_multiple_slices(
     
     pi_matrices = []
     
-    print(f"Starting Multi-Slice Alignment for {len(slices)} slices...")
-    
+    if verbose:
+        print(f"Starting Multi-Slice Alignment for {len(slices)} slices...")
+
     # Step 1: Compute OT matchings for all consecutive pairs
     for i in range(len(slices) - 1):
-        print(f"\n{'='*40}")
-        print(f"Aligning Pair {i} and {i+1}")
-        print(f"{'='*40}")
+        if verbose:
+            print(f"\n{'='*40}")
+            print(f"Aligning Pair {i} and {i+1}")
+            print(f"{'='*40}")
         
         pi_pair = hierarchical_pairwise_align(
             sliceA=slices[i], 
@@ -1128,8 +1143,6 @@ def calculate_spatial_distance(sliceA, sliceB, nx, data_type=np.float32, spatial
     D_A, D_B: Pairwise spatial distance matrices (backend tensors).
     """
 
-    print("Calculating spatial distance between cells in slice A and slice B")
-
     coordinates_A = np.asarray(sliceA.obsm[spatial_key], dtype=np.float64)
     coordinates_B = np.asarray(sliceB.obsm[spatial_key], dtype=np.float64)
 
@@ -1173,8 +1186,6 @@ def calculate_gene_expression_cosine_distance(sliceA, sliceB, use_rep, nx=None, 
     Returns:
     cosine_dist_gene_expr: Cosine distance matrix between gene expression profiles of slice A and slice B.
     """
-
-    print("Calculating cosine distance between gene expression profiles of slice A and slice B")
 
     # Extract and prepare data matrices for cosine distance calculation
     A_X = to_dense_array(extract_data_matrix(sliceA, use_rep)) + eps
