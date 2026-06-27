@@ -41,7 +41,7 @@ from .visualize import (
 # multiple of the characteristic cell spacing (see ``calculate_neighborhood_dissimilarity``),
 # and a supercell is sized to cover roughly one such neighborhood footprint -- so the
 # coarse and fine stages of the pipeline commit to a single, consistent spatial scale.
-NEIGHBORHOOD_OUTER_MULTIPLIER = 5.0
+NEIGHBORHOOD_OUTER_MULTIPLIER = 10.0
 
 
 def estimate_coarsen_length(sliceA, sliceB, spatial_key="spatial"):
@@ -105,12 +105,12 @@ def _coarse_matchability(Pi_cluster, centroids_A, centroids_B):
 def select_coarsen_length(
     sliceA,
     sliceB,
+    alpha,
+    delta,
     spatial_key="spatial",
     use_rep="X_pca",
     label_key="cell_type_annot",
-    alpha=0.5,
-    delta=0.75,
-    multipliers=(0.6, 0.8, 1.0, 1.3, 1.6),
+    multipliers=(0.75, 1.0, 1.25),
     use_gpu=False,
 ):
     """
