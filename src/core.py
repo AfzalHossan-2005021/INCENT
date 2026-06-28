@@ -326,6 +326,7 @@ def hierarchical_pairwise_align(
         label_key=label_key,
         cluster_cache_A=cache_A,
         cluster_cache_B=cache_B,
+        verbose=verbose,
     )
     if not macro_section.ok:
         raise ValueError(

@@ -8,7 +8,6 @@ from scipy.optimize import linear_sum_assignment
 from scipy.spatial import cKDTree
 from scipy.sparse.csgraph import dijkstra
 from scipy.spatial import Delaunay
-from scipy.special import rel_entr
 from scipy.stats import rankdata
 from ot.gromov import fused_unbalanced_gromov_wasserstein
 from .utils import select_backend, to_backend, jensenshannon_divergence_backend
@@ -81,17 +80,6 @@ class SliceClusterCache:
     mu_struct: np.ndarray
     cluster_hist: np.ndarray
     all_types: np.ndarray
-
-
-def safe_jensenshannon(p, q):
-    p = np.asarray(p, dtype=np.float64)
-    q = np.asarray(q, dtype=np.float64)
-    p = p / max(p.sum(), 1e-12)
-    q = q / max(q.sum(), 1e-12)
-    m = (p + q) / 2.0
-    # Compute relative entropy and clip negative float underflows before sqrt
-    js_sq = np.sum(rel_entr(p, m) + rel_entr(q, m)) / 2.0
-    return np.sqrt(max(js_sq, 0.0))
 
 
 def build_slice_cluster_cache(
@@ -1258,6 +1246,7 @@ def extract_continuous_macro_section(
     label_key='cell_type_annot',
     cluster_cache_A=None,
     cluster_cache_B=None,
+    verbose: bool = False,
 ):
     """
     Identify a compact, biologically consistent overlap region from the coarse alignment.
@@ -1375,11 +1364,12 @@ def extract_continuous_macro_section(
             diagnostics=diagnostics,
         )
 
-    print(
-        "[HOT] Macro-section candidates: "
-        f"{diagnostics['num_positive_mass_pairs']} transport-supported pairs, "
-        f"{diagnostics['num_enriched_pairs']} enriched-above-null pairs."
-    )
+    if verbose:
+        print(
+            "[HOT] Macro-section candidates: "
+            f"{diagnostics['num_positive_mass_pairs']} transport-supported pairs, "
+            f"{diagnostics['num_enriched_pairs']} enriched-above-null pairs."
+        )
 
     # 5. Build the pair graph.
     match_adj = build_match_graph(matches, adj_A, adj_B)
@@ -1401,12 +1391,13 @@ def extract_continuous_macro_section(
             diagnostics=diagnostics,
         )
 
-    print(
-        "[HOT] Initial macro seed trials: "
-        f"{len(seed_index_trials)} motif(s) will be expanded independently; "
-        f"pair-graph edges={diagnostics['match_graph_edges']}."
-    )
-    if diagnostics.get("seed_evidence_ratio") is not None:
+    if verbose:
+        print(
+            "[HOT] Initial macro seed trials: "
+            f"{len(seed_index_trials)} motif(s) will be expanded independently; "
+            f"pair-graph edges={diagnostics['match_graph_edges']}."
+        )
+    if verbose and diagnostics.get("seed_evidence_ratio") is not None:
         print(
             "[HOT] Seed competition: "
             f"log-gap={diagnostics['seed_log_evidence_gap']:.4f}, "
@@ -1421,13 +1412,15 @@ def extract_continuous_macro_section(
             AmbiguousAlignmentWarning,
         )
 
-    print("[HOT] Coupled frontier expansion: accepting frontier pairs only when they improve on the unmatched null.")
+    if verbose:
+        print("[HOT] Coupled frontier expansion: accepting frontier pairs only when they improve on the unmatched null.")
     hypothesis_records = []
     seen_hypotheses = {}
     for trial_rank, seed_indices in enumerate(seed_index_trials, start=1):
         seed_pairs = [matches[i] for i in seed_indices]
         seed_name = {1: "singleton", 2: "edge", 3: "triangle"}.get(len(seed_pairs), f"{len(seed_pairs)}-pair")
-        print(f"[HOT] Expanding seed trial {trial_rank}: {seed_name} with {len(seed_pairs)} matched pair(s).")
+        if verbose:
+            print(f"[HOT] Expanding seed trial {trial_rank}: {seed_name} with {len(seed_pairs)} matched pair(s).")
 
         selected_pairs, expansion_diagnostics = expand_macro_match_frontier(
             seed_pairs=seed_pairs,
@@ -1545,18 +1538,19 @@ def extract_continuous_macro_section(
     diagnostics["macro_hypothesis_score_resolution"] = float(macro_score_resolution)
     diagnostics["macro_hypothesis_ambiguity_detected"] = bool(macro_ambiguity_detected)
 
-    if diagnostics["accepted_pairs_per_round"]:
-        rounds = len(diagnostics["accepted_pairs_per_round"])
-        total_new = int(sum(diagnostics["accepted_pairs_per_round"]))
-        print(f"[HOT] Winning expansion accepted {total_new} new pair(s) over {rounds} round(s).")
-    else:
-        print("[HOT] Winning expansion remained at the seed; no frontier pair beat the unmatched alternative.")
-    print(
-        "[HOT] Winning macro hypothesis: "
-        f"trial {diagnostics['selected_seed_trial_rank']} with score {diagnostics['macro_hypothesis_best_score']:.4f}; "
-        f"stop reason={diagnostics['stop_reason']}."
-    )
-    if macro_ambiguity_detected:
+    if verbose:
+        if diagnostics["accepted_pairs_per_round"]:
+            rounds = len(diagnostics["accepted_pairs_per_round"])
+            total_new = int(sum(diagnostics["accepted_pairs_per_round"]))
+            print(f"[HOT] Winning expansion accepted {total_new} new pair(s) over {rounds} round(s).")
+        else:
+            print("[HOT] Winning expansion remained at the seed; no frontier pair beat the unmatched alternative.")
+        print(
+            "[HOT] Winning macro hypothesis: "
+            f"trial {diagnostics['selected_seed_trial_rank']} with score {diagnostics['macro_hypothesis_best_score']:.4f}; "
+            f"stop reason={diagnostics['stop_reason']}."
+        )
+    if verbose and macro_ambiguity_detected:
         warnings.warn(
             "The final macro-overlap hypothesis remains ambiguous after expanding the top seed trials.",
             AmbiguousAlignmentWarning,
