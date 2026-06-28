@@ -1410,6 +1410,7 @@ def extract_continuous_macro_section(
             "The macro-overlap seed is ambiguous: at least two connected seed motifs "
             "have indistinguishable evidence under the observed features.",
             AmbiguousAlignmentWarning,
+            stacklevel=2,
         )
 
     if verbose:
@@ -1554,6 +1555,7 @@ def extract_continuous_macro_section(
         warnings.warn(
             "The final macro-overlap hypothesis remains ambiguous after expanding the top seed trials.",
             AmbiguousAlignmentWarning,
+            stacklevel=2
         )
 
     return materialize_macro_section_result(
