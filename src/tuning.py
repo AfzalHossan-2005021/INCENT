@@ -74,19 +74,34 @@ def _quiet(enabled: bool):
         yield
 
 
-def simplex_grid(step: float = 0.25):
+def simplex_grid(step: float = 0.25, offset: float = 0.0):
     """
     Grid the (gene, cell-type, neighborhood) feature simplex.
 
-    Returns ``(beta, gamma)`` pairs with ``beta, gamma >= 0`` and
-    ``beta + gamma <= 1`` (the remaining mass ``1 - beta - gamma`` is the
-    gene-expression weight). Includes ``(0, 0)`` = pure expression.
+    Returns ``(beta, gamma)`` pairs with ``beta + gamma <= 1``.
+    With ``offset=0.0`` (default) values start at 0 and include the corners
+    (0,0), (1,0), (0,1).  With ``offset > 0`` values start at ``offset`` and
+    stop before 1, so neither beta nor gamma equals exactly 0 or 1.
+    For example ``simplex_grid(0.2, offset=0.1)`` yields 15 interior points
+    with values in {0.1, 0.3, 0.5, 0.7, 0.9}.
     """
     n = int(round(1.0 / step))
     pts = []
-    for i in range(n + 1):
-        for j in range(n + 1 - i):
-            pts.append((round(i * step, 6), round(j * step, 6)))
+    if offset == 0.0:
+        for i in range(n + 1):
+            for j in range(n + 1 - i):
+                pts.append((round(i * step, 6), round(j * step, 6)))
+    else:
+        for i in range(n + 1):
+            beta = round(offset + i * step, 6)
+            if beta >= 1.0 - 1e-9:
+                break
+            for j in range(n + 1):
+                gamma = round(offset + j * step, 6)
+                if gamma >= 1.0 - 1e-9:
+                    break
+                if beta + gamma <= 1.0 + 1e-9:
+                    pts.append((beta, gamma))
     return pts
 
 
@@ -189,6 +204,7 @@ def _staged_search(
     alpha_grid,
     alpha_cluster_grid,
     simplex_step: float,
+    simplex_offset: float = 0.0,
     delta_grid,
     refine: bool,
     n_jobs: int = 1,
@@ -234,7 +250,7 @@ def _staged_search(
     # Stage B: feature simplex (beta, gamma) x delta at alpha*, alpha_cluster*
     combos_B = [
         {**best, "beta": float(beta), "gamma": float(gamma), "delta": float(d)}
-        for (beta, gamma) in simplex_grid(simplex_step)
+        for (beta, gamma) in simplex_grid(simplex_step, offset=simplex_offset)
         for d in delta_grid
     ]
     pairs_B = _eval_batch(combos_B, "feature")
@@ -310,6 +326,7 @@ def select_alignment_weights(
     delta_grid=(0.0, 0.25, 0.5, 0.75, 1.0),
     alpha_grid=(0.1, 0.3, 0.5, 0.7, 0.9),
     simplex_step: float = 0.25,
+    simplex_offset: float = 0.0,
     n_trials: int = 40,
     init: Optional[dict] = None,
     align_kwargs: Optional[dict] = None,
@@ -390,6 +407,7 @@ def select_alignment_weights(
             score_fn, init=init, alpha_grid=alpha_grid,
             alpha_cluster_grid=alpha_cluster_grid,
             simplex_step=simplex_step,
+            simplex_offset=simplex_offset,
             delta_grid=delta_grid,
             refine=refine,
             n_jobs=n_jobs,
