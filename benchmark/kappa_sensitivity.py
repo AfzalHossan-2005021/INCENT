@@ -105,10 +105,24 @@ def _eval_kappa(
     return row
 
 
+def _estimate_s_from_sources(section, reference, crops, spatial_key):
+    """Estimate the shared characteristic spacing from whichever inputs are given."""
+    if crops is not None:
+        spacings = []
+        for sec, ref in crops:
+            spacings.append(estimate_characteristic_spacing(sec, spatial_key=spatial_key))
+            spacings.append(estimate_characteristic_spacing(ref, spatial_key=spatial_key))
+        return float(max(spacings))
+    s_A = estimate_characteristic_spacing(section, spatial_key=spatial_key)
+    s_B = estimate_characteristic_spacing(reference, spatial_key=spatial_key)
+    return float(max(s_A, s_B))
+
+
 def run_kappa_sensitivity(
-    section,
-    reference,
+    section=None,
+    reference=None,
     *,
+    crops=None,
     kappa_grid=DEFAULT_KAPPA_GRID,
     n_instances: int = 3,
     perturb_kwargs: Optional[dict] = None,
@@ -122,15 +136,24 @@ def run_kappa_sensitivity(
     """
     Sweep kappa and report alignment metrics averaged over ``n_instances`` pairs.
 
+    Instance source (priority ``crops`` > ``section``+``reference``), matching
+    the convention of :func:`select_alignment_weights`.
+
     Parameters
     ----------
     section, reference:
         AnnData slices (section is the simulated/cropped slice, reference is the
-        full parent slice). Passed to :func:`make_self_alignment_instances`.
+        full parent slice). Used when ``crops`` is None.
+    crops:
+        Explicit list of ``(section, reference)`` AnnData pairs. When given,
+        ``section``, ``reference``, and ``n_instances`` are ignored — one
+        instance is produced per crop. Mirrors the ``crops`` argument of
+        :func:`select_alignment_weights`.
     kappa_grid:
         List of kappa values to evaluate. Default: [5, 7.5, 10, 12.5, 15].
     n_instances:
-        Number of synthetic slice pairs per kappa point (default 3).
+        Number of synthetic pairs per kappa point when using
+        ``section``+``reference`` mode (ignored when ``crops`` is given).
         The same set of instances is reused across all kappa values so the only
         variable is the mesoregion scale.
     perturb_kwargs:
@@ -152,6 +175,8 @@ def run_kappa_sensitivity(
         ``default_kappa`` — the package default (NEIGHBORHOOD_OUTER_MULTIPLIER),
         ``config`` — run configuration for reproducibility.
     """
+    if crops is None and (section is None or reference is None):
+        raise ValueError("Provide either `crops` or both `section` and `reference`.")
     if "coarsen_scale" in (align_kwargs or {}):
         raise ValueError(
             "Do not pass coarsen_scale in align_kwargs — "
@@ -166,15 +191,12 @@ def run_kappa_sensitivity(
     perturb_kwargs = dict(perturb_kwargs or DEFAULT_PERTURB)
 
     # Estimate s once from the data (not kappa-dependent)
-    s_A = estimate_characteristic_spacing(section, spatial_key=spatial_key)
-    s_B = estimate_characteristic_spacing(reference, spatial_key=spatial_key)
-    s = max(s_A, s_B)
-    print(f"[kappa_sensitivity] characteristic spacing s={s:.4g} "
-          f"(section={s_A:.4g}, reference={s_B:.4g})")
+    s = _estimate_s_from_sources(section, reference, crops, spatial_key)
+    print(f"[kappa_sensitivity] characteristic spacing s={s:.4g}")
 
     # Generate instances once; reuse across all kappa values
     instances = make_self_alignment_instances(
-        section=section, reference=reference,
+        section=section, reference=reference, crops=crops,
         n_instances=n_instances,
         perturb_kwargs=perturb_kwargs,
         seed=seed,
@@ -207,7 +229,8 @@ def run_kappa_sensitivity(
         "default_kappa": float(NEIGHBORHOOD_OUTER_MULTIPLIER),
         "config": {
             "kappa_grid": list(kappa_grid),
-            "n_instances": n_instances,
+            "n_instances": n_instances if crops is None else len(instances),
+            "mode": "crops" if crops is not None else "section+reference",
             "perturb_kwargs": perturb_kwargs,
             "s": float(s),
             "seed": seed,
@@ -293,18 +316,23 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser(
         description="Sensitivity analysis for the mesoregion scale parameter kappa."
     )
-    ap.add_argument("--reference_h5ad", required=True,
-                    help="Full parent slice (.h5ad).")
-    ap.add_argument("--section_h5ad", required=True,
+    ap.add_argument("--reference_h5ad",
+                    help="Full parent slice (.h5ad). Required unless --crops_h5ad is used.")
+    ap.add_argument("--section_h5ad",
                     help="Cropped section (.h5ad); parent-frame coords whose "
-                         "obs_names subset the reference.")
+                         "obs_names subset the reference. Required unless --crops_h5ad is used.")
+    ap.add_argument("--crops_h5ad", nargs="+", metavar="SECTION REF",
+                    help="Explicit crop pairs as alternating section/reference .h5ad paths "
+                         "(e.g. sec1.h5ad ref1.h5ad sec2.h5ad ref2.h5ad). "
+                         "When given, --section_h5ad and --reference_h5ad are ignored.")
     ap.add_argument("--outdir", default="results/kappa_sensitivity")
     ap.add_argument("--kappa_grid", type=float, nargs="+",
                     default=DEFAULT_KAPPA_GRID, metavar="K",
-                    help="Space-separated kappa values to sweep "
-                         "(default: 6 7 8 9 10 11 12 13 14 15 16).")
+                    help=f"Space-separated kappa values to sweep "
+                         f"(default: {DEFAULT_KAPPA_GRID}).")
     ap.add_argument("--n_instances", type=int, default=3,
-                    help="Synthetic pairs per kappa point (default: 3).")
+                    help="Synthetic pairs per kappa point in section+reference mode (default: 3). "
+                         "Ignored when --crops_h5ad is used.")
     ap.add_argument("--n_jobs", type=int, default=1,
                     help="Parallel threads for kappa evaluation (default: 1).")
     ap.add_argument("--use_gpu", choices=["auto", "true", "false"], default="auto")
@@ -316,12 +344,24 @@ if __name__ == "__main__":
     else:
         use_gpu = args.use_gpu == "true"
 
-    reference = sc.read_h5ad(args.reference_h5ad)
-    section = sc.read_h5ad(args.section_h5ad)
+    if args.crops_h5ad is not None:
+        paths = args.crops_h5ad
+        if len(paths) % 2 != 0:
+            ap.error("--crops_h5ad requires an even number of paths (section ref pairs).")
+        crops = [(sc.read_h5ad(paths[i]), sc.read_h5ad(paths[i + 1]))
+                 for i in range(0, len(paths), 2)]
+        section = reference = None
+    else:
+        if not args.section_h5ad or not args.reference_h5ad:
+            ap.error("Provide either --crops_h5ad or both --section_h5ad and --reference_h5ad.")
+        section = sc.read_h5ad(args.section_h5ad)
+        reference = sc.read_h5ad(args.reference_h5ad)
+        crops = None
 
     res = run_kappa_sensitivity(
         section,
         reference,
+        crops=crops,
         kappa_grid=args.kappa_grid,
         n_instances=args.n_instances,
         align_kwargs={"use_gpu": use_gpu},
