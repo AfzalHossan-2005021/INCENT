@@ -4,7 +4,7 @@ tuning.py
 Ground-truth-anchored selection of the alignment weights
 (``alpha``, ``alpha_cluster``, ``beta``, ``gamma``, ``delta``).
 
-Two entry points:
+Three entry points:
 
 * :func:`select_alignment_weights` -- the **development-time** selector, scored by
   **1 − FOSCTTM** (fully non-circular: FOSCTTM has no overlap with INCENT's objective
@@ -12,6 +12,12 @@ Two entry points:
   via either a staged ``"grid"`` or Optuna ``"bayesopt"`` (fewer evaluations).
   The simulator's joint PCA writes a shared ``X_pca`` into both the simulated slice
   and the retained ``reference``, so each (sim, ref) pair is already comparable.
+
+* :func:`select_weights_real_pairs` -- uses **real section/reference pairs directly**,
+  no synthetic perturbation. Scored by **LTA** (Label Transfer Accuracy): for each
+  source cell the highest-weight target in the transport plan must share the same
+  cell-type label. Requires ``cell_type_annot`` in both slices' ``.obs``; no
+  ``sim.uns`` ground-truth provenance is needed.  Supports multi-GPU and ``n_jobs``.
 
 * :func:`select_weights_unsupervised` -- the **deployment-time** selector for real
   slice pairs with no ground truth; staged grid scored by label-free **spatial
@@ -438,6 +444,166 @@ def select_alignment_weights(
         "landscape": landscape,
         "per_instance_at_best": per_instance,
         "n_instances": len(instances),
+    }
+
+
+# ----------------------------------------------------------------------------
+# real-pair selector  (LTA; cell-type labels; no perturbation)
+# ----------------------------------------------------------------------------
+
+def select_weights_real_pairs(
+    pairs,
+    *,
+    objective_key: str = "lta",
+    method: str = "grid",
+    alpha_grid=(0.1, 0.3, 0.5, 0.7, 0.9),
+    alpha_cluster_grid=(0.1, 0.3, 0.5, 0.7, 0.9),
+    simplex_step: float = 0.25,
+    simplex_offset: float = 0.0,
+    delta_grid=(0.25, 0.5, 0.75),
+    n_trials: int = 40,
+    init: Optional[dict] = None,
+    align_kwargs: Optional[dict] = None,
+    sim_axis: int = 0,
+    refine: bool = True,
+    quiet: bool = True,
+    seed: int = 0,
+    n_jobs: int = 1,
+    device_ids=None,
+) -> dict:
+    """
+    Select all five alignment weights using real section/reference pairs directly,
+    without synthetic perturbation.
+
+    Unlike :func:`select_alignment_weights`, no :func:`simulate_adjacent_slice` is
+    called: each ``(sliceA, sliceB)`` tuple is aligned as-is, and the score is
+    evaluated on the resulting transport plan.
+
+    Because no exact ground-truth correspondences exist, ``objective_key`` defaults
+    to ``"lta"`` (Label Transfer Accuracy): for each source cell the highest-weight
+    target cell is found via argmax over the transport plan row, and label agreement
+    is measured.  LTA requires only ``cell_type_annot`` (or the ``label_key`` kwarg)
+    in both slices' ``.obs``; no ``sim.uns`` provenance is needed.
+
+    Parameters
+    ----------
+    pairs : list of (AnnData, AnnData)
+        Real ``(section, reference)`` pairs.  Each pair is aligned independently;
+        the score averaged across all pairs.
+    objective_key : str
+        Any key returned by :func:`evaluation.evaluate_alignment`.
+        ``"lta"`` (default) and ``"gpr"`` are non-circular for real pairs.
+        ``"neg_foscttm"`` will be ``None`` for real pairs (no ground truth) and
+        must not be used here.
+    method : str
+        ``"grid"`` (default) or ``"bayesopt"``.
+    alpha_grid, alpha_cluster_grid : tuple of float
+        Grid values for Stage A and the optional Stage C refinement.
+    simplex_step, simplex_offset : float
+        Controls the (beta, gamma) simplex grid in Stage B.
+    delta_grid : tuple of float
+        Grid values for delta in Stage B.
+    n_trials : int
+        Number of Optuna trials (only used when ``method="bayesopt"``).
+    init : dict or None
+        Starting point for the staged search.  Defaults to :data:`DEFAULT_INIT`.
+    align_kwargs : dict or None
+        Extra kwargs forwarded to :func:`core.hierarchical_pairwise_align`.
+    sim_axis : int
+        Which slice acts as the LTA / GPR source.
+        ``0`` = sliceA is the source (default; use when sliceA is the section).
+        ``1`` = sliceB is the source.
+    refine : bool
+        Re-run the (alpha, alpha_cluster) grid after Stage B to fine-tune.
+    quiet : bool
+        Suppress alignment prints during the sweep.
+    seed : int
+        Random seed for the Bayesian sampler.
+    n_jobs : int
+        Thread-parallel weight evaluations.  Set ``>1`` together with
+        ``len(device_ids) > 1`` to distribute across multiple GPUs.
+    device_ids : list of int or None
+        GPU indices to distribute across threads.
+
+    Returns
+    -------
+    dict with keys:
+        ``best``, ``best_score``, ``objective_key``, ``method``,
+        ``landscape``, ``per_instance_at_best``, ``n_pairs``.
+    """
+    if method not in ("grid", "bayesopt"):
+        raise ValueError("method must be 'grid' or 'bayesopt'.")
+    pairs = list(pairs)
+    if not pairs:
+        raise ValueError("pairs must contain at least one (sliceA, sliceB) tuple.")
+
+    init = dict(init or DEFAULT_INIT)
+    align_kwargs = dict(align_kwargs or {})
+    align_kwargs.setdefault("use_gpu", gpu_available())
+    align_kwargs.setdefault("gpu_verbose", False)
+    align_kwargs.setdefault("verbose", False)
+    align_kwargs.setdefault("visualize_clusters", False)
+    label_key = align_kwargs.get("label_key", "cell_type_annot")
+    spatial_key = align_kwargs.get("spatial_key", "spatial")
+
+    def score_fn(weights):
+        vals = []
+        for sliceA, sliceB in pairs:
+            pi = _align_score(sliceA, sliceB, weights, align_kwargs, quiet)
+            if pi is None:
+                vals.append(0.0)
+                continue
+            mets = evaluate_alignment(
+                pi, sliceA, sliceB,
+                sim_axis=sim_axis,
+                label_key=label_key,
+                spatial_key=spatial_key,
+            )
+            v = mets.get(objective_key, 0.0)
+            vals.append(0.0 if v is None or not np.isfinite(v) else float(v))
+        return float(np.mean(vals)) if vals else 0.0
+
+    if method == "grid":
+        best, best_score, landscape = _staged_search(
+            score_fn, init=init,
+            alpha_grid=alpha_grid,
+            alpha_cluster_grid=alpha_cluster_grid,
+            simplex_step=simplex_step,
+            simplex_offset=simplex_offset,
+            delta_grid=delta_grid,
+            refine=refine,
+            n_jobs=n_jobs,
+            device_ids=device_ids,
+        )
+    else:
+        best, best_score, landscape = _cell_optuna_search(
+            score_fn, init=init,
+            alpha_cluster_grid=alpha_cluster_grid,
+            delta_grid=delta_grid,
+            n_trials=n_trials, seed=seed,
+        )
+
+    per_instance = []
+    for sliceA, sliceB in pairs:
+        pi = _align_score(sliceA, sliceB, best, align_kwargs, quiet)
+        if pi is not None:
+            per_instance.append(
+                evaluate_alignment(
+                    pi, sliceA, sliceB,
+                    sim_axis=sim_axis,
+                    label_key=label_key,
+                    spatial_key=spatial_key,
+                )
+            )
+
+    return {
+        "best": best,
+        "best_score": best_score,
+        "objective_key": objective_key,
+        "method": method,
+        "landscape": landscape,
+        "per_instance_at_best": per_instance,
+        "n_pairs": len(pairs),
     }
 
 
