@@ -454,7 +454,7 @@ def select_alignment_weights(
 def select_weights_real_pairs(
     pairs,
     *,
-    objective_key: str = "lta",
+    objective_key="lta",
     method: str = "grid",
     alpha_grid=(0.1, 0.3, 0.5, 0.7, 0.9),
     alpha_cluster_grid=(0.1, 0.3, 0.5, 0.7, 0.9),
@@ -490,11 +490,12 @@ def select_weights_real_pairs(
     pairs : list of (AnnData, AnnData)
         Real ``(section, reference)`` pairs.  Each pair is aligned independently;
         the score averaged across all pairs.
-    objective_key : str
-        Any key returned by :func:`evaluation.evaluate_alignment`.
-        ``"lta"`` (default) and ``"gpr"`` are non-circular for real pairs.
-        ``"neg_foscttm"`` will be ``None`` for real pairs (no ground truth) and
-        must not be used here.
+    objective_key : str or callable
+        Either a string key from :func:`evaluation.evaluate_alignment` or a
+        callable ``(metrics_dict) -> float`` for combined objectives.
+        String examples: ``"lta"`` (default), ``"gpr"``.
+        Callable example: ``lambda m: 0.5 * (m["lta"] or 0) + 0.5 * (m["gpr"] or 0)``.
+        ``"neg_foscttm"`` will be ``None`` for real pairs and must not be used here.
     method : str
         ``"grid"`` (default) or ``"bayesopt"``.
     alpha_grid, alpha_cluster_grid : tuple of float
@@ -559,7 +560,10 @@ def select_weights_real_pairs(
                 label_key=label_key,
                 spatial_key=spatial_key,
             )
-            v = mets.get(objective_key, 0.0)
+            if callable(objective_key):
+                v = objective_key(mets)
+            else:
+                v = mets.get(objective_key, 0.0)
             vals.append(0.0 if v is None or not np.isfinite(v) else float(v))
         return float(np.mean(vals)) if vals else 0.0
 
@@ -599,7 +603,7 @@ def select_weights_real_pairs(
     return {
         "best": best,
         "best_score": best_score,
-        "objective_key": objective_key,
+        "objective_key": "<callable>" if callable(objective_key) else objective_key,
         "method": method,
         "landscape": landscape,
         "per_instance_at_best": per_instance,

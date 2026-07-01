@@ -210,9 +210,9 @@ def hierarchical_pairwise_align(
     and then restricting the cell-level OT matchings to the aligned blocks.
 
     The mesoregions are uniform, contiguous supercells produced by a deterministic
-    grid-seeded centroidal Voronoi tessellation (see ``cluster_cells_spatial``).
+    farthest-point-seeded centroidal Voronoi tessellation (see ``cluster_cells_spatial``).
     Both slices are tessellated at one shared physical scale so the supercells
-    match in size, shape, and position -- the property the cluster-level FGW
+    are built at one shared physical scale, giving comparable mesoregion sizes while preserving each section's observed tissue footprint -- the property the cluster-level FGW
     alignment depends on. The scale is chosen automatically; there is no
     magic-number cluster count and no per-call resolution knob.
 

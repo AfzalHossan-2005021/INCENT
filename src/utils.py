@@ -57,16 +57,18 @@ def to_backend(x, nx, data_type=None, reference=None):
     else:
         x = np.asarray(x)
         
-    x_nx = nx.from_numpy(x)
-
-    # Use reference tensor to match device/type if provided
-    # Otherwise set up PyTorch CUDA if backend is Torch and CUDA is available
-    if reference is not None: # Use POT type_as logic
-        x_nx = nx.zeros(x_nx.shape, type_as=reference) + x_nx
-    elif nx.__class__.__name__ == 'TorchBackend':
-        import torch
-        if torch.cuda.is_available():
-            x_nx = x_nx.cuda()
+    # Use reference tensor to match device/type if provided (POT's type_as places
+    # the tensor directly on the reference's device -- unlike dtype, device never
+    # silently promotes, so combining a CPU tensor with a CUDA one raises instead).
+    # Otherwise set up PyTorch CUDA if backend is Torch and CUDA is available.
+    if reference is not None:
+        x_nx = nx.from_numpy(x, type_as=reference)
+    else:
+        x_nx = nx.from_numpy(x)
+        if nx.__class__.__name__ == 'TorchBackend':
+            import torch
+            if torch.cuda.is_available():
+                x_nx = x_nx.cuda()
 
     return x_nx
 
