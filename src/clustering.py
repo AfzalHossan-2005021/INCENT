@@ -1,6 +1,6 @@
 import numpy as np
 import scipy.sparse as sp
-from scipy.spatial import Delaunay, cKDTree
+from scipy.spatial import Delaunay
 from scipy.sparse.csgraph import connected_components
 from anndata import AnnData
 from sklearn.cluster import KMeans
@@ -66,71 +66,52 @@ def _split_into_contiguous_clusters(coords: np.ndarray, labels: np.ndarray) -> n
     return comp.astype(int)
 
 
-def _pca_canonical_coords(coords: np.ndarray):
+def _farthest_point_seeds(coords: np.ndarray, S: float) -> np.ndarray:
     """
-    Rotate coords into the tissue's PCA frame (PC1 along X-axis).
+    Deterministic farthest-point (greedy Poisson-disk) seeding.
 
-    Sign convention: each axis is oriented so that its 90th-percentile
-    projection is positive.  Using a high quantile rather than the mean
-    makes the sign stable even when a large minority of cells are on the
-    opposite side — a crop that removes up to ~40 % of the cells will
-    not flip the axis.
+    Seeds are chosen directly from cell positions: start at the cell nearest
+    the section centroid, then repeatedly add the cell farthest (Euclidean
+    distance) from every seed chosen so far, stopping once the farthest
+    remaining candidate is closer than ``S`` to an existing seed. The result
+    is a set of seeds at roughly uniform spacing ``S`` that follows the
+    tissue outline automatically -- holes and concave boundaries are
+    respected because seeds are only ever placed on real cell positions.
 
-    Returns:
-        canonical : (N, 2) coordinates in the PCA frame.
-        Vt        : (2, 2) rotation matrix (rows are the principal axes).
-        centroid  : (2,) mean of the original coords.
+    Unlike a grid, this procedure depends only on pairwise Euclidean
+    distances between cells and is therefore invariant to rotation and
+    translation of the input coordinates by construction. No coordinate-
+    frame canonicalization (PCA) and no sign-ambiguity resolution are
+    required, and the seed grid cannot land in a rotation-dependent phase
+    relative to the tissue.
+
+    Deterministic: initialization is the fixed nearest-centroid point, not a
+    random draw, and each subsequent choice is the unique running argmax of
+    a min-distance field (ties broken by lowest array index).
+
+    Complexity: O(k * n) for k retained seeds and n cells (each iteration
+    is one vectorized distance update over all cells); k is set by S via
+    the stopping rule and is of the same order as the previous grid-based
+    seed count for the same S.
     """
+    n = coords.shape[0]
+    if n == 0:
+        return np.empty((0, 2))
+
     centroid = coords.mean(axis=0)
-    centered = coords - centroid
-    _, _, Vt = np.linalg.svd(centered, full_matrices=False)
+    start = int(np.argmin(np.linalg.norm(coords - centroid, axis=1)))
 
-    for i in range(2):
-        if np.percentile(centered @ Vt[i], 90) < 0:
-            Vt[i] = -Vt[i]
+    seed_idx = [start]
+    d_min = np.linalg.norm(coords - coords[start], axis=1)
 
-    return centered @ Vt.T, Vt, centroid
+    while True:
+        cand = int(np.argmax(d_min))
+        if d_min[cand] < S or len(seed_idx) >= n:
+            break
+        seed_idx.append(cand)
+        d_min = np.minimum(d_min, np.linalg.norm(coords - coords[cand], axis=1))
 
-
-def _grid_seeds_canonical(coords: np.ndarray, S: float) -> np.ndarray:
-    """
-    Lay a regular grid of spacing ``S`` in the PCA-canonical frame of the
-    tissue, anchored at the tissue centroid (the PCA origin), and return
-    the seeds back in the original coordinate space.
-
-    Anchoring at the PCA origin rather than the bounding-box corner means
-    the grid is defined relative to the tissue's own geometry.  Two slices
-    of the same tissue — even after an arbitrary rotation, crop, or border
-    removal — produce seeds at the same intrinsic positions, so k-means
-    converges to the same compact clusters for the shared interior region.
-
-    Only seeds that have at least one cell within distance ``S`` are kept,
-    so the tessellation follows the true tissue outline (holes and concave
-    boundaries included).
-    """
-    canonical, Vt, centroid = _pca_canonical_coords(coords)
-
-    # Integer grid coordinates that span the tissue in canonical space.
-    c_min = canonical.min(axis=0)
-    c_max = canonical.max(axis=0)
-    k_lo = np.floor(c_min / S).astype(int) - 1
-    k_hi = np.ceil(c_max / S).astype(int) + 2
-
-    ks = np.arange(k_lo[0], k_hi[0])
-    ls = np.arange(k_lo[1], k_hi[1])
-    gk, gl = np.meshgrid(ks, ls)
-    seeds_can = np.column_stack([gk.ravel(), gl.ravel()]) * S  # (M, 2) in canonical frame
-
-    # Keep only seeds close enough to an actual cell.
-    tree = cKDTree(canonical)
-    d, _ = tree.query(seeds_can, k=1)
-    seeds_can = seeds_can[d <= S]
-
-    if seeds_can.shape[0] == 0:
-        seeds_can = canonical.mean(axis=0, keepdims=True)
-
-    # Map back to original coordinate space: x_orig = seeds_can @ Vt + centroid
-    return seeds_can @ Vt + centroid
+    return coords[seed_idx]
 
 
 def cluster_cells_spatial(
@@ -141,39 +122,34 @@ def cluster_cells_spatial(
 ) -> np.ndarray:
     """
     Partition cells into uniform, contiguous supercells (mesoregions) using a
-    PCA-canonical grid-seeded centroidal Voronoi tessellation.
+    farthest-point-seeded centroidal Voronoi tessellation.
 
-    Seeds are placed on a regular grid of spacing ``coarsen_length`` in the
-    tissue's PCA frame, anchored at the tissue centroid.  Because the grid is
-    defined relative to the tissue's own principal axes (not the global bounding
-    box), the same physical cell always receives the same seed neighbourhood
-    regardless of how the tissue was rotated, cropped, or had its border
-    trimmed.  Lloyd refinement (k-means) then yields compact, near-isotropic,
-    roughly equal-area supercells — the centroidal Voronoi property that the
-    original SLIC approach provided — while the PCA anchor ensures that interior
-    cells get the same cluster in a parent slice and any rotated/cropped child
-    derived from it.
+    Seeds are chosen by greedy farthest-point sampling at target spacing
+    ``coarsen_length`` (see ``_farthest_point_seeds``), directly on the
+    original cell coordinates. Because the seeding step uses only pairwise
+    Euclidean distances, the resulting partition is invariant to rotation
+    and translation of the input by construction -- no coordinate-frame
+    canonicalization is needed. Lloyd refinement (k-means) then yields
+    compact, near-isotropic, roughly equal-area supercells, exactly as in
+    the grid-seeded version.
 
-    Compared to the original bounding-box-anchored SLIC:
-    - Rotation-invariant  : seeds live in the tissue's PCA frame.
-    - Crop/border-invariant: grid anchored at tissue centroid, not bbox corner.
-    - Same cluster quality : k-means Lloyd iterations still give compact,
-      equal-area tiles; no degenerate 1-cell boundary clusters.
-
-    The labels are a dense ``0..C-1`` range (contiguity-enforced).
+    Labels are a dense ``0..C-1`` range (contiguity-enforced).
 
     Args:
         adata: AnnData object.
         spatial_key: Key in ``adata.obsm`` storing the (N, 2) coordinates.
-        coarsen_length: Physical seed spacing ``S``.  Use the same value for
-            both slices of a pair so the tessellations share one physical scale.
+        coarsen_length: Target seed spacing ``S``. Use the same value for
+            both slices of a pair so the tessellations share one physical
+            scale.
 
     Returns:
         Cluster labels from 0 to C-1.
 
     References:
-        Achanta et al., "SLIC Superpixels Compared to State-of-the-Art
-        Superpixel Methods", IEEE TPAMI 2012 (grid-seeded compact tessellation).
+        Achanta et al., IEEE TPAMI 2012 (compact tessellation via seeded
+        Lloyd refinement); farthest-point / Poisson-disk sampling is
+        standard practice for blue-noise seed placement in computational
+        geometry (e.g. Cook 1986; Lloyd 1982 for the refinement step).
     """
     coords = np.asarray(adata.obsm[spatial_key], dtype=np.float64)
     n_cells = coords.shape[0]
@@ -184,13 +160,13 @@ def cluster_cells_spatial(
     if not np.isfinite(S) or S <= 0:
         raise ValueError("coarsen_length must be a positive, finite length scale.")
 
-    # 1. Place seeds on the PCA-canonical grid restricted to the tissue footprint.
-    seeds = _grid_seeds_canonical(coords, S)
+    # 1. Place seeds directly on the tissue by greedy farthest-point sampling.
+    seeds = _farthest_point_seeds(coords, S)
     k = min(seeds.shape[0], n_cells)
     if k < 2:
         return np.zeros(n_cells, dtype=int)
 
-    # 2. Centroidal Voronoi tessellation via canonical-grid-initialized k-means.
+    # 2. Centroidal Voronoi tessellation via farthest-point-initialized k-means.
     kmeans = KMeans(n_clusters=k, init=seeds[:k], n_init=1, random_state=0)
     raw_labels = kmeans.fit_predict(coords)
 
