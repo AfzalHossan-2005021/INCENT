@@ -435,9 +435,9 @@ def simulate_adjacent_slice(
     scale_before_pca: bool = False,
     target_sum: float = 1e4,
     # --- 8. annotation noise & spurious (birth) cells (default off) ---
-    label_flip_rate: float = 0.0,        # fraction of labels reassigned to a different type
-    birth_rate: float = 0.0,             # spurious unmatched cells, as a fraction of survivors
-    birth_offset_scale: float = 2.0,     # birth scatter, in units of median NN distance
+    label_flip_rate: float = 0.10,        # fraction of labels reassigned to a different type
+    birth_rate: float = 0.10,             # spurious unmatched cells, as a fraction of survivors
+    birth_offset_scale: float = 2.0,      # birth scatter, in units of median NN distance
     # --- bookkeeping ---
     min_cells: int = 4,
     seed: Optional[int] = None,
