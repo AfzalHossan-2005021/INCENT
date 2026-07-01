@@ -87,6 +87,66 @@ def _default_fgw_tol(x, fallback=1e-9):
     return fallback       # float64 / double
 
 
+def _project_coupling_to_marginals(G, p, q, nx):
+    """
+    Round a nonnegative warm start onto the transport polytope with marginals ``p``, ``q``.
+
+    POT's conditional-gradient solver expects ``G0`` to be feasible for the same
+    transport polytope used by the linear minimization oracle, but an arbitrary warm
+    start (e.g. a soft lifted coupling) need not have row/column sums matching ``p``
+    and ``q``. This applies the exact single-pass rounding of Altschuler, Weed &
+    Rigollet (2017): scale rows down to at most ``p``, scale columns down to at most
+    ``q``, then patch the leftover mass with a rank-1 correction
+    ``outer(err_p, err_q) / |err_p|_1``. Because scaling only ever shrinks entries,
+    both row and column sums stay below their targets until the final patch, so the
+    correction term is guaranteed nonnegative and lands exactly on ``p`` and ``q`` --
+    in a single O(n*m) pass, with no iteration or tolerance, and no special-casing
+    needed for rows/columns that started out with zero mass.
+
+    All arithmetic runs through ``nx`` (the active POT backend), so a CUDA ``G``/``p``/
+    ``q`` stays on the GPU end to end instead of round-tripping through NumPy.
+    """
+    p = nx.reshape(p, (-1,))
+    q = nx.reshape(q, (-1,))
+
+    if G.shape != (p.shape[0], q.shape[0]):
+        raise ValueError(
+            f"G_init has shape {tuple(G.shape)}, expected {(p.shape[0], q.shape[0])} from marginals."
+        )
+
+    p = nx.maximum(nx.nan_to_num(p, nan=0.0, posinf=0.0, neginf=0.0), 0.0)
+    q = nx.maximum(nx.nan_to_num(q, nan=0.0, posinf=0.0, neginf=0.0), 0.0)
+    p_mass, q_mass = nx.sum(p), nx.sum(q)
+    if p_mass <= 0 or q_mass <= 0:
+        raise ValueError("Transport marginals must have positive total mass.")
+    p = p / p_mass
+    q = q / q_mass
+
+    G = nx.maximum(nx.nan_to_num(G, nan=0.0, posinf=0.0, neginf=0.0), 0.0)
+    G_mass = nx.sum(G)
+    if G_mass <= 0:
+        return p[:, None] * q[None, :]
+    G = G / G_mass
+
+    # ``+ (row_sum <= 0)`` keeps the divisor away from 0 without an explicit mask op;
+    # those rows are all-zero already, so the resulting scale factor is discarded.
+    row_sum = nx.sum(G, axis=1)
+    row_scale = nx.minimum(p / (row_sum + (1.0 - (row_sum > 0) * 1.0)), 1.0)
+    G = G * row_scale[:, None]
+
+    col_sum = nx.sum(G, axis=0)
+    col_scale = nx.minimum(q / (col_sum + (1.0 - (col_sum > 0) * 1.0)), 1.0)
+    G = G * col_scale[None, :]
+
+    err_p = p - nx.sum(G, axis=1)
+    err_q = q - nx.sum(G, axis=0)
+    err_mass = nx.sum(err_p)
+    if err_mass > 1e-14:
+        G = G + nx.outer(err_p, err_q) / err_mass
+
+    return G
+
+
 def fused_gromov_wasserstein_incent(M, C1, C2, p, q, G_init = None, alpha = 0.1, log=False, numItermax=10000, numItermaxEmd=100000, tol_rel=None, tol_abs=None, verbose=False, **kwargs):
     """
     Fused Gromov-Wasserstein optimal transport with an optional warm-start coupling.
@@ -119,8 +179,10 @@ def fused_gromov_wasserstein_incent(M, C1, C2, p, q, G_init = None, alpha = 0.1,
     q : array-like, shape (m,)
         Target marginal (mass) distribution.
     G_init : array-like, shape (n, m), optional
-        Initial coupling for the conditional gradient. It is mass-normalized and used
-        as the starting point ``G0``; ``None`` uses the outer product ``p (x) q``.
+        Initial coupling for the conditional gradient. It is rounded onto the
+        transport polytope with marginals ``p`` and ``q`` (exact single-pass
+        projection, see :func:`_project_coupling_to_marginals`) and used as the
+        starting point ``G0``; ``None`` uses the outer product ``p (x) q``.
     alpha : float, default 0.1
         Trade-off in ``[0, 1]``: weight ``alpha`` on the GW structural term and
         ``1 - alpha`` on the linear feature term.
@@ -164,9 +226,13 @@ def fused_gromov_wasserstein_incent(M, C1, C2, p, q, G_init = None, alpha = 0.1,
 
     if G_init is None:
         G0 = p[:, None] * q[None, :]
+        G0 = to_backend(G0, nx)
     else:
-        G0 = (1/nx.sum(G_init)) * G_init
-    G0 = to_backend(G0, nx)
+        # Move onto nx's backend/device first so the O(n*m) rounding below runs
+        # there too (GPU-resident when nx is TorchBackend+CUDA), instead of forcing
+        # it through NumPy.
+        G_init = to_backend(G_init, nx, reference=M)
+        G0 = _project_coupling_to_marginals(G_init, p, q, nx)
 
     # ── Normalize structural matrices to [0, 1] ──────────────────────────
     scale = max(nx.max(C1), nx.max(C2)) + 1e-9
