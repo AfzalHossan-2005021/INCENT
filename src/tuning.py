@@ -19,11 +19,6 @@ Three entry points:
   cell-type label. Requires ``cell_type_annot`` in both slices' ``.obs``; no
   ``sim.uns`` ground-truth provenance is needed.  Supports multi-GPU and ``n_jobs``.
 
-* :func:`select_weights_unsupervised` -- the **deployment-time** selector for real
-  slice pairs with no ground truth; staged grid scored by label-free **spatial
-  coherence** (= GPR@k). The benchmark validates that this optimum tracks the
-  development-time 1 − FOSCTTM optimum.
-
 GPU: every alignment uses CUDA automatically when available (``use_gpu=gpu_available()``).
 """
 
@@ -39,7 +34,7 @@ import numpy as np
 
 from .core import hierarchical_pairwise_align
 from .perturb import simulate_adjacent_slice
-from .evaluation import evaluate_alignment, geometric_preservation_rate
+from .evaluation import evaluate_alignment
 
 
 DEFAULT_INIT = {"alpha": 0.5, "beta": 0.5, "gamma": 0.25, "alpha_cluster": 0.5, "delta": 0.75}
@@ -359,17 +354,14 @@ def select_alignment_weights(
     choice because:
       * **Fully non-circular** — FOSCTTM has zero overlap with INCENT's objective
         components (α expression, β cell-type, γ neighbourhood, α_cluster, δ).
-        In contrast, GPR correlates with the γ neighbourhood term and LTA correlates
-        with the β cell-type term; both could bias weight selection toward their
-        respective objective component.
+        In contrast, LTA correlates with the β cell-type term, which could bias
+        weight selection toward that objective component.
       * **Exact ground truth** — ``select_alignment_weights`` always creates synthetic
         instances via ``simulate_adjacent_slice``, so FOSCTTM correspondences are
         always available and ``neg_foscttm`` is never None here.
       * **Consistent with the reported metric** — the paper reports FOSCTTM on
         held-out instances; selecting by ``neg_foscttm`` on training instances is the
         most coherent methodology for reviewer scrutiny.
-      ``'gpr'`` is a valid alternative when ground truth is uncertain or when you
-      need a result that is also interpretable in the deployment (no-ground-truth) setting.
 
     GPU is used automatically when CUDA is available.
 
@@ -386,7 +378,6 @@ def select_alignment_weights(
     align_kwargs.setdefault("verbose", False)
     align_kwargs.setdefault("visualize_clusters", False)
     label_key = align_kwargs.get("label_key", "cell_type_annot")
-    spatial_key = align_kwargs.get("spatial_key", "spatial")
 
     instances = make_self_alignment_instances(
         section=section, reference=reference, crops=crops,
@@ -402,7 +393,7 @@ def select_alignment_weights(
                 vals.append(0.0)
                 continue
             mets = evaluate_alignment(
-                pi, sim, ref, sim_axis=0, label_key=label_key, spatial_key=spatial_key,
+                pi, sim, ref, sim_axis=0, label_key=label_key,
             )
             v = mets.get(objective_key, 0.0)
             vals.append(0.0 if v is None or not np.isfinite(v) else float(v))
@@ -432,8 +423,7 @@ def select_alignment_weights(
         pi = _align_score(sim, ref, best, align_kwargs, quiet)
         if pi is not None:
             per_instance.append(
-                evaluate_alignment(pi, sim, ref, sim_axis=0,
-                                   label_key=label_key, spatial_key=spatial_key)
+                evaluate_alignment(pi, sim, ref, sim_axis=0, label_key=label_key)
             )
 
     return {
@@ -493,8 +483,7 @@ def select_weights_real_pairs(
     objective_key : str or callable
         Either a string key from :func:`evaluation.evaluate_alignment` or a
         callable ``(metrics_dict) -> float`` for combined objectives.
-        String examples: ``"lta"`` (default), ``"gpr"``.
-        Callable example: ``lambda m: 0.5 * (m["lta"] or 0) + 0.5 * (m["gpr"] or 0)``.
+        String example: ``"lta"`` (default).
         ``"neg_foscttm"`` will be ``None`` for real pairs and must not be used here.
     method : str
         ``"grid"`` (default) or ``"bayesopt"``.
@@ -511,7 +500,7 @@ def select_weights_real_pairs(
     align_kwargs : dict or None
         Extra kwargs forwarded to :func:`core.hierarchical_pairwise_align`.
     sim_axis : int
-        Which slice acts as the LTA / GPR source.
+        Which slice acts as the LTA source.
         ``0`` = sliceA is the source (default; use when sliceA is the section).
         ``1`` = sliceB is the source.
     refine : bool
@@ -545,7 +534,6 @@ def select_weights_real_pairs(
     align_kwargs.setdefault("verbose", False)
     align_kwargs.setdefault("visualize_clusters", False)
     label_key = align_kwargs.get("label_key", "cell_type_annot")
-    spatial_key = align_kwargs.get("spatial_key", "spatial")
 
     def score_fn(weights):
         vals = []
@@ -558,7 +546,6 @@ def select_weights_real_pairs(
                 pi, sliceA, sliceB,
                 sim_axis=sim_axis,
                 label_key=label_key,
-                spatial_key=spatial_key,
             )
             if callable(objective_key):
                 v = objective_key(mets)
@@ -596,7 +583,6 @@ def select_weights_real_pairs(
                     pi, sliceA, sliceB,
                     sim_axis=sim_axis,
                     label_key=label_key,
-                    spatial_key=spatial_key,
                 )
             )
 
@@ -610,56 +596,3 @@ def select_weights_real_pairs(
         "n_pairs": len(pairs),
     }
 
-
-# ----------------------------------------------------------------------------
-# deployment-time selector  (label-free spatial coherence; no ground truth)
-# ----------------------------------------------------------------------------
-
-def select_weights_unsupervised(
-    sliceA,
-    sliceB,
-    *,
-    alpha_grid=(0.1, 0.3, 0.5, 0.7, 0.9),
-    alpha_cluster_grid=(0.1, 0.3, 0.5, 0.7, 0.9),
-    simplex_step: float = 0.25,
-    delta_grid=(0.0, 0.25, 0.5, 0.75, 1.0),
-    init: Optional[dict] = None,
-    align_kwargs: Optional[dict] = None,
-    k_coherence: int = 15,
-    refine: bool = True,
-    quiet: bool = True,
-) -> dict:
-    """
-    Select weights for a real (sliceA, sliceB) pair WITHOUT ground truth, by
-    maximizing the label-free spatial coherence of the mapping. Same staged search
-    as :func:`select_alignment_weights`. (The benchmark validates that this
-    optimum agrees with the registration-optimal weights.)
-    """
-    init = dict(init or DEFAULT_INIT)
-    align_kwargs = dict(align_kwargs or {})
-    align_kwargs.setdefault("use_gpu", gpu_available())
-    align_kwargs.setdefault("gpu_verbose", False)
-    align_kwargs.setdefault("verbose", False)
-    align_kwargs.setdefault("visualize_clusters", False)
-    spatial_key = align_kwargs.get("spatial_key", "spatial")
-
-    coordsA = np.asarray(sliceA.obsm[spatial_key], dtype=np.float64)[:, :2]
-    coordsB = np.asarray(sliceB.obsm[spatial_key], dtype=np.float64)[:, :2]
-
-    def score_fn(weights):
-        pi = _align_score(sliceA, sliceB, weights, align_kwargs, quiet)
-        if pi is None:
-            return 0.0
-        c = geometric_preservation_rate(pi, coordsA, coordsB, k_values=(k_coherence,))["gpr"]
-        return 0.0 if c is None or not np.isfinite(c) else float(c)
-
-    best, best_score, landscape = _staged_search(
-        score_fn, init=init, alpha_grid=alpha_grid, alpha_cluster_grid=alpha_cluster_grid,
-        simplex_step=simplex_step, delta_grid=delta_grid, refine=refine,
-    )
-    return {
-        "best": best,
-        "best_score": best_score,
-        "objective_key": "gpr",
-        "landscape": landscape,
-    }

@@ -20,7 +20,6 @@ import pytest
 from src.evaluation import (
     label_transfer_accuracy,
     foscttm,
-    geometric_preservation_rate,
     expression_transfer_corr,
     calculate_neighborhood_dissimilarity_cost,
     calculate_gene_expression_dissimilarity,
@@ -171,87 +170,6 @@ class TestFoscttm:
         r_perfect = foscttm(perfect_pi.T, gt_indices)
         r_uniform = foscttm(uniform_pi.T, gt_indices)
         assert r_perfect["foscttm"] < r_uniform["foscttm"]
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# 3.  geometric_preservation_rate
-# ══════════════════════════════════════════════════════════════════════════════
-
-class TestGeometricPreservationRate:
-
-    def _make_grid_coords(self, n):
-        """Return n points on a regular 1D grid → known neighbors."""
-        return np.column_stack([np.arange(n, dtype=float), np.zeros(n)])
-
-    def test_identity_plan_high_gpr(self):
-        """
-        Identity coupling (no /n): each source cell maps entirely to its exact
-        counterpart → proj[i] = coords[i] exactly → GPR = 1.0.
-        Note: dividing by n introduces float drift (x/n / (1/n) ≠ x exactly);
-        using eye(n) with row_sums=1 avoids that.
-        """
-        n = 20
-        coords = self._make_grid_coords(n)
-        pi = np.eye(n, dtype=np.float64)   # row_sums = 1.0 exactly
-        result = geometric_preservation_rate(pi, coords, coords, k_values=(3, 5))
-        assert result["gpr"] == pytest.approx(1.0, abs=1e-10)
-
-    def test_uniform_plan_low_gpr(self):
-        """
-        Uniform coupling: projected position = centroid of all target coords;
-        all cells project to the same point → neighborhood structure destroyed → GPR near 0.
-        """
-        n = 30
-        rng = np.random.default_rng(0)
-        coords_A = rng.random((n, 2)) * 100.0
-        coords_B = rng.random((n, 2)) * 100.0
-        pi = _uniform_pi(n, n)
-        result = geometric_preservation_rate(pi, coords_A, coords_B, k_values=(5,))
-        assert result["gpr"] < 0.5
-
-    def test_returns_expected_keys(self):
-        n = 10
-        coords = self._make_grid_coords(n)
-        pi = np.eye(n) / n
-        result = geometric_preservation_rate(pi, coords, coords, k_values=(3,))
-        assert "gpr" in result
-        assert "gpr_per_k" in result
-        assert 3 in result["gpr_per_k"]
-
-    def test_gpr_is_mean_of_per_k(self):
-        n = 15
-        coords = self._make_grid_coords(n)
-        pi = np.eye(n) / n
-        k_values = (3, 5, 7)
-        result = geometric_preservation_rate(pi, coords, coords, k_values=k_values)
-        expected = float(np.mean([result["gpr_per_k"][k] for k in k_values]))
-        assert result["gpr"] == pytest.approx(expected, abs=1e-10)
-
-    def test_gpr_range(self):
-        n = 20
-        coords_A = np.random.default_rng(1).random((n, 2))
-        coords_B = np.random.default_rng(2).random((n, 2))
-        pi = _uniform_pi(n, n)
-        result = geometric_preservation_rate(pi, coords_A, coords_B, k_values=(5,))
-        assert 0.0 <= result["gpr"] <= 1.0
-
-    def test_gpr_per_k_values_in_range(self):
-        n = 20
-        coords = self._make_grid_coords(n)
-        pi = np.eye(n) / n
-        result = geometric_preservation_rate(pi, coords, coords, k_values=(3, 5, 10))
-        for k, v in result["gpr_per_k"].items():
-            assert 0.0 <= v <= 1.0, f"GPR@{k}={v} out of [0,1]"
-
-    def test_zero_row_handled(self):
-        """A row with zero mass should not crash; projection uses coords_B centroid."""
-        n = 10
-        coords = self._make_grid_coords(n)
-        pi = np.eye(n) / n
-        pi[0] = 0.0   # first row has zero mass
-        result = geometric_preservation_rate(pi, coords, coords, k_values=(3,))
-        assert "gpr" in result
-        assert np.isfinite(result["gpr"])
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -456,26 +374,26 @@ class TestEvaluateAlignment:
     def test_perfect_pi_returns_all_keys(self, perfect_pi, slice_sim, slice_ref, gt_indices):
         out = evaluate_alignment(
             perfect_pi, slice_sim, slice_ref,
-            sim_axis=0, gpr_k_values=(3, 5),
+            sim_axis=0,
         )
         required = {"lta", "lta_detail", "foscttm", "foscttm_A_to_B",
-                    "foscttm_B_to_A", "neg_foscttm", "gpr", "gpr_per_k", "expr_corr"}
+                    "foscttm_B_to_A", "neg_foscttm", "expr_corr"}
         assert required.issubset(out.keys()), f"Missing keys: {required - out.keys()}"
 
     def test_perfect_pi_lta_is_one(self, perfect_pi, slice_sim, slice_ref):
-        out = evaluate_alignment(perfect_pi, slice_sim, slice_ref, sim_axis=0, gpr_k_values=(3,))
+        out = evaluate_alignment(perfect_pi, slice_sim, slice_ref, sim_axis=0)
         assert out["lta"] == pytest.approx(1.0)
 
     def test_perfect_pi_foscttm_near_zero(self, perfect_pi, slice_sim, slice_ref):
-        out = evaluate_alignment(perfect_pi, slice_sim, slice_ref, sim_axis=0, gpr_k_values=(3,))
+        out = evaluate_alignment(perfect_pi, slice_sim, slice_ref, sim_axis=0)
         assert out["foscttm"] == pytest.approx(0.0, abs=1e-10)
 
     def test_perfect_pi_neg_foscttm_near_one(self, perfect_pi, slice_sim, slice_ref):
-        out = evaluate_alignment(perfect_pi, slice_sim, slice_ref, sim_axis=0, gpr_k_values=(3,))
+        out = evaluate_alignment(perfect_pi, slice_sim, slice_ref, sim_axis=0)
         assert out["neg_foscttm"] == pytest.approx(1.0, abs=1e-10)
 
     def test_neg_foscttm_equals_one_minus_foscttm(self, uniform_pi, slice_sim, slice_ref):
-        out = evaluate_alignment(uniform_pi, slice_sim, slice_ref, sim_axis=0, gpr_k_values=(3,))
+        out = evaluate_alignment(uniform_pi, slice_sim, slice_ref, sim_axis=0)
         if out["foscttm"] is not None:
             assert out["neg_foscttm"] == pytest.approx(1.0 - out["foscttm"], abs=1e-12)
 
@@ -487,7 +405,7 @@ class TestEvaluateAlignment:
         sim_no_gt.obs["cell_type_annot"] = ["A"] * N_SIM
         out = evaluate_alignment(
             uniform_pi, sim_no_gt, slice_ref,
-            sim_axis=0, gpr_k_values=(3,), include_expression=False,
+            sim_axis=0, include_expression=False,
         )
         assert out["foscttm"] is None
         assert out["neg_foscttm"] is None
@@ -498,23 +416,22 @@ class TestEvaluateAlignment:
         (shape n_ref × n_sim = 30×20) as sliceB=sim, sliceA=ref.
         evaluate_alignment internally transposes it back → same result.
         """
-        out0 = evaluate_alignment(perfect_pi, slice_sim, slice_ref, sim_axis=0, gpr_k_values=(3,))
-        out1 = evaluate_alignment(perfect_pi.T, slice_ref, slice_sim, sim_axis=1, gpr_k_values=(3,))
+        out0 = evaluate_alignment(perfect_pi, slice_sim, slice_ref, sim_axis=0)
+        out1 = evaluate_alignment(perfect_pi.T, slice_ref, slice_sim, sim_axis=1)
         assert out0["lta"] == pytest.approx(out1["lta"], abs=1e-10)
 
     def test_include_expression_false_omits_expr_corr(self, uniform_pi, slice_sim, slice_ref):
         out = evaluate_alignment(
             uniform_pi, slice_sim, slice_ref, sim_axis=0,
-            gpr_k_values=(3,), include_expression=False,
+            include_expression=False,
         )
         assert "expr_corr" not in out
 
     def test_uniform_pi_metrics_in_range(self, uniform_pi, slice_sim, slice_ref):
-        out = evaluate_alignment(uniform_pi, slice_sim, slice_ref, sim_axis=0, gpr_k_values=(5,))
+        out = evaluate_alignment(uniform_pi, slice_sim, slice_ref, sim_axis=0)
         assert 0.0 <= out["lta"] <= 1.0
         if out["foscttm"] is not None:
             assert 0.0 <= out["foscttm"] <= 1.0
-        assert 0.0 <= out["gpr"] <= 1.0
 
     def test_explicit_gt_override(self, perfect_pi, slice_sim, slice_ref, gt_indices):
         """Pass gt_src_indices explicitly; FOSCTTM must still be computed."""
@@ -524,7 +441,7 @@ class TestEvaluateAlignment:
         sim_no_uns.uns = {}
         out = evaluate_alignment(
             perfect_pi, sim_no_uns, slice_ref, sim_axis=0,
-            gpr_k_values=(3,), gt_src_indices=gt_indices,
+            gt_src_indices=gt_indices,
         )
         assert out["foscttm"] is not None
         assert out["foscttm"] == pytest.approx(0.0, abs=1e-10)
@@ -537,23 +454,18 @@ class TestEvaluateAlignment:
 class TestMetricConsistency:
 
     def test_perfect_beats_uniform_on_lta(self, perfect_pi, uniform_pi, slice_sim, slice_ref):
-        o_p = evaluate_alignment(perfect_pi, slice_sim, slice_ref, sim_axis=0, gpr_k_values=(5,))
-        o_u = evaluate_alignment(uniform_pi, slice_sim, slice_ref, sim_axis=0, gpr_k_values=(5,))
+        o_p = evaluate_alignment(perfect_pi, slice_sim, slice_ref, sim_axis=0)
+        o_u = evaluate_alignment(uniform_pi, slice_sim, slice_ref, sim_axis=0)
         assert o_p["lta"] >= o_u["lta"]
 
     def test_perfect_beats_uniform_on_foscttm(self, perfect_pi, uniform_pi, slice_sim, slice_ref):
-        o_p = evaluate_alignment(perfect_pi, slice_sim, slice_ref, sim_axis=0, gpr_k_values=(5,))
-        o_u = evaluate_alignment(uniform_pi, slice_sim, slice_ref, sim_axis=0, gpr_k_values=(5,))
+        o_p = evaluate_alignment(perfect_pi, slice_sim, slice_ref, sim_axis=0)
+        o_u = evaluate_alignment(uniform_pi, slice_sim, slice_ref, sim_axis=0)
         assert o_p["foscttm"] <= o_u["foscttm"]
-
-    def test_perfect_beats_uniform_on_gpr(self, perfect_pi, uniform_pi, slice_sim, slice_ref):
-        o_p = evaluate_alignment(perfect_pi, slice_sim, slice_ref, sim_axis=0, gpr_k_values=(5,))
-        o_u = evaluate_alignment(uniform_pi, slice_sim, slice_ref, sim_axis=0, gpr_k_values=(5,))
-        assert o_p["gpr"] >= o_u["gpr"]
 
     def test_neg_foscttm_ordering_matches_foscttm(self, perfect_pi, uniform_pi,
                                                     slice_sim, slice_ref):
-        o_p = evaluate_alignment(perfect_pi, slice_sim, slice_ref, sim_axis=0, gpr_k_values=(5,))
-        o_u = evaluate_alignment(uniform_pi, slice_sim, slice_ref, sim_axis=0, gpr_k_values=(5,))
+        o_p = evaluate_alignment(perfect_pi, slice_sim, slice_ref, sim_axis=0)
+        o_u = evaluate_alignment(uniform_pi, slice_sim, slice_ref, sim_axis=0)
         # neg_foscttm higher is better; perfect should be higher
         assert o_p["neg_foscttm"] >= o_u["neg_foscttm"]

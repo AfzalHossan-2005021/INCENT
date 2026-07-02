@@ -9,8 +9,6 @@ PRIMARY  (objective-independent; use in the main benchmark table):
     lta            Label Transfer Accuracy — hard argmax prediction accuracy.
     foscttm        Fraction Of Samples Closer Than True Match (Demetci et al., 2022).
                    Auto-extracted from the simulated slice's .uns when available.
-    gpr            Geometric Preservation Rate (barycentric projection + kNN).
-    gpr_per_k      GPR broken down per neighbourhood size k.
 
 EXPRESSION PROXY  (label-free; soft expression-consistency check):
     expr_corr      Mean per-gene Pearson correlation, predicted vs measured.
@@ -28,7 +26,7 @@ Orientation convention
 pi has shape (n_sliceA, n_sliceB) as returned by hierarchical_pairwise_align(A, B).
 In evaluate_alignment, sim_axis controls which slice is the simulated one
 (0 = sliceA is sim, 1 = sliceB is sim); pi is internally oriented to (n_sim, n_parent)
-before computing LTA, GPR, and expression correlation.  FOSCTTM receives the transposed
+before computing LTA and expression correlation.  FOSCTTM receives the transposed
 plan (n_parent, n_sim) as the metric requires.
 
 In calculate_performance_metrics the convention is sliceA = reference/parent (rows),
@@ -48,12 +46,11 @@ from __future__ import annotations
 
 import time
 import tracemalloc
-from typing import Callable, Dict, Optional, Sequence, Tuple
+from typing import Callable, Dict, Optional, Tuple
 
 import numpy as np
 import scipy.sparse as sp
 import torch
-from sklearn.neighbors import NearestNeighbors
 
 from .core import (
     calculate_cell_type_mismatch,
@@ -80,10 +77,6 @@ def _extract_gt_indices(slc) -> Optional[np.ndarray]:
         )
     except (KeyError, TypeError):
         return None
-
-
-def _extract_coords(slc, spatial_key: str = "spatial") -> np.ndarray:
-    return np.asarray(slc.obsm[spatial_key], dtype=np.float64)[:, :2]
 
 
 def _relative_improvement(initial: float, final: float) -> float:
@@ -113,10 +106,6 @@ def _print_metrics(results: Dict, W: int = 82) -> None:
         print(_row("FOSCTTM (symmetric mean)", results.get("foscttm"), "↓"))
         print(_row("  FOSCTTM  A→B", results.get("foscttm_A_to_B"), "↓"))
         print(_row("  FOSCTTM  B→A", results.get("foscttm_B_to_A"), "↓"))
-    print(_row("Geometric Preservation Rate (GPR)", results.get("gpr"), "↑"))
-    if results.get("gpr_per_k") is not None:
-        for k, v in sorted(results["gpr_per_k"].items()):
-            print(_row(f"  GPR@{k}", v, "↑"))
     if results.get("expr_corr") is not None:
         print(_row("Expression Transfer Correlation", results.get("expr_corr"), "↑"))
 
@@ -286,72 +275,6 @@ def foscttm(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# PRIMARY METRIC 3 — Geometric Preservation Rate
-# ─────────────────────────────────────────────────────────────────────────────
-
-def geometric_preservation_rate(
-    pi: np.ndarray,
-    coords_A: np.ndarray,
-    coords_B: np.ndarray,
-    k_values: Sequence[int] = (5, 10, 15),
-) -> Dict:
-    """
-    Geometric Preservation Rate (GPR).
-
-    For each source cell i:
-      1. Barycentric projection: p_i = Σ_j Pi[i,j] · coords_B[j] / Σ_j Pi[i,j]
-      2. kNN of i in source space: N_k^src(i).
-      3. kNN of p_i among {p_j}: N_k^proj(i).
-      4. GPR@k(i) = |N_k^src(i) ∩ N_k^proj(i)| / k.
-
-    GPR = mean over all cells and k values.  Higher is better; 1.0 = perfect geometry
-    preservation.  Penalises diffuse mappings that scatter local neighbourhoods.
-
-    Parameters
-    ----------
-    pi : ndarray, shape (n_A, n_B)
-        Transport plan; rows = source (sim), columns = target (reference).
-    coords_A : ndarray, shape (n_A, 2)  — source spatial coordinates.
-    coords_B : ndarray, shape (n_B, 2)  — target spatial coordinates.
-    k_values : sequence of int
-        Neighbourhood sizes.  Default (5, 10, 15) spans local to meso-scale.
-
-    Returns
-    -------
-    dict : 'gpr' (mean over k_values, higher is better), 'gpr_per_k' {k: float}.
-    """
-    pi = np.asarray(pi, dtype=np.float64)
-    coords_A = np.asarray(coords_A, dtype=np.float64)[:, :2]
-    coords_B = np.asarray(coords_B, dtype=np.float64)[:, :2]
-    n_A = pi.shape[0]
-
-    row_sums = pi.sum(axis=1, keepdims=True)
-    row_sums = np.where(row_sums > 0.0, row_sums, 1.0)
-    proj = (pi @ coords_B) / row_sums                  # (n_A, 2)
-
-    k_max = max(k_values) + 1
-    nn_src = NearestNeighbors(n_neighbors=k_max, algorithm="ball_tree", n_jobs=-1)
-    nn_src.fit(coords_A)
-    src_neighbors = nn_src.kneighbors(coords_A, return_distance=False)[:, 1:]  # exclude self
-
-    nn_proj = NearestNeighbors(n_neighbors=k_max, algorithm="ball_tree", n_jobs=-1)
-    nn_proj.fit(proj)
-    proj_neighbors = nn_proj.kneighbors(proj, return_distance=False)[:, 1:]
-
-    gpr_per_k: Dict[int, float] = {}
-    for k in k_values:
-        src_k = src_neighbors[:, :k]
-        proj_k = proj_neighbors[:, :k]
-        scores = np.array([
-            len(np.intersect1d(src_k[i], proj_k[i])) / k
-            for i in range(n_A)
-        ], dtype=np.float64)
-        gpr_per_k[k] = float(scores.mean())
-
-    return {"gpr": float(np.mean(list(gpr_per_k.values()))), "gpr_per_k": gpr_per_k}
-
-
-# ─────────────────────────────────────────────────────────────────────────────
 # EXPRESSION PROXY
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -468,10 +391,8 @@ def evaluate_alignment(
     sliceA,
     sliceB,
     *,
-    spatial_key: str = "spatial",
     label_key: str = "cell_type_annot",
     sim_axis: int = 0,
-    gpr_k_values: Sequence[int] = (5, 10, 15),
     mass_threshold: float = 0.0,
     gt_src_indices: Optional[np.ndarray] = None,
     include_expression: bool = True,
@@ -482,7 +403,7 @@ def evaluate_alignment(
 
     pi has shape (n_A, n_B) as returned by hierarchical_pairwise_align(sliceA, sliceB).
     sim_axis indicates which slice is the simulated one (0 = sliceA, 1 = sliceB); pi
-    is internally oriented to rows=sim, cols=reference before LTA, GPR, and expression.
+    is internally oriented to rows=sim, cols=reference before LTA and expression.
     FOSCTTM receives the transposed plan (n_ref, n_sim).
 
     FOSCTTM ground-truth indices are auto-extracted from the simulated slice's .uns
@@ -492,10 +413,8 @@ def evaluate_alignment(
     ----------
     pi : ndarray, shape (n_A, n_B)
     sliceA, sliceB : AnnData
-    spatial_key : str   — obsm key for spatial coordinates.
     label_key : str     — obs column for cell-type labels (also tries label_key + '_clean').
     sim_axis : int      — 0 if sliceA is the simulated slice, 1 if sliceB is.
-    gpr_k_values : sequence of int — neighbourhood sizes for GPR.
     mass_threshold : float — LTA: skip source cells below this fraction of mean mass.
     gt_src_indices : array or None — override auto-extracted FOSCTTM ground truth.
     include_expression : bool — whether to compute expression_transfer_corr.
@@ -508,7 +427,6 @@ def evaluate_alignment(
         foscttm, foscttm_A_to_B, foscttm_B_to_A   FOSCTTM (None if no gt available).
         neg_foscttm                                 1 − foscttm; higher is better; used as
                                                     the weight-selection objective.
-        gpr, gpr_per_k                              Geometric Preservation Rate.
         expr_corr                                   Expression correlation (if requested).
     """
     pi = np.asarray(pi, dtype=np.float64)
@@ -558,13 +476,6 @@ def evaluate_alignment(
         out["foscttm_B_to_A"] = None
         out["neg_foscttm"] = None
 
-    # ── GPR ──────────────────────────────────────────────────────────────────
-    coords_sim = _extract_coords(sim_slice, spatial_key)
-    coords_par = _extract_coords(par_slice, spatial_key)
-    gpr_result = geometric_preservation_rate(
-        pi_oriented, coords_sim, coords_par, k_values=gpr_k_values)
-    out.update(gpr_result)
-
     # ── Expression transfer correlation ───────────────────────────────────────
     if include_expression:
         ec = expression_transfer_corr(pi_oriented, sim_slice.X, par_slice.X)
@@ -588,10 +499,8 @@ def calculate_performance_metrics(
     use_rep: Optional[str] = None,
     radius: float = 100.0,
     use_gpu: bool = True,
-    gpr_k_values: Sequence[int] = (5, 10, 15),
     mass_threshold: float = 0.0,
     gt_src_indices: Optional[np.ndarray] = None,
-    spatial_key: str = "spatial",
     foscttm_chunk_size: int = 512,
 ) -> Dict:
     """
@@ -604,7 +513,6 @@ def calculate_performance_metrics(
     PRIMARY metrics (objective-independent, main benchmark table):
         'lta', 'lta_detail'
         'foscttm', 'foscttm_A_to_B', 'foscttm_B_to_A'  (None if no gt available)
-        'gpr', 'gpr_per_k'
 
     SUPPLEMENTARY metrics (biased; components of INCENT's objective):
         'initial_obj_neighbor', 'final_obj_neighbor'
@@ -622,10 +530,8 @@ def calculate_performance_metrics(
     use_rep : str or None — obsm key for gene-expression features.
     radius : float — neighbourhood radius for JSD computation.
     use_gpu : bool
-    gpr_k_values : sequence of int
     mass_threshold : float — LTA mass threshold.
     gt_src_indices : array or None — override auto-extracted FOSCTTM ground truth.
-    spatial_key : str
     foscttm_chunk_size : int
     """
     final_pi = np.asarray(final_pi, dtype=np.float64)
@@ -691,18 +597,6 @@ def calculate_performance_metrics(
         results["foscttm"] = None
         results["foscttm_A_to_B"] = None
         results["foscttm_B_to_A"] = None
-
-    # ── PRIMARY: GPR ──────────────────────────────────────────────────────────
-    if sliceA is not None and sliceB is not None:
-        results.update(geometric_preservation_rate(
-            final_pi,
-            _extract_coords(sliceA, spatial_key),
-            _extract_coords(sliceB, spatial_key),
-            k_values=gpr_k_values,
-        ))
-    else:
-        results["gpr"] = None
-        results["gpr_per_k"] = None
 
     # ── SUPPLEMENTARY ─────────────────────────────────────────────────────────
     results["initial_obj_neighbor"] = calculate_neighborhood_dissimilarity_cost(

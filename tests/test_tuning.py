@@ -1,8 +1,7 @@
 """
 Tests for src/tuning.py
 ========================
-Tests for the helper functions (simplex_grid, gpu_available, _staged_search)
-and the unsupervised selector (select_weights_unsupervised).
+Tests for the helper functions (simplex_grid, gpu_available, _staged_search).
 
 select_alignment_weights is NOT tested here because it runs real OT alignment
 (too expensive for a unit-test suite); it is covered at integration level by
@@ -21,7 +20,6 @@ from src.tuning import (
     WEIGHT_KEYS,
     _staged_search,
     make_self_alignment_instances,
-    select_weights_unsupervised,
 )
 from tests.conftest import N_REF, N_SIM, _make_adata
 
@@ -281,93 +279,3 @@ class TestMakeSelfAlignmentInstances:
     def test_raises_without_inputs(self):
         with pytest.raises(ValueError):
             make_self_alignment_instances()
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# 6.  select_weights_unsupervised  (monkey-patched aligner to avoid OT cost)
-# ══════════════════════════════════════════════════════════════════════════════
-
-class TestSelectWeightsUnsupervised:
-    """
-    Replace hierarchical_pairwise_align with a stub that returns a uniform pi
-    so the test runs in milliseconds.
-    """
-
-    @pytest.fixture(autouse=True)
-    def patch_aligner(self, monkeypatch):
-        import src.tuning as tuning_mod
-
-        def _stub_aligner(sliceA, sliceB, **kwargs):
-            nA, nB = sliceA.n_obs, sliceB.n_obs
-            return np.full((nA, nB), 1.0 / (nA * nB), dtype=np.float64)
-
-        monkeypatch.setattr(tuning_mod, "hierarchical_pairwise_align", _stub_aligner)
-
-    def test_returns_expected_keys(self):
-        sliceA = _make_adata(20, 8, seed=30)
-        sliceB = _make_adata(20, 8, seed=31)
-        result = select_weights_unsupervised(
-            sliceA, sliceB,
-            alpha_grid=(0.3, 0.7),
-            alpha_cluster_grid=(0.3, 0.7),
-            simplex_step=1.0,
-            delta_grid=(0.0, 1.0),
-            refine=False,
-        )
-        assert set(result.keys()) == {"best", "best_score", "objective_key", "landscape"}
-
-    def test_objective_key_is_gpr(self):
-        sliceA = _make_adata(20, 8, seed=32)
-        sliceB = _make_adata(20, 8, seed=33)
-        result = select_weights_unsupervised(
-            sliceA, sliceB,
-            alpha_grid=(0.5,),
-            alpha_cluster_grid=(0.5,),
-            simplex_step=1.0,
-            delta_grid=(0.5,),
-            refine=False,
-        )
-        assert result["objective_key"] == "gpr"
-
-    def test_best_weights_have_all_keys(self):
-        sliceA = _make_adata(20, 8, seed=34)
-        sliceB = _make_adata(20, 8, seed=35)
-        result = select_weights_unsupervised(
-            sliceA, sliceB,
-            alpha_grid=(0.5,),
-            alpha_cluster_grid=(0.5,),
-            simplex_step=1.0,
-            delta_grid=(0.5,),
-            refine=False,
-        )
-        assert set(result["best"].keys()) == set(WEIGHT_KEYS)
-
-    def test_best_score_is_finite_float(self):
-        sliceA = _make_adata(20, 8, seed=36)
-        sliceB = _make_adata(20, 8, seed=37)
-        result = select_weights_unsupervised(
-            sliceA, sliceB,
-            alpha_grid=(0.5,),
-            alpha_cluster_grid=(0.5,),
-            simplex_step=1.0,
-            delta_grid=(0.5,),
-            refine=False,
-        )
-        assert isinstance(result["best_score"], float)
-        assert np.isfinite(result["best_score"])
-
-    def test_landscape_is_list_of_dicts(self):
-        sliceA = _make_adata(20, 8, seed=38)
-        sliceB = _make_adata(20, 8, seed=39)
-        result = select_weights_unsupervised(
-            sliceA, sliceB,
-            alpha_grid=(0.3, 0.7),
-            alpha_cluster_grid=(0.3,),
-            simplex_step=1.0,
-            delta_grid=(0.5,),
-            refine=False,
-        )
-        assert isinstance(result["landscape"], list)
-        for row in result["landscape"]:
-            assert isinstance(row, dict)
-            assert "score" in row

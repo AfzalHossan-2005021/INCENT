@@ -7,7 +7,6 @@ from .core import (
 from .evaluation import (
     label_transfer_accuracy,
     foscttm,
-    geometric_preservation_rate,
     expression_transfer_corr,
     calculate_neighborhood_dissimilarity_cost,
     calculate_gene_expression_dissimilarity,
@@ -36,7 +35,6 @@ from .perturb import (
 
 from .tuning import (
     select_alignment_weights,
-    select_weights_unsupervised,
     make_self_alignment_instances,
     simplex_grid,
     gpu_available,
@@ -50,7 +48,6 @@ __all__ = [
     # primary metrics
     'label_transfer_accuracy',
     'foscttm',
-    'geometric_preservation_rate',
     'expression_transfer_corr',
     'evaluate_alignment',
     'calculate_performance_metrics',
@@ -72,7 +69,6 @@ __all__ = [
     'simulate_adjacent_slice',
     # weight selection
     'select_alignment_weights',
-    'select_weights_unsupervised',
     'make_self_alignment_instances',
     'simplex_grid',
     'gpu_available',
