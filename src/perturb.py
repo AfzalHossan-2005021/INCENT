@@ -17,12 +17,6 @@ inherited from ``section`` is dropped in the process, since it would otherwise
 be a stale embedding of the pre-noise expression. The original (pre-noise)
 expression is preserved in ``layers["X_unperturbed"]`` for provenance.
 
-The INCENT pipeline also consumes ``obsm["X_pca"]`` (``hierarchical.py``
-defaults to ``feature_key="X_pca"``); once ``.X`` is final, call
-``utils.compute_joint_pca`` on the returned slice and ``reference`` to write a
-consistent shared embedding into both -- this is what
-``tuning.make_self_alignment_instances`` does.
-
 Pipeline (in order)
 -------------------
     1. Random cell dropout              Bernoulli(keep) over cells.
@@ -87,8 +81,6 @@ import anndata as ad
 from anndata import AnnData
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
-
-from .utils import compute_joint_pca
 
 
 # ----------------------------------------------------------------------------
@@ -321,10 +313,10 @@ def simulate_adjacent_slice(
     # --- 1. dropout ---
     dropout_rate: float = 0.10,
     # --- 2. warp ---
-    warp_amplitude: Optional[float] = None,     # um;  None -> 0.025 * bbox diagonal
+    warp_amplitude: Optional[float] = None,     # um;  None -> 0.01 * bbox diagonal
     warp_n_control: int = 5,                    # control point grid size (n_control x n_control)
     # --- 3. jitter ---
-    jitter_sigma: Optional[float] = None,       # um;  None -> 0.25 * median NN dist
+    jitter_sigma: Optional[float] = None,       # um;  None -> 0.1 * median NN dist
     jitter_fraction: float = 1.0,
     # --- 4. no-touch ---
     min_dist: Optional[float] = None,
@@ -344,7 +336,7 @@ def simulate_adjacent_slice(
     expression_layer: Optional[str] = None,      # source expression; None -> .X
     nonneg_clip: Union[bool, str] = "auto",       # auto: clip iff data is non-negative
     # --- 7. annotation noise & spurious (birth) cells (default off) ---
-    label_flip_rate: float = 0.10,        # fraction of labels reassigned to a different type
+    label_flip_rate: float = 0.05,        # fraction of labels reassigned to a different type
     birth_rate: float = 0.10,             # spurious unmatched cells, as a fraction of survivors
     birth_offset_scale: float = 2.0,      # birth scatter, in units of median NN distance
     # --- bookkeeping ---
@@ -356,9 +348,8 @@ def simulate_adjacent_slice(
 
     See the module docstring for the full step list, conventions, and ground
     truth.  ``.X`` is the sole source of truth for expression; any inherited
-    ``obsm["X_pca"]`` is dropped since it would go stale.  Call
-    ``utils.compute_joint_pca`` on the result (with ``reference``) for a
-    consistent shared embedding.  Key expression parameters:
+    ``obsm["X_pca"]`` is dropped since it would go stale.  Key expression
+    parameters:
 
     expr_alpha : float
         Noise scale; per cell i and gene g the std is ``expr_alpha * std_g`` over
@@ -410,9 +401,9 @@ def simulate_adjacent_slice(
     median_nn = float(np.median(nn_full))
 
     if warp_amplitude is None:
-        warp_amplitude = 0.025 * bbox_diag
+        warp_amplitude = 0.01 * bbox_diag
     if jitter_sigma is None:
-        jitter_sigma = 0.25 * median_nn
+        jitter_sigma = 0.1 * median_nn
     if min_dist is None:
         min_dist = float(np.quantile(nn_full, min_dist_quantile))
     if hardcore_diameter is not None:
@@ -489,8 +480,7 @@ def simulate_adjacent_slice(
     if expression_layer is not None:
         sim.layers[expression_layer] = E_noised.astype(np.float32)
     # any obsm['X_pca'] inherited from `section` is now a stale embedding of the
-    # pre-noise expression; drop it so callers cannot silently use it.  Call
-    # utils.compute_joint_pca(sim, reference) for a consistent shared embedding.
+    # pre-noise expression; drop it so callers cannot silently use it.
     sim.obsm.pop("X_pca", None)
 
     # -- 7. annotation noise: corrupt the labels the aligner READS (expression
@@ -566,7 +556,6 @@ def simulate_adjacent_slice(
             "prerigid_displacement": "obsm['adjacent_displacement_prerigid']",
             "expression_pre_noise": "layers['X_unperturbed']",
             "noised_expression": ".X (canonical)",
-            "shared_embedding": "call utils.compute_joint_pca(sim, reference) to populate obsm['X_pca']",
             "clean_labels": f"obs['{celltype_key}_clean']",
             "label_flipped_mask": "obs['adjacent_label_flipped']",
             "birth_mask": "obs['adjacent_is_birth'] (exclude from correspondence scoring)",
@@ -642,7 +631,6 @@ if __name__ == "__main__":
         adata = sc.read_h5ad(args.input_h5ad)
         reference = sc.read_h5ad(args.reference_h5ad)
         sim = simulate_adjacent_slice(adata, reference=reference, seed=args.seed)
-        sim, reference = compute_joint_pca(sim, reference)
         show_slice(sim)
         sim.write_h5ad(args.output_h5ad)
         print(f"Simulated adjacent slice written to {args.output_h5ad}.")
