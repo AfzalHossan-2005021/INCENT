@@ -68,7 +68,13 @@ Ground truth written onto the returned slice
     obs ["adjacent_label_flipped"]           which labels were corrupted (step 8)
     obs ["adjacent_is_birth"]                spurious unmatched cells (step 9); exclude
                                             these from correspondence scoring
-    uns["self_alignment_test"]["adjacent_simulation"]  full provenance.
+    uns["self_alignment_test"]["adjacent_simulation"]  full provenance, including
+        "dropout_kept_positions" (N_matched,): dropout_kept_positions[j] is the
+        ROW INDEX INTO `reference` of the true parent of matched sim cell j
+        (mapped via obs_names -- NOT a position local to `section`). This is
+        what evaluate_alignment / foscttm auto-extract as FOSCTTM ground truth,
+        so `reference` must contain every surviving cell of `section` under a
+        matching obs_name.
 
 Note (state in the paper): matched cells are known parent cells (a z-displaced
 same-cell model). Weaker / more realistic correspondence is obtained by raising
@@ -639,6 +645,22 @@ def simulate_adjacent_slice(
         sim.obs["adjacent_label_flipped"] = np.zeros(n, dtype=bool)
 
     # -- ground truth & provenance --
+    # `kept_pos` is a position local to `section` (0..n_full-1). When `section`
+    # is a spatial crop of a larger `reference` (the common case -- see module
+    # docstring), that local position is NOT a valid row index into `reference`.
+    # Map it through obs_names so `dropout_kept_positions` is always a row index
+    # into `reference`, matching what evaluate_alignment/foscttm assume. Without
+    # this, FOSCTTM ground truth silently points at the wrong reference cells and
+    # the score collapses to ~0.5 (chance) even when the alignment is correct.
+    ref_kept_pos = reference.obs_names.get_indexer(section.obs_names[kept_pos])
+    n_unmatched = int((ref_kept_pos < 0).sum())
+    if n_unmatched:
+        raise ValueError(
+            f"{n_unmatched} surviving cell(s) from `section` were not found in "
+            f"`reference` by obs_name. `reference` must contain every cell in "
+            f"`section` (matching obs_names) so that FOSCTTM ground-truth indices "
+            f"are valid row positions in `reference`.")
+
     gt = np.asarray(sim.obsm[spatial_key], dtype=np.float64).copy()
     gt[:, :2] = coords0
     sim.obsm["spatial_unperturbed"] = gt
@@ -668,7 +690,7 @@ def simulate_adjacent_slice(
         "no_touch_satisfied": bool(final_min >= min_dist - 1e-9),
         "dropout_rate": float(dropout_rate),
         "n_obs_input": int(n_full), "n_obs_output": int(n),
-        "dropout_kept_positions": kept_pos.astype(np.int64),
+        "dropout_kept_positions": ref_kept_pos.astype(np.int64),
         "label_flip_rate": float(label_flip_rate),
         "n_labels_flipped": int(n_flipped),
         "birth_rate": float(birth_rate),

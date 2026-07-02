@@ -106,11 +106,68 @@ def simplex_grid(step: float = 0.25, offset: float = 0.0):
     return pts
 
 
-def _subsample(adata, max_cells: Optional[int], rng):
-    if max_cells is None or adata.n_obs <= max_cells:
-        return adata
-    idx = np.sort(rng.choice(adata.n_obs, size=max_cells, replace=False))
-    return adata[idx].copy()
+def _subsample_paired(sim, ref, max_cells: Optional[int], rng):
+    """
+    Jointly subsample ``(sim, ref)``, keeping FOSCTTM ground truth
+    (``dropout_kept_positions``) valid and aligned to the new rows.
+
+    Subsampling ``sim`` and ``ref`` independently reorders/reduces their rows
+    without touching the stored ground-truth indices, silently desyncing FOSCTTM
+    scoring (see :func:`.perturb.simulate_adjacent_slice`). Here, ``ref`` is
+    subsampled first and the ground truth remapped through it; any matched
+    ``sim`` cell whose true parent got dropped from ``ref`` is then dropped too
+    (birth/unmatched cells fill any remaining budget), and
+    ``dropout_kept_positions`` is rewritten to match the new ``sim`` rows.
+    """
+    if max_cells is None:
+        return sim, ref
+
+    adj = sim.uns.get("self_alignment_test", {}).get("adjacent_simulation", {})
+    gt = adj.get("dropout_kept_positions")
+    gt = None if gt is None else np.asarray(gt, dtype=np.int64)
+    n_matched = 0 if gt is None else len(gt)
+
+    ref_subsampled = ref.n_obs > max_cells
+    if ref_subsampled:
+        ref_idx = np.sort(rng.choice(ref.n_obs, size=max_cells, replace=False))
+        if gt is not None:
+            ref_new_pos = np.full(ref.n_obs, -1, dtype=np.int64)
+            ref_new_pos[ref_idx] = np.arange(ref_idx.size)
+            gt = ref_new_pos[gt]  # -1: this matched sim cell's parent was dropped
+        ref = ref[ref_idx].copy()
+
+    if gt is None:
+        if sim.n_obs > max_cells:
+            sim_idx = np.sort(rng.choice(sim.n_obs, size=max_cells, replace=False))
+            sim = sim[sim_idx].copy()
+        return sim, ref
+
+    if not ref_subsampled and sim.n_obs <= max_cells:
+        return sim, ref  # nothing to do
+
+    valid_matched = np.flatnonzero(gt >= 0)
+    birth = np.arange(n_matched, sim.n_obs)
+    if valid_matched.size + birth.size > max_cells:
+        if valid_matched.size >= max_cells:
+            keep_matched = np.sort(rng.choice(valid_matched, size=max_cells, replace=False))
+            keep_birth = np.array([], dtype=np.int64)
+        else:
+            keep_matched = valid_matched
+            n_birth_keep = min(max_cells - valid_matched.size, birth.size)
+            keep_birth = (np.sort(rng.choice(birth, size=n_birth_keep, replace=False))
+                          if n_birth_keep > 0 else np.array([], dtype=np.int64))
+    else:
+        keep_matched, keep_birth = valid_matched, birth
+
+    sim_idx = np.concatenate([keep_matched, keep_birth])  # matched rows first
+    new_gt = gt[keep_matched]
+    sim = sim[sim_idx].copy()
+    meta = dict(sim.uns.get("self_alignment_test", {}))
+    adj2 = dict(meta.get("adjacent_simulation", {}))
+    adj2["dropout_kept_positions"] = new_gt.astype(np.int64)
+    meta["adjacent_simulation"] = adj2
+    sim.uns["self_alignment_test"] = meta
+    return sim, ref
 
 
 def make_self_alignment_instances(
@@ -157,7 +214,7 @@ def make_self_alignment_instances(
         s = int(rng.integers(0, 2**31 - 1))
         with _quiet(True):
             sim = simulate_adjacent_slice(sec_src.copy(), reference=ref, seed=s, **perturb_kwargs)
-        instances.append((_subsample(sim, max_cells, rng), _subsample(ref, max_cells, rng)))
+        instances.append(_subsample_paired(sim, ref, max_cells, rng))
     return instances
 
 

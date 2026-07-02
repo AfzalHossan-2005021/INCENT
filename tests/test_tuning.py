@@ -233,16 +233,19 @@ class TestMakeSelfAlignmentInstances:
     """
 
     @pytest.fixture
-    def tiny_section(self):
-        return _make_adata(40, 10, n_types=3, seed=20, label_key="cell_type_annot")
-
-    @pytest.fixture
     def tiny_reference(self):
         adata = _make_adata(100, 10, n_types=3, seed=21, label_key="cell_type_annot")
         # give obs_names that the section could be a subset of
         import pandas as pd
         adata.obs_names = pd.Index([f"cell_{i}" for i in range(100)])
         return adata
+
+    @pytest.fixture
+    def tiny_section(self, tiny_reference):
+        # a real obs_names subset of `tiny_reference` (as synthesize.py crops are),
+        # required so simulate_adjacent_slice can map dropout_kept_positions into
+        # `tiny_reference`'s row index space.
+        return tiny_reference[:40].copy()
 
     def test_n_instances_matches_request(self, tiny_section, tiny_reference):
         instances = make_self_alignment_instances(
@@ -275,6 +278,47 @@ class TestMakeSelfAlignmentInstances:
         crops = [(tiny_section, tiny_reference), (tiny_section, tiny_reference)]
         instances = make_self_alignment_instances(crops=crops, seed=0)
         assert len(instances) == 2
+
+    def test_dropout_kept_positions_index_into_reference(self, tiny_section, tiny_reference):
+        """
+        Regression test: dropout_kept_positions must be a row index into
+        `reference`, not a position local to the (cropped) `section`. Since
+        `tiny_section` is `tiny_reference`'s first 40 rows, gt[j] must recover
+        the true parent's obs_name for every matched sim cell j.
+        """
+        instances = make_self_alignment_instances(
+            section=tiny_section, reference=tiny_reference,
+            n_instances=1, seed=0,
+        )
+        sim, ref = instances[0]
+        gt = np.asarray(
+            sim.uns["self_alignment_test"]["adjacent_simulation"]["dropout_kept_positions"]
+        )
+        assert gt.min() >= 0
+        assert gt.max() < ref.n_obs
+        matched_names = sim.obs_names[: len(gt)]
+        assert list(ref.obs_names[gt]) == list(matched_names)
+
+    def test_max_cells_keeps_ground_truth_consistent(self, tiny_section, tiny_reference):
+        """
+        When max_cells forces ref/sim subsampling, dropout_kept_positions must
+        still index into the (subsampled) reference's new row order and match
+        sim's (subsampled) row order 1:1 for the matched prefix.
+        """
+        instances = make_self_alignment_instances(
+            section=tiny_section, reference=tiny_reference,
+            n_instances=1, seed=0, max_cells=10,
+        )
+        sim, ref = instances[0]
+        assert ref.n_obs <= 10
+        assert sim.n_obs <= 10
+        gt = np.asarray(
+            sim.uns["self_alignment_test"]["adjacent_simulation"]["dropout_kept_positions"]
+        )
+        assert gt.min() >= 0
+        assert gt.max() < ref.n_obs
+        matched_names = sim.obs_names[: len(gt)]
+        assert list(ref.obs_names[gt]) == list(matched_names)
 
     def test_raises_without_inputs(self):
         with pytest.raises(ValueError):
