@@ -23,6 +23,7 @@ from .src import (
     make_self_alignment_instances,
     simplex_grid,
     gpu_available,
+    compute_joint_pca,
 )
 
 __all__ = [
@@ -57,4 +58,6 @@ __all__ = [
     'make_self_alignment_instances',
     'simplex_grid',
     'gpu_available',
+    # utils
+    'compute_joint_pca',
 ]

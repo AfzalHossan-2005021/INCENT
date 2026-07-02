@@ -40,6 +40,10 @@ from .tuning import (
     gpu_available,
 )
 
+from .utils import (
+    compute_joint_pca,
+)
+
 __all__ = [
     # core alignment
     'pairwise_align',
@@ -72,4 +76,6 @@ __all__ = [
     'make_self_alignment_instances',
     'simplex_grid',
     'gpu_available',
+    # utils
+    'compute_joint_pca',
 ]

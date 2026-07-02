@@ -2,8 +2,13 @@ import ot
 import torch
 import warnings
 
+from typing import Optional, Tuple
+
 import numpy as np
 import scipy.sparse as sp
+
+from anndata import AnnData
+from sklearn.decomposition import PCA
 
 from ot.optim import cg
 from ot.gromov import init_matrix, gwloss, gwggrad, solve_gromov_linesearch
@@ -498,4 +503,149 @@ to_dense_array = lambda X: X.toarray() if sp.issparse(X) else np.asarray(X)
 
 ## Returns the data matrix or representation
 extract_data_matrix = lambda adata,rep: adata.X if rep is None else adata.obsm[rep]
+
+
+# ----------------------------------------------------------------------------
+# Joint PCA -- shared embedding across two AnnData objects
+# ----------------------------------------------------------------------------
+
+def _sanitize_expression(M: np.ndarray, name: str) -> np.ndarray:
+    """Replace non-finite entries (NaN/inf) with 0, warning how many were found."""
+    M = np.asarray(M, dtype=np.float64)
+    bad = ~np.isfinite(M)
+    nbad = int(bad.sum())
+    if nbad:
+        warnings.warn(
+            f"{name} contained {nbad} non-finite value(s) (NaN/inf); replaced with 0. "
+            f"Check upstream preprocessing.", UserWarning, stacklevel=3)
+        M = np.where(bad, 0.0, M)
+    return M
+
+
+def _has_negative_expression(M: np.ndarray, tol: float = 1e-6) -> bool:
+    finite = M[np.isfinite(M)]
+    return bool(finite.size and finite.min() < -tol)
+
+
+def _log_normalize_expression(counts: np.ndarray, target_sum: float) -> np.ndarray:
+    """Library-size normalize to ``target_sum`` then log1p (scanpy convention)."""
+    counts = _sanitize_expression(counts, "expression matrix").clip(min=0.0)
+    libsize = counts.sum(axis=1, keepdims=True)
+    libsize[libsize <= 0] = 1.0
+    return np.log1p(counts / libsize * target_sum)
+
+
+def _preprocess_expression_for_pca(M: np.ndarray, mode: str, target_sum: float) -> np.ndarray:
+    """Map an expression matrix into the space PCA is fit on (always finite)."""
+    M = _sanitize_expression(M, "PCA input")
+    if mode == "none":
+        return M
+    if mode == "log1p":
+        return np.log1p(np.clip(M, 0.0, None))
+    if mode == "lognorm":
+        return _log_normalize_expression(M, target_sum)
+    raise ValueError(f"preprocess must be 'none', 'log1p', 'lognorm', or 'auto'; got {mode!r}.")
+
+
+def compute_joint_pca(
+    section: AnnData,
+    reference: AnnData,
+    *,
+    expression_layer: Optional[str] = None,
+    preprocess: str = "auto",
+    target_sum: float = 1e4,
+    scale: bool = False,
+    key: str = "X_pca",
+) -> Tuple[AnnData, AnnData]:
+    """
+    Fit one PCA on the pooled expression of ``section`` and ``reference`` (their
+    shared genes) and write the resulting embedding into ``obsm[key]`` of both,
+    in place, so the pair lives in one directly-comparable space.
+
+    ``reference`` must already carry ``obsm[key]`` -- its current width is used
+    as the number of components, so a joint re-embedding never changes the
+    reference's PCA dimensionality. Call this any time expression changes (e.g.
+    after adding noise) and a shared embedding is needed downstream (the
+    aligners in :mod:`hierarchical` default to ``feature_key="X_pca"``).
+
+    Parameters
+    ----------
+    section, reference : AnnData
+        The two slices to jointly embed. Only genes present in both are used.
+    expression_layer : str or None
+        Expression source; ``None`` uses ``.X``.
+    preprocess : {'lognorm', 'log1p', 'none', 'auto'}
+        How expression maps into PCA space. ``'lognorm'`` = normalize_total +
+        log1p (scanpy default); ``'log1p'``; ``'none'`` = PCA directly on the
+        raw values. ``'auto'`` (default) picks ``'none'`` if either matrix
+        contains negative values (already normalized/scaled data), else
+        ``'lognorm'``.
+    target_sum : float, default 1e4
+        Library-size target used when ``preprocess`` resolves to ``'lognorm'``.
+    scale : bool, default False
+        Z-score the pooled matrix per gene before fitting PCA.
+    key : str, default 'X_pca'
+        obsm key read (for the component count) and written (with the result).
+
+    Returns
+    -------
+    (section, reference) : Tuple[AnnData, AnnData]
+        The same objects passed in, with ``obsm[key]`` replaced by the shared
+        embedding.
+
+    Raises
+    ------
+    ValueError
+        If ``reference.obsm[key]`` is missing, or the two slices share no genes.
+    """
+    if key not in reference.obsm:
+        raise ValueError(
+            f"reference.obsm['{key}'] not found; compute_joint_pca infers the "
+            f"number of components from it and requires it to already exist."
+        )
+    n_pcs = int(reference.obsm[key].shape[1])
+
+    common = [g for g in reference.var_names if g in set(section.var_names)]
+    if not common:
+        raise ValueError("section and reference share no genes; cannot compute a joint PCA.")
+
+    sec_expr = to_dense_array(
+        section[:, common].layers[expression_layer] if expression_layer else section[:, common].X
+    ).astype(np.float64)
+    ref_expr = to_dense_array(
+        reference[:, common].layers[expression_layer] if expression_layer else reference[:, common].X
+    ).astype(np.float64)
+    sec_expr = _sanitize_expression(sec_expr, "section expression (joint PCA)")
+    ref_expr = _sanitize_expression(ref_expr, "reference expression (joint PCA)")
+
+    eff_preprocess = preprocess
+    has_neg = _has_negative_expression(sec_expr) or _has_negative_expression(ref_expr)
+    if eff_preprocess == "auto":
+        eff_preprocess = "none" if has_neg else "lognorm"
+    elif eff_preprocess in ("lognorm", "log1p") and has_neg:
+        warnings.warn(
+            f"preprocess='{eff_preprocess}' assumes non-negative counts, but the "
+            f"expression contains negative values (already normalized/scaled). "
+            f"Falling back to 'none' (PCA directly on the expression values).",
+            UserWarning, stacklevel=2)
+        eff_preprocess = "none"
+
+    mat_sec = _preprocess_expression_for_pca(sec_expr, eff_preprocess, target_sum)
+    mat_ref = _preprocess_expression_for_pca(ref_expr, eff_preprocess, target_sum)
+
+    M = _sanitize_expression(np.vstack([mat_ref, mat_sec]), "joint PCA matrix")
+    if scale:
+        mu, sd = M.mean(0), M.std(0)
+        sd[sd == 0] = 1.0
+        M = _sanitize_expression((M - mu) / sd, "scaled joint PCA matrix")
+
+    npc = int(min(n_pcs, M.shape[0] - 1, M.shape[1]))
+    pca = PCA(n_components=npc, svd_solver="full", random_state=0)
+    Z = pca.fit_transform(M)
+
+    n_ref = mat_ref.shape[0]
+    reference.obsm[key] = np.ascontiguousarray(Z[:n_ref], dtype=np.float32)
+    section.obsm[key] = np.ascontiguousarray(Z[n_ref:], dtype=np.float32)
+
+    return section, reference
 

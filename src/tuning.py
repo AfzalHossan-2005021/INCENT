@@ -10,8 +10,9 @@ Three entry points:
   **1 − FOSCTTM** (fully non-circular: FOSCTTM has no overlap with INCENT's objective
   components). All five weights are swept with the full (GPU-accelerated) alignment
   via either a staged ``"grid"`` or Optuna ``"bayesopt"`` (fewer evaluations).
-  The simulator's joint PCA writes a shared ``X_pca`` into both the simulated slice
-  and the retained ``reference``, so each (sim, ref) pair is already comparable.
+  :func:`make_self_alignment_instances` calls ``utils.compute_joint_pca`` after
+  perturbation to write a shared ``X_pca`` into both the simulated slice and the
+  retained ``reference``, so each (sim, ref) pair is already comparable.
 
 * :func:`select_weights_real_pairs` -- uses **real section/reference pairs directly**,
   no synthetic perturbation. Scored by **LTA** (Label Transfer Accuracy): for each
@@ -35,6 +36,7 @@ import numpy as np
 from .core import hierarchical_pairwise_align
 from .perturb import simulate_adjacent_slice
 from .evaluation import evaluate_alignment
+from .utils import compute_joint_pca
 
 
 DEFAULT_INIT = {"alpha": 0.5, "beta": 0.5, "gamma": 0.25, "alpha_cluster": 0.5, "delta": 0.75}
@@ -193,10 +195,11 @@ def make_self_alignment_instances(
     * ``crops``: an explicit list of ``(section, reference)`` pairs; one instance
       per pair (``n_instances`` ignored).
 
-    In both modes :func:`simulate_adjacent_slice` writes a **shared** ``X_pca`` into
-    both ``sim`` and the (copied) reference, so each pair is in a comparable
-    embedding. Instances are generated ONCE and reused across all weight candidates
-    (weights do not change the PCA) -- the main speed-up of the sweep.
+    In both modes, after :func:`simulate_adjacent_slice` perturbs ``sim``,
+    :func:`utils.compute_joint_pca` writes a **shared** ``X_pca`` into both ``sim``
+    and the (copied) reference, so each pair is in a comparable embedding.
+    Instances are generated ONCE and reused across all weight candidates (weights
+    do not change the PCA) -- the main speed-up of the sweep.
     """
     perturb_kwargs = dict(perturb_kwargs or {})
     rng = np.random.default_rng(seed)
@@ -214,6 +217,7 @@ def make_self_alignment_instances(
         s = int(rng.integers(0, 2**31 - 1))
         with _quiet(True):
             sim = simulate_adjacent_slice(sec_src.copy(), reference=ref, seed=s, **perturb_kwargs)
+        sim, ref = compute_joint_pca(sim, ref)
         instances.append(_subsample_paired(sim, ref, max_cells, rng))
     return instances
 

@@ -9,19 +9,19 @@ slice), drops some cells, geometrically displaces the survivors the way a
 retaining a known 1:1 correspondence to the parent (gold ground truth for
 scoring).
 
-Expression / PCA consistency
-----------------------------
-The INCENT pipeline consumes BOTH ``.X`` (read directly in ``hierarchical.py``
-when ``feature_key="X"`` and in the notebook) AND ``obsm["X_pca"]``.  They are
-two views of the SAME expression state and must stay consistent.  Therefore:
+Expression consistency
+-----------------------
+``.X`` is the single source of truth for expression: the Gaussian noise is
+added to it and it is overwritten with the noised result. Any ``obsm["X_pca"]``
+inherited from ``section`` is dropped in the process, since it would otherwise
+be a stale embedding of the pre-noise expression. The original (pre-noise)
+expression is preserved in ``layers["X_unperturbed"]`` for provenance.
 
-    * the Gaussian noise is added to ``.X`` (the single source of truth),
-    * ``.X`` is overwritten with the noised expression,
-    * ``X_pca`` is recomputed as a JOINT PCA *of that same noised* ``.X``.
-
-So ``X_pca == jointPCA(preprocess(.X))`` by construction and the two cannot
-disagree.  The original (pre-noise) expression is preserved in
-``layers["X_unperturbed"]`` for provenance.
+The INCENT pipeline also consumes ``obsm["X_pca"]`` (``hierarchical.py``
+defaults to ``feature_key="X_pca"``); once ``.X`` is final, call
+``utils.compute_joint_pca`` on the returned slice and ``reference`` to write a
+consistent shared embedding into both -- this is what
+``tuning.make_self_alignment_instances`` does.
 
 Pipeline (in order)
 -------------------
@@ -36,23 +36,14 @@ Pipeline (in order)
                                         gene *within each cell type*
                                         (sigma_{i,g} = alpha * std of gene g
                                         among cells of i's cell type).
-    7. Combined (joint) PCA             one PCA fit on  reference U simulated,
-                                        FROM the (now noised) .X, written into
-                                        obsm["X_pca"] of BOTH.
-    8. Annotation (label) noise         a fraction of cell-type labels reassigned
+    7. Annotation (label) noise         a fraction of cell-type labels reassigned
                                         to a different type (annotation error);
                                         the TRUE labels used by step 6 are kept
                                         in obs[celltype_key + "_clean"].
-    9. Spurious (birth) cells           optional unmatched cells appended as
+    8. Spurious (birth) cells           optional unmatched cells appended as
                                         realistic clutter; they have no parent
                                         (spatial_unperturbed = NaN) and are
                                         flagged obs["adjacent_is_birth"].
-
-Set ``pca_preprocess`` to match how your existing ``X_pca`` was produced
-(``"lognorm"`` = normalize_total + log1p, the scanpy default; ``"log1p"``;
-``"none"`` = PCA directly on ``.X``).  Because the joint PCA regenerates the
-embedding for BOTH slices from scratch, the pair is internally comparable
-regardless of the chosen preprocess.
 
 Rotation convention matches ``core.py`` / ``synthesize.py``:
     R(theta) = [[cos, -sin], [sin, cos]];  forward map on rows: X @ A.T + b.
@@ -65,8 +56,8 @@ Ground truth written onto the returned slice
     layers["X_unperturbed"]                 pre-noise expression
     obs ["adjacent_kept"]                    provenance flag
     obs [celltype_key + "_clean"]            true labels before annotation noise
-    obs ["adjacent_label_flipped"]           which labels were corrupted (step 8)
-    obs ["adjacent_is_birth"]                spurious unmatched cells (step 9); exclude
+    obs ["adjacent_label_flipped"]           which labels were corrupted (step 7)
+    obs ["adjacent_is_birth"]                spurious unmatched cells (step 8); exclude
                                             these from correspondence scoring
     uns["self_alignment_test"]["adjacent_simulation"]  full provenance, including
         "dropout_kept_positions" (N_matched,): dropout_kept_positions[j] is the
@@ -92,11 +83,12 @@ import numpy as np
 import scipy.sparse as sp
 from scipy.spatial import cKDTree
 from scipy.interpolate import RBFInterpolator
-from sklearn.decomposition import PCA
 import anndata as ad
 from anndata import AnnData
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
+
+from .utils import compute_joint_pca
 
 
 # ----------------------------------------------------------------------------
@@ -123,33 +115,6 @@ def _sanitize(M: np.ndarray, name: str) -> np.ndarray:
 def _has_negatives(M: np.ndarray, tol: float = 1e-6) -> bool:
     finite = M[np.isfinite(M)]
     return bool(finite.size and finite.min() < -tol)
-
-
-def _log_normalize(counts: np.ndarray, target_sum: float = 1e4) -> np.ndarray:
-    """
-    Library-size normalize to ``target_sum`` then log1p (scanpy convention).
-
-    Defensive: non-finite values are zeroed and negatives are clipped to 0 before
-    normalization so the function never emits NaN.  (Negatives indicate the input
-    is not count data; the caller should use ``pca_preprocess='none'`` instead --
-    ``simulate_adjacent_slice`` detects this and falls back automatically.)
-    """
-    counts = _sanitize(counts, "expression matrix").clip(min=0.0)
-    libsize = counts.sum(axis=1, keepdims=True)
-    libsize[libsize <= 0] = 1.0
-    return np.log1p(counts / libsize * target_sum)
-
-
-def _preprocess_for_pca(M: np.ndarray, mode: str, target_sum: float) -> np.ndarray:
-    """Map an expression matrix into the space PCA is fit on (always finite)."""
-    M = _sanitize(M, "PCA input")
-    if mode == "none":
-        return M
-    if mode == "log1p":
-        return np.log1p(np.clip(M, 0.0, None))
-    if mode == "lognorm":
-        return _log_normalize(M, target_sum)
-    raise ValueError(f"pca_preprocess must be 'none', 'log1p', or 'lognorm'; got {mode!r}.")
 
 
 def _rotation_matrix(angle_rad: float) -> np.ndarray:
@@ -318,9 +283,9 @@ def _make_spurious_cells(sim, rng, n_birth, spatial_key, median_nn, offset_scale
     """
     Build ``n_birth`` unmatched 'birth' cells (GT-safe independent-resampling proxy).
 
-    Each birth copies a random simulated cell (so its expression / label / X_pca
-    stay valid and in the shared embedding) and is scattered locally by a small
-    Gaussian offset. Births carry **no parent**: ``spatial_unperturbed`` is NaN
+    Each birth copies a random simulated cell (so its expression and label stay
+    valid) and is scattered locally by a small Gaussian offset. Births carry
+    **no parent**: ``spatial_unperturbed`` is NaN
     and ``obs['adjacent_is_birth']`` is True, so a scorer drops them from the
     correspondence metrics while they still act as realistic clutter that the
     aligner must cope with. Returns an ``AnnData`` (``n_birth`` rows) or ``None``.
@@ -341,62 +306,6 @@ def _make_spurious_cells(sim, rng, n_birth, spatial_key, median_nn, offset_scale
     births.obs["adjacent_is_birth"] = np.ones(n_birth, dtype=bool)
     births.obs["adjacent_label_flipped"] = np.zeros(n_birth, dtype=bool)
     return births
-
-
-# ----------------------------------------------------------------------------
-# Combined (joint) PCA  --  writes a shared X_pca into BOTH slices in place
-# ----------------------------------------------------------------------------
-
-def recompute_combined_pca(
-    adata_a: AnnData,
-    adata_b: AnnData,
-    *,
-    mat_a: Optional[np.ndarray] = None,
-    mat_b: Optional[np.ndarray] = None,
-    n_pcs: int = 50,
-    scale: bool = False,
-    preprocess: str = "lognorm",
-    target_sum: float = 1e4,
-    layer: Optional[str] = None,
-    key: str = "X_pca",
-) -> PCA:
-    """
-    Fit ONE PCA on the concatenation of two slices' expression and write the
-    shared embedding into ``obsm[key]`` of BOTH (in place).  When ``mat_a`` /
-    ``mat_b`` are not given, they are built from each slice's CURRENT ``.X`` (or
-    ``layer``) via ``_preprocess_for_pca`` on the shared gene set -- so calling
-    this after modifying ``.X`` keeps ``X`` and ``X_pca`` consistent.
-    """
-    if mat_a is None or mat_b is None:
-        common = [g for g in adata_a.var_names if g in set(adata_b.var_names)]
-        if not common:
-            raise ValueError("Slices share no genes; cannot build a joint PCA.")
-        if mat_a is None:
-            Xa = _to_dense(adata_a[:, common].layers[layer] if layer else adata_a[:, common].X)
-            mat_a = _preprocess_for_pca(Xa, preprocess, target_sum)
-        if mat_b is None:
-            Xb = _to_dense(adata_b[:, common].layers[layer] if layer else adata_b[:, common].X)
-            mat_b = _preprocess_for_pca(Xb, preprocess, target_sum)
-
-    if mat_a.shape[1] != mat_b.shape[1]:
-        raise ValueError(
-            f"Gene axis mismatch for joint PCA: {mat_a.shape[1]} vs {mat_b.shape[1]}.")
-
-    M = _sanitize(np.vstack([mat_a, mat_b]), "joint PCA matrix")
-    if scale:
-        mu, sd = M.mean(0), M.std(0)
-        sd[sd == 0] = 1.0
-        M = (M - mu) / sd
-        M = _sanitize(M, "scaled PCA matrix")
-
-    npc = int(min(n_pcs, M.shape[0] - 1, M.shape[1]))
-    pca = PCA(n_components=npc, svd_solver="full", random_state=0)
-    Z = pca.fit_transform(M)
-
-    na = mat_a.shape[0]
-    adata_a.obsm[key] = np.ascontiguousarray(Z[:na], dtype=np.float32)
-    adata_b.obsm[key] = np.ascontiguousarray(Z[na:], dtype=np.float32)
-    return pca
 
 
 # ----------------------------------------------------------------------------
@@ -434,13 +343,7 @@ def simulate_adjacent_slice(
     min_group_cells: int = 20,
     expression_layer: Optional[str] = None,      # source expression; None -> .X
     nonneg_clip: Union[bool, str] = "auto",       # auto: clip iff data is non-negative
-    # --- 7. joint PCA (FROM the noised .X) ---
-    recompute_pca: bool = True,
-    pca_preprocess: str = "auto",                # auto: 'lognorm' if count-like else 'none'
-    n_pcs: int = 50,
-    scale_before_pca: bool = False,
-    target_sum: float = 1e4,
-    # --- 8. annotation noise & spurious (birth) cells (default off) ---
+    # --- 7. annotation noise & spurious (birth) cells (default off) ---
     label_flip_rate: float = 0.10,        # fraction of labels reassigned to a different type
     birth_rate: float = 0.10,             # spurious unmatched cells, as a fraction of survivors
     birth_offset_scale: float = 2.0,      # birth scatter, in units of median NN distance
@@ -449,12 +352,13 @@ def simulate_adjacent_slice(
     seed: Optional[int] = None,
 ) -> AnnData:
     """
-    Turn a cut ``section`` into a simulated adjacent serial section, keeping
-    ``.X`` and ``obsm["X_pca"]`` mutually consistent (X_pca is the joint PCA of
-    the noised ``.X``).
+    Turn a cut ``section`` into a simulated adjacent serial section.
 
     See the module docstring for the full step list, conventions, and ground
-    truth.  Key expression/PCA parameters:
+    truth.  ``.X`` is the sole source of truth for expression; any inherited
+    ``obsm["X_pca"]`` is dropped since it would go stale.  Call
+    ``utils.compute_joint_pca`` on the result (with ``reference``) for a
+    consistent shared embedding.  Key expression parameters:
 
     expr_alpha : float
         Noise scale; per cell i and gene g the std is ``expr_alpha * std_g`` over
@@ -467,20 +371,16 @@ def simulate_adjacent_slice(
     nonneg_clip : bool
         Clip noised expression at 0 (appropriate for counts / log-normalized
         data; set False if your expression representation can be negative).
-    pca_preprocess : {'lognorm', 'log1p', 'none'}
-        How the joint PCA maps expression -> PCA space.  Set this to match how
-        your existing ``X_pca`` was produced.  ``'lognorm'`` = normalize_total +
-        log1p (scanpy default); ``'none'`` = PCA directly on ``.X``.
     reference : AnnData or None
-        Clean partner for the joint PCA; ``obsm['X_pca']`` is written into it in
-        place so both slices share the embedding.  ``None`` -> clean copy of the
-        input section.
+        Slice ``section`` is a crop of; every surviving cell of ``section`` must
+        be present in it (matched by ``obs_names``) so FOSCTTM ground truth can be
+        mapped into ``reference``'s row index space.  ``None`` -> clean copy of
+        the input section.
 
     Returns
     -------
     AnnData
-        Simulated section with noised ``.X``, a consistent shared ``X_pca``, and
-        full ground truth.
+        Simulated section with noised ``.X`` and full ground truth.
     """
     if not (0.0 <= dropout_rate < 1.0):
         raise ValueError(f"dropout_rate must be in [0, 1); got {dropout_rate}.")
@@ -492,6 +392,9 @@ def simulate_adjacent_slice(
         raise ValueError(f"label_flip_rate must be in [0, 1]; got {label_flip_rate}.")
     if birth_rate < 0:
         raise ValueError(f"birth_rate must be >= 0; got {birth_rate}.")
+
+    if reference is None:
+        reference = section.copy()
 
     rng = np.random.default_rng(seed)
     meta = dict(section.uns.get("self_alignment_test", {}))
@@ -575,28 +478,8 @@ def simulate_adjacent_slice(
             f"to global per-gene std (gene-aware only).", UserWarning, stacklevel=2)
 
     # Auto-detect the expression representation.  Negatives => .X is already
-    # normalized/scaled (not counts): do NOT clip the noise and do NOT log-transform
-    # before PCA.  Decided once and applied to both slices for consistency.
-    if reference is None:
-        reference = section.copy()
-    common = [g for g in reference.var_names if g in set(sim.var_names)]
-    if not common:
-        raise ValueError("reference and section share no genes for joint PCA.")
-    ref_expr = _sanitize(
-        _to_dense(reference[:, common].layers[expression_layer] if expression_layer
-                  else reference[:, common].X), "reference .X")
-    data_has_neg = _has_negatives(E_clean) or _has_negatives(ref_expr)
-
-    eff_nonneg = (not data_has_neg) if nonneg_clip == "auto" else bool(nonneg_clip)
-    eff_preprocess = pca_preprocess
-    if eff_preprocess == "auto":
-        eff_preprocess = "none" if data_has_neg else "lognorm"
-    elif eff_preprocess in ("lognorm", "log1p") and data_has_neg:
-        warnings.warn(
-            f"pca_preprocess='{eff_preprocess}' assumes non-negative counts, but the "
-            f"expression contains negative values (already normalized/scaled). Falling "
-            f"back to 'none' (PCA directly on .X).", UserWarning, stacklevel=2)
-        eff_preprocess = "none"
+    # normalized/scaled (not counts): do NOT clip the noise.
+    eff_nonneg = (not _has_negatives(E_clean)) if nonneg_clip == "auto" else bool(nonneg_clip)
 
     E_noised, noise_info = _celltype_gene_aware_noise(
         E_clean, cell_types, expr_alpha, min_group_cells, rng, eff_nonneg)
@@ -605,30 +488,12 @@ def simulate_adjacent_slice(
     sim.X = E_noised.astype(np.float32)                        # noised .X is canonical
     if expression_layer is not None:
         sim.layers[expression_layer] = E_noised.astype(np.float32)
+    # any obsm['X_pca'] inherited from `section` is now a stale embedding of the
+    # pre-noise expression; drop it so callers cannot silently use it.  Call
+    # utils.compute_joint_pca(sim, reference) for a consistent shared embedding.
+    sim.obsm.pop("X_pca", None)
 
-    # -- 7. joint PCA computed FROM the noised .X (consistency guarantee) --
-    pca_info = None
-    if recompute_pca:
-        mat_ref = _preprocess_for_pca(ref_expr, eff_preprocess, target_sum)
-        # sim's noised expression on the shared genes, in reference gene order
-        sim_idx = {g: k for k, g in enumerate(sim.var_names)}
-        cols = [sim_idx[g] for g in common]
-        mat_sim = _preprocess_for_pca(E_noised[:, cols], eff_preprocess, target_sum)
-
-        pca = recompute_combined_pca(
-            reference, sim, mat_a=mat_ref, mat_b=mat_sim,
-            n_pcs=n_pcs, scale=scale_before_pca, key="X_pca")
-        pca_info = {
-            "n_pcs": int(pca.n_components_),
-            "pca_preprocess": eff_preprocess,
-            "scale_before_pca": bool(scale_before_pca),
-            "n_shared_genes": int(len(common)),
-            "fit_on": "reference + simulated (joint), from noised .X",
-            "explained_variance_ratio_sum": float(pca.explained_variance_ratio_.sum()),
-            "consistency": "X_pca == jointPCA(preprocess(.X))",
-        }
-
-    # -- 8. annotation noise: corrupt the labels the aligner READS (expression
+    # -- 7. annotation noise: corrupt the labels the aligner READS (expression
     #       noise above used the TRUE cell types, so this is an independent axis) --
     n_flipped = 0
     if celltype_key in sim.obs.columns:
@@ -672,8 +537,7 @@ def simulate_adjacent_slice(
     meta["adjacent_simulation"] = {
         "seed": (-1 if seed is None else seed),
         "apply_order": ["dropout", "warp", "jitter", "collision_resolve",
-                        "rigid", "expr_noise(.X)", "joint_pca(from .X)",
-                        "label_noise", "birth_cells"],
+                        "rigid", "expr_noise(.X)", "label_noise", "birth_cells"],
         "model": "cell_preserving_z_displaced",
         "affine_A": A, "affine_b": b, "affine_A_inv": A_inv, "affine_b_inv": b_inv,
         "rotation_deg": float(rotation_deg), "rotation_radians": angle_rad,
@@ -696,14 +560,13 @@ def simulate_adjacent_slice(
         "birth_rate": float(birth_rate),
         "birth_offset_scale": float(birth_offset_scale),
         "expr_noise": noise_info,
-        "expression_layer": (expression_layer if expression_layer is not None else ""), "target_sum": float(target_sum),
-        "combined_pca": (pca_info if pca_info is not None else {}),
+        "expression_layer": (expression_layer if expression_layer is not None else ""),
         "ground_truth_keys": {
             "spatial_unperturbed": "obsm['spatial_unperturbed'] (NaN for birth cells)",
             "prerigid_displacement": "obsm['adjacent_displacement_prerigid']",
             "expression_pre_noise": "layers['X_unperturbed']",
             "noised_expression": ".X (canonical)",
-            "shared_embedding": "obsm['X_pca'] (both slices, derived from .X)",
+            "shared_embedding": "call utils.compute_joint_pca(sim, reference) to populate obsm['X_pca']",
             "clean_labels": f"obs['{celltype_key}_clean']",
             "label_flipped_mask": "obs['adjacent_label_flipped']",
             "birth_mask": "obs['adjacent_is_birth'] (exclude from correspondence scoring)",
@@ -779,6 +642,7 @@ if __name__ == "__main__":
         adata = sc.read_h5ad(args.input_h5ad)
         reference = sc.read_h5ad(args.reference_h5ad)
         sim = simulate_adjacent_slice(adata, reference=reference, seed=args.seed)
+        sim, reference = compute_joint_pca(sim, reference)
         show_slice(sim)
         sim.write_h5ad(args.output_h5ad)
         print(f"Simulated adjacent slice written to {args.output_h5ad}.")
