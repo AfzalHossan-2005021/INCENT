@@ -192,7 +192,7 @@ def hierarchical_pairwise_align(
     beta: float = 0.5,
     gamma: float = 0.25,
     alpha_cluster: float = 0.5,
-    delta: float = 0.75,
+    delta: float = 0.5,
     reg_m: float = 1.0,
     numItermax: int = 100000,
     use_gpu: bool = True,
