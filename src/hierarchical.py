@@ -455,33 +455,6 @@ def fit_weighted_rigid_transform(source_points, target_points, weights=None):
     return R, t
 
 
-def seed_is_well_conditioned(points_A, points_B, transform_scale, min_spread_ratio=0.25):
-    """
-    True iff both point sets have non-degenerate 2D spread (not (near-)collinear).
-
-    A rigid transform fit to very few or (near-)collinear points can land at
-    near-zero residual almost independent of whether the correspondence is
-    actually correct: with 2 points, rotation is barely constrained at all, and
-    even 3 near-collinear points leave the orientation underdetermined in the
-    direction perpendicular to the line. Such a fit then "looks" trustworthy
-    to `score_frontier_matches`/`score_macro_hypothesis` regardless of whether
-    it is -- and because frontier expansion only ever admits pairs consistent
-    with the transform it already trusts, an early bad fit is self-reinforcing.
-    Requiring a minimum spread along the minor axis (relative to the
-    characteristic inter-cluster spacing) ensures the fitted orientation is
-    actually pinned down by the data before it is used as a consistency signal.
-    """
-    for pts in (np.asarray(points_A, dtype=np.float64), np.asarray(points_B, dtype=np.float64)):
-        if pts.shape[0] < 3:
-            return False
-        centered = pts - pts.mean(axis=0)
-        svals = np.linalg.svd(centered, compute_uv=False)
-        minor_extent = float(svals[-1]) if svals.size > 1 else 0.0
-        if minor_extent < min_spread_ratio * transform_scale:
-            return False
-    return True
-
-
 def empirical_logit_evidence(values, larger_is_better=True):
     """
     Convert a score vector into centered, parameter-free evidence values.
@@ -594,23 +567,22 @@ def score_frontier_matches(
     The score combines:
     1. global pair evidence from transport enrichment and niche context
     2. support from already selected neighboring pairs
-    3. rigid consistency, but only once the selected pairs are enough (and
-       spatially spread out enough) to actually pin down an orientation --
-       see `seed_is_well_conditioned`
+    3. rigid consistency, but only once at least two selected pairs define an
+       orientation-aware transform
     """
     if not frontier_A or not frontier_B or not selected_pairs:
         return [], []
 
-    seed_points_A = centroids_A[[u for u, _ in selected_pairs]]
-    seed_points_B = centroids_B[[v for _, v in selected_pairs]]
-    use_rigid = seed_is_well_conditioned(seed_points_A, seed_points_B, transform_scale)
+    use_rigid = len(selected_pairs) >= 2
     if use_rigid:
         seed_weights = np.array(
             [max(mi_contrib[u, v], 1e-12) for u, v in selected_pairs],
             dtype=np.float64
         )
         R_seed, t_seed = fit_weighted_rigid_transform(
-            seed_points_A, seed_points_B, weights=seed_weights
+            centroids_A[[u for u, _ in selected_pairs]],
+            centroids_B[[v for _, v in selected_pairs]],
+            weights=seed_weights
         )
     else:
         R_seed = None
@@ -1228,17 +1200,17 @@ def score_macro_hypothesis(
     topology_score = 0.0
     attachment_score = 0.0
 
-    transform_scale = max(edge_scale_A, edge_scale_B, 1e-12)
-    sel_points_A = centroids_A[[u for u, _ in selected_pairs]]
-    sel_points_B = centroids_B[[v for _, v in selected_pairs]]
-    if seed_is_well_conditioned(sel_points_A, sel_points_B, transform_scale):
+    if len(selected_pairs) >= 2:
         weights = np.array(
             [max(mi_contrib[u, v], 1e-12) for u, v in selected_pairs],
             dtype=np.float64,
         )
         R_sel, t_sel = fit_weighted_rigid_transform(
-            sel_points_A, sel_points_B, weights=weights,
+            centroids_A[[u for u, _ in selected_pairs]],
+            centroids_B[[v for _, v in selected_pairs]],
+            weights=weights,
         )
+        transform_scale = max(edge_scale_A, edge_scale_B, 1e-12)
         rigid_residuals = [
             float(
                 np.linalg.norm(centroids_B[v] - (centroids_A[u] @ R_sel.T + t_sel))
