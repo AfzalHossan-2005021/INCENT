@@ -548,6 +548,78 @@ def collect_candidate_match_pairs(Pi_cluster, valid_A, valid_B):
     return matches, enrichment_signal, global_pair_scores, global_pair_evidence, mi_contrib, log_enrichment, diagnostics
 
 
+def geometric_admissibility_radius(
+    selected_pairs,
+    frontier_B,
+    R_seed,
+    t_seed,
+    centroids_A,
+    centroids_B,
+    transform_scale,
+):
+    r"""
+    Largest rigid residual for which a frontier pair still reads as the *same*
+    location rather than an unrelated cluster, derived without any free tuning.
+
+    The macro-section must grow so that the two selected portions keep the same
+    shape. A candidate cluster pair ``(u, v)`` is geometrically admissible only
+    if the target centroid ``centroids_B[v]`` sits where the current
+    seed-derived rigid transform maps ``centroids_A[u]``, up to registration
+    noise. Deciding "up to noise" without a hand-set tolerance is a model
+    comparison, not a threshold:
+
+    * **Inlier model** -- ``u`` and ``v`` are the same anatomical location, so
+      the displacement ``r = ||centroids_B[v] - (R centroids_A[u] + t)||`` is
+      isotropic Gaussian registration noise with mean-squared displacement
+      ``A`` estimated by maximum likelihood from the residuals the already
+      selected pairs exhibit under the same transform.
+    * **Diffuse-outlier model** -- ``v`` carries no positional correspondence
+      and could be any cluster in the region under consideration, i.e. an
+      isotropic Gaussian with mean-squared displacement ``B`` equal to the
+      spread of the candidate/selected target centroids about their mean.
+
+    For two isotropic 2-D Gaussians the log Bayes factor in favour of the inlier
+    model is ``log(B/A) - r^2/A + r^2/B``. The admissibility boundary is the
+    residual at which the two models are equally plausible (log Bayes factor
+    ``= 0``), obtained in closed form as ``r^2 = log(B/A) * A * B / (B - A)``.
+    Every quantity is a maximum-likelihood estimate from the data, so the
+    boundary contains no threshold, multiplier, or significance level.
+
+    Residuals are expressed in units of the characteristic cluster spacing
+    (they are divided by ``transform_scale``). The inlier scale ``A`` is floored
+    at one such unit because distinct clusters cannot be spatially resolved -- nor
+    their centroids localized -- below the median inter-cluster gap, so the
+    registration noise is not physically tighter than one normalized unit. When
+    the region is not yet spread more widely than its own registration noise
+    (``B <= A``) the diffuse model carries no discriminative power, so no
+    contiguous candidate can be rejected and the radius is infinite.
+
+    Returns
+    -------
+    float
+        Admissibility radius in units of ``transform_scale``; frontier pairs
+        with a larger normalized residual are geometrically inadmissible.
+    """
+    source = centroids_A[[u for u, _ in selected_pairs]]
+    target = centroids_B[[v for _, v in selected_pairs]]
+    predicted = source @ R_seed.T + t_seed
+    inlier_msd = float(np.mean(np.sum((target - predicted) ** 2, axis=1))) / transform_scale ** 2
+    # Structural-resolution floor: one median inter-cluster spacing == 1.0 in
+    # normalized units (see ``normalize_contact_graph``).
+    inlier_msd = max(inlier_msd, 1.0)
+
+    region_v = sorted({v for _, v in selected_pairs}.union(frontier_B))
+    region_centroids = centroids_B[region_v] / transform_scale
+    diffuse_msd = float(
+        np.mean(np.sum((region_centroids - region_centroids.mean(axis=0)) ** 2, axis=1))
+    )
+
+    if diffuse_msd <= inlier_msd:
+        return np.inf
+    boundary_sq = np.log(diffuse_msd / inlier_msd) * inlier_msd * diffuse_msd / (diffuse_msd - inlier_msd)
+    return float(np.sqrt(boundary_sq))
+
+
 def score_frontier_matches(
     frontier_A,
     frontier_B,
@@ -569,6 +641,23 @@ def score_frontier_matches(
     2. support from already selected neighboring pairs
     3. rigid consistency, but only once at least two selected pairs define an
        orientation-aware transform
+
+    In addition to scoring, once an orientation is identifiable the frontier is
+    passed through a geometric admissibility test that keeps the two selected
+    portions the same shape. The rank-based rigid evidence in (3) only expresses
+    a *relative* preference among the frontier and cannot, on its own, reject a
+    frontier that is geometrically wrong as a whole. The admissibility test is
+    absolute: a candidate pair ``(u, v)`` is retained only when the observed
+    rigid residual is better explained by ``u`` and ``v`` being the *same*
+    anatomical location (an inlier whose displacement reflects only registration
+    noise) than by the null in which ``v`` is an unrelated cluster lying anywhere
+    in the region under consideration. This is the standard Gaussian-inlier /
+    diffuse-outlier registration mixture (Myronenko & Song, *Coherent Point
+    Drift*, IEEE TPAMI 2010), evaluated as a log Bayes factor. The decision
+    boundary is the residual at which the two models are equally likely
+    (log-odds = 0); it is therefore fixed entirely by the data -- the ratio of
+    the registration-noise scale to the tissue scale -- and introduces no
+    tolerance threshold, multiplier, or significance level to tune.
     """
     if not frontier_A or not frontier_B or not selected_pairs:
         return [], []
@@ -584,9 +673,19 @@ def score_frontier_matches(
             centroids_B[[v for _, v in selected_pairs]],
             weights=seed_weights
         )
+        residual_gate = geometric_admissibility_radius(
+            selected_pairs=selected_pairs,
+            frontier_B=frontier_B,
+            R_seed=R_seed,
+            t_seed=t_seed,
+            centroids_A=centroids_A,
+            centroids_B=centroids_B,
+            transform_scale=transform_scale,
+        )
     else:
         R_seed = None
         t_seed = None
+        residual_gate = np.inf
 
     frontier_pairs = []
     support_strengths = []
@@ -615,6 +714,14 @@ def score_frontier_matches(
                 rigid_residual = float(
                     np.linalg.norm(centroids_B[v] - rigid_prediction) / transform_scale
                 )
+                # Shape-preservation admissibility: reject candidates whose
+                # residual falls on the diffuse-outlier side of the log Bayes
+                # factor (``rigid_residual`` beyond ``residual_gate``). Growing
+                # on such a pair would bend region B into a different outline
+                # than region A, breaking the intended "same shape"
+                # correspondence between the two selected portions.
+                if rigid_residual > residual_gate:
+                    continue
             else:
                 rigid_residual = 0.0
 
