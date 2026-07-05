@@ -47,7 +47,7 @@ except ImportError:
     from src.tuning import make_self_alignment_instances, gpu_available, _quiet
     from src.evaluation import evaluate_alignment
 
-DEFAULT_REG_M_GRID = [0.1, 0.5, 1.0, 5.0, 10.0]
+DEFAULT_REG_M_GRID = [0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1.0, 5.0, 10.0]
 DEFAULT_PERTURB = dict(
     dropout_rate=0.10,
     rotation_range=(-180.0, 180.0),
