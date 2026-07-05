@@ -43,6 +43,11 @@ from .visualize import (
 # coarse and fine stages of the pipeline commit to a single, consistent spatial scale.
 NEIGHBORHOOD_OUTER_MULTIPLIER = 10.0
 
+# Default marginal-relaxation penalty for the unbalanced coarse FUGW (``reg_marginals``
+# in POT). See ``run_coarse_fugw`` / ``benchmark/reg_m_sensitivity.py`` for the sweep
+# that justifies this default.
+DEFAULT_REG_M = 1.0
+
 
 def estimate_coarsen_length(sliceA, sliceB, spatial_key="spatial"):
     """
@@ -193,7 +198,7 @@ def hierarchical_pairwise_align(
     gamma: float = 0.25,
     alpha_cluster: float = 0.5,
     delta: float = 0.5,
-    reg_m: float = 1.0,
+    reg_m: float = DEFAULT_REG_M,
     numItermax: int = 100000,
     use_gpu: bool = True,
     coarsen_scale: Optional[float] = None,
