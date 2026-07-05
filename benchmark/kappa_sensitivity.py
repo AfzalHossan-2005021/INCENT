@@ -30,13 +30,26 @@ from typing import Optional
 
 import numpy as np
 
-from src.core import (
-    estimate_characteristic_spacing,
-    hierarchical_pairwise_align,
-    NEIGHBORHOOD_OUTER_MULTIPLIER,
-)
-from src.tuning import make_self_alignment_instances, gpu_available, _quiet
-from src.evaluation import evaluate_alignment
+try:
+    # Package context (e.g. `import INCENT` from a parent directory, as on Kaggle):
+    # `src` only exists as a submodule of the enclosing package, not top-level.
+    from ..src.core import (
+        estimate_characteristic_spacing,
+        hierarchical_pairwise_align,
+        NEIGHBORHOOD_OUTER_MULTIPLIER,
+    )
+    from ..src.tuning import make_self_alignment_instances, gpu_available, _quiet
+    from ..src.evaluation import evaluate_alignment
+except ImportError:
+    # Script context (`python -m benchmark.kappa_sensitivity` from the repo root):
+    # `benchmark` and `src` are sibling top-level packages on sys.path.
+    from src.core import (
+        estimate_characteristic_spacing,
+        hierarchical_pairwise_align,
+        NEIGHBORHOOD_OUTER_MULTIPLIER,
+    )
+    from src.tuning import make_self_alignment_instances, gpu_available, _quiet
+    from src.evaluation import evaluate_alignment
 
 DEFAULT_KAPPA_GRID = [5, 7.5, 10, 12.5, 15]
 DEFAULT_PERTURB = dict(
@@ -131,7 +144,7 @@ def run_kappa_sensitivity(
     spatial_key: str = "spatial",
     n_jobs: int = 1,
     seed: int = 0,
-    outdir: Optional[str] = None,
+    outdir: Optional[str] = 'results/kappa_sensitivity',
 ) -> dict:
     """
     Sweep kappa and report alignment metrics averaged over ``n_instances`` pairs.

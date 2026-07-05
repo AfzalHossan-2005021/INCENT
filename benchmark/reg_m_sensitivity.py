@@ -34,9 +34,18 @@ from typing import Callable, Optional
 
 import numpy as np
 
-from src.core import hierarchical_pairwise_align, DEFAULT_REG_M
-from src.tuning import make_self_alignment_instances, gpu_available, _quiet
-from src.evaluation import evaluate_alignment
+try:
+    # Package context (e.g. `import INCENT` from a parent directory, as on Kaggle):
+    # `src` only exists as a submodule of the enclosing package, not top-level.
+    from ..src.core import hierarchical_pairwise_align, DEFAULT_REG_M
+    from ..src.tuning import make_self_alignment_instances, gpu_available, _quiet
+    from ..src.evaluation import evaluate_alignment
+except ImportError:
+    # Script context (`python -m benchmark.reg_m_sensitivity` from the repo root):
+    # `benchmark` and `src` are sibling top-level packages on sys.path.
+    from src.core import hierarchical_pairwise_align, DEFAULT_REG_M
+    from src.tuning import make_self_alignment_instances, gpu_available, _quiet
+    from src.evaluation import evaluate_alignment
 
 DEFAULT_REG_M_GRID = [0.1, 0.5, 1.0, 5.0, 10.0]
 DEFAULT_PERTURB = dict(
@@ -165,7 +174,7 @@ def run_reg_m_sensitivity(
     n_jobs: int = 1,
     device_ids=None,
     seed: int = 0,
-    outdir: Optional[str] = None,
+    outdir: Optional[str] = 'results/reg_m_sensitivity',
 ) -> dict:
     """
     Sweep reg_m and report alignment metrics averaged over ``n_instances`` pairs.
