@@ -165,6 +165,7 @@ def run_reg_m_sensitivity(
     reference=None,
     *,
     crops=None,
+    real_pairs=None,
     reg_m_grid=DEFAULT_REG_M_GRID,
     n_instances: int = 3,
     perturb_kwargs: Optional[dict] = None,
@@ -179,19 +180,31 @@ def run_reg_m_sensitivity(
     """
     Sweep reg_m and report alignment metrics averaged over ``n_instances`` pairs.
 
-    Instance source (priority ``crops`` > ``section``+``reference``), matching
-    the convention of :func:`select_alignment_weights` and :func:`run_kappa_sensitivity`.
+    Instance source (priority ``real_pairs`` > ``crops`` > ``section``+``reference``),
+    matching the convention of :func:`select_alignment_weights` and
+    :func:`run_kappa_sensitivity`.
 
     Parameters
     ----------
     section, reference:
         AnnData slices (section is the simulated/cropped slice, reference is the
-        full parent slice). Used when ``crops`` is None.
+        full parent slice). Used when neither ``real_pairs`` nor ``crops`` is given.
     crops:
         Explicit list of ``(section, reference)`` AnnData pairs. When given,
         ``section``, ``reference``, and ``n_instances`` are ignored — one
-        instance is produced per crop. Mirrors the ``crops`` argument of
+        synthetic self-alignment instance (via :func:`simulate_adjacent_slice`)
+        is produced per crop. Mirrors the ``crops`` argument of
         :func:`select_alignment_weights`.
+    real_pairs:
+        Explicit list of genuine ``(sliceA, sliceB)`` AnnData pairs to align
+        as-is — **no** :func:`simulate_adjacent_slice` perturbation is applied,
+        so this is the only mode that reflects real deployment noise (registration
+        drift, true non-overlap, real dropout) rather than synthetic instances
+        built from a single crop. Takes priority over ``crops`` and
+        ``section``/``reference``; ``perturb_kwargs`` and ``n_instances`` are
+        ignored. Since there is no ground truth correspondence, FOSCTTM/
+        neg_foscttm come back as ``None`` (NaN in the aggregated rows) — only
+        stability, LTA, and expr_corr are meaningful here.
     reg_m_grid:
         List of reg_m values to evaluate. Default: [0.1, 0.5, 1.0, 5.0, 10.0].
     n_instances:
@@ -230,8 +243,8 @@ def run_reg_m_sensitivity(
         ``default_reg_m`` — the package default (DEFAULT_REG_M),
         ``config`` — run configuration for reproducibility.
     """
-    if crops is None and (section is None or reference is None):
-        raise ValueError("Provide either `crops` or both `section` and `reference`.")
+    if real_pairs is None and crops is None and (section is None or reference is None):
+        raise ValueError("Provide `real_pairs`, `crops`, or both `section` and `reference`.")
     if "reg_m" in (align_kwargs or {}):
         raise ValueError(
             "Do not pass reg_m in align_kwargs — "
@@ -258,17 +271,23 @@ def run_reg_m_sensitivity(
     else:
         device_ids = None
 
-    perturb_kwargs = dict(perturb_kwargs or DEFAULT_PERTURB)
-
-    # Generate instances once; reuse across all reg_m values
-    instances = make_self_alignment_instances(
-        section=section, reference=reference, crops=crops,
-        n_instances=n_instances,
-        perturb_kwargs=perturb_kwargs,
-        seed=seed,
-    )
-    print(f"[reg_m_sensitivity] {len(instances)} instance(s) generated, "
-          f"sweeping {len(reg_m_grid)} reg_m values: {reg_m_grid}")
+    if real_pairs is not None:
+        instances = list(real_pairs)
+        perturb_kwargs = None
+        print(f"[reg_m_sensitivity] {len(instances)} real pair(s) supplied "
+              "(no synthetic perturbation, no ground truth -- FOSCTTM will be N/A), "
+              f"sweeping {len(reg_m_grid)} reg_m values: {reg_m_grid}")
+    else:
+        perturb_kwargs = dict(perturb_kwargs or DEFAULT_PERTURB)
+        # Generate instances once; reuse across all reg_m values
+        instances = make_self_alignment_instances(
+            section=section, reference=reference, crops=crops,
+            n_instances=n_instances,
+            perturb_kwargs=perturb_kwargs,
+            seed=seed,
+        )
+        print(f"[reg_m_sensitivity] {len(instances)} instance(s) generated, "
+              f"sweeping {len(reg_m_grid)} reg_m values: {reg_m_grid}")
 
     def _job(reg_m):
         row = _eval_reg_m(reg_m, instances, align_kwargs, label_key, min_total_mass, aligner=aligner)
@@ -296,8 +315,9 @@ def run_reg_m_sensitivity(
         "default_reg_m": float(DEFAULT_REG_M),
         "config": {
             "reg_m_grid": list(reg_m_grid),
-            "n_instances": n_instances if crops is None else len(instances),
-            "mode": "crops" if crops is not None else "section+reference",
+            "n_instances": len(instances),
+            "mode": "real_pairs" if real_pairs is not None
+                    else "crops" if crops is not None else "section+reference",
             "perturb_kwargs": perturb_kwargs,
             "min_total_mass": min_total_mass,
             "seed": seed,
@@ -392,14 +412,23 @@ if __name__ == "__main__":
         description="Sensitivity analysis for the marginal-relaxation penalty reg_m."
     )
     ap.add_argument("--reference_h5ad",
-                    help="Full parent slice (.h5ad). Required unless --crops_h5ad is used.")
+                    help="Full parent slice (.h5ad). Required unless --crops_h5ad or "
+                         "--real_pairs_h5ad is used.")
     ap.add_argument("--section_h5ad",
                     help="Cropped section (.h5ad); parent-frame coords whose "
-                         "obs_names subset the reference. Required unless --crops_h5ad is used.")
+                         "obs_names subset the reference. Required unless --crops_h5ad or "
+                         "--real_pairs_h5ad is used.")
     ap.add_argument("--crops_h5ad", nargs="+", metavar="SECTION REF",
                     help="Explicit crop pairs as alternating section/reference .h5ad paths "
-                         "(e.g. sec1.h5ad ref1.h5ad sec2.h5ad ref2.h5ad). "
-                         "When given, --section_h5ad and --reference_h5ad are ignored.")
+                         "(e.g. sec1.h5ad ref1.h5ad sec2.h5ad ref2.h5ad); each pair is still "
+                         "run through simulate_adjacent_slice for a synthetic self-alignment "
+                         "instance. Ignored when --real_pairs_h5ad is given.")
+    ap.add_argument("--real_pairs_h5ad", nargs="+", metavar="SLICE_A SLICE_B",
+                    help="Genuine real slice pairs to align as-is, alternating paths "
+                         "(e.g. a1.h5ad b1.h5ad a2.h5ad b2.h5ad) -- no synthetic "
+                         "perturbation, no ground truth (FOSCTTM will be N/A; only "
+                         "stability, LTA, and expr_corr are meaningful). Takes priority "
+                         "over --crops_h5ad and --section_h5ad/--reference_h5ad.")
     ap.add_argument("--outdir", default="results/reg_m_sensitivity")
     ap.add_argument("--reg_m_grid", type=float, nargs="+",
                     default=DEFAULT_REG_M_GRID, metavar="R",
@@ -429,24 +458,33 @@ if __name__ == "__main__":
     else:
         use_gpu = args.use_gpu == "true"
 
-    if args.crops_h5ad is not None:
+    real_pairs = None
+    crops = None
+    section = reference = None
+    if args.real_pairs_h5ad is not None:
+        paths = args.real_pairs_h5ad
+        if len(paths) % 2 != 0:
+            ap.error("--real_pairs_h5ad requires an even number of paths (sliceA sliceB pairs).")
+        real_pairs = [(sc.read_h5ad(paths[i]), sc.read_h5ad(paths[i + 1]))
+                      for i in range(0, len(paths), 2)]
+    elif args.crops_h5ad is not None:
         paths = args.crops_h5ad
         if len(paths) % 2 != 0:
             ap.error("--crops_h5ad requires an even number of paths (section ref pairs).")
         crops = [(sc.read_h5ad(paths[i]), sc.read_h5ad(paths[i + 1]))
                  for i in range(0, len(paths), 2)]
-        section = reference = None
     else:
         if not args.section_h5ad or not args.reference_h5ad:
-            ap.error("Provide either --crops_h5ad or both --section_h5ad and --reference_h5ad.")
+            ap.error("Provide --real_pairs_h5ad, --crops_h5ad, or both "
+                     "--section_h5ad and --reference_h5ad.")
         section = sc.read_h5ad(args.section_h5ad)
         reference = sc.read_h5ad(args.reference_h5ad)
-        crops = None
 
     res = run_reg_m_sensitivity(
         section,
         reference,
         crops=crops,
+        real_pairs=real_pairs,
         reg_m_grid=args.reg_m_grid,
         n_instances=args.n_instances,
         align_kwargs={"use_gpu": use_gpu},
