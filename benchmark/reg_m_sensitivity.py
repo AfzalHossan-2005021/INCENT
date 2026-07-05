@@ -29,7 +29,8 @@ from __future__ import annotations
 import json
 import os
 import concurrent.futures
-from typing import Optional
+from queue import Queue
+from typing import Callable, Optional
 
 import numpy as np
 
@@ -62,10 +63,41 @@ def _is_stable_pi(pi: np.ndarray, min_total_mass: float = 0.05) -> bool:
     return True
 
 
-def _align_one(sliceA, sliceB, reg_m: float, align_kwargs: dict):
+def _make_device_aware_aligner(aligner: Callable, device_ids: list) -> Callable:
+    """Wrap aligner so each thread picks a GPU from the pool via torch.cuda.device().
+
+    Mirrors ``_make_device_pool_score`` in src/tuning.py, but wraps an
+    (sliceA, sliceB, **kwargs) aligner signature instead of a score_fn.
+    ``torch.cuda.device()`` is thread-local, so concurrent threads (one per
+    reg_m point, via ``n_jobs``) can each hold a different device without
+    cross-contamination. Returns the original aligner unchanged when CUDA is
+    not available.
+    """
+    try:
+        import torch
+    except ImportError:
+        return aligner
+    if not torch.cuda.is_available():
+        return aligner
+    pool: Queue = Queue()
+    for did in device_ids:
+        pool.put(did)
+
+    def _wrapped(sliceA, sliceB, **kwargs):
+        did = pool.get()
+        try:
+            with torch.cuda.device(did):
+                return aligner(sliceA, sliceB, **kwargs)
+        finally:
+            pool.put(did)
+
+    return _wrapped
+
+
+def _align_one(aligner: Callable, sliceA, sliceB, reg_m: float, align_kwargs: dict):
     try:
         with _quiet(True):
-            pi = hierarchical_pairwise_align(
+            pi = aligner(
                 sliceA, sliceB,
                 reg_m=reg_m,
                 **align_kwargs,
@@ -82,12 +114,13 @@ def _eval_reg_m(
     align_kwargs: dict,
     label_key: str,
     min_total_mass: float,
+    aligner: Callable = hierarchical_pairwise_align,
 ) -> dict:
     """Align all instances at a given reg_m; return averaged metrics."""
     mets = []
     n_unstable = 0
     for sim, ref in instances:
-        pi = _align_one(sim, ref, reg_m, align_kwargs)
+        pi = _align_one(aligner, sim, ref, reg_m, align_kwargs)
         if pi is None:
             n_unstable += 1
             continue
@@ -130,6 +163,7 @@ def run_reg_m_sensitivity(
     label_key: str = "cell_type_annot",
     min_total_mass: float = 0.05,
     n_jobs: int = 1,
+    device_ids=None,
     seed: int = 0,
     outdir: Optional[str] = None,
 ) -> dict:
@@ -168,6 +202,14 @@ def run_reg_m_sensitivity(
     n_jobs:
         Number of parallel threads for evaluating reg_m points (default 1).
         Safe only on CPU or with multiple GPUs routed to separate threads.
+    device_ids:
+        CUDA device indices to distribute reg_m points across (e.g. ``[0, 1]``),
+        mirroring the ``device_ids`` argument of :func:`select_alignment_weights`.
+        With a single GPU ``n_jobs`` is forced to 1 (concurrent CUDA calls on one
+        device are unsafe). With ``len(device_ids) > 1`` and ``n_jobs > 1``, each
+        thread grabs a free device from a pool via ``torch.cuda.device()`` so
+        different reg_m points align concurrently on different GPUs. Ignored
+        when ``use_gpu`` is False.
     outdir:
         If given, writes ``reg_m_sensitivity.json`` and ``reg_m_sensitivity.png``.
 
@@ -192,6 +234,21 @@ def run_reg_m_sensitivity(
     align_kwargs.setdefault("verbose", False)
     align_kwargs.setdefault("visualize_clusters", False)
 
+    aligner = hierarchical_pairwise_align
+    if align_kwargs["use_gpu"]:
+        if device_ids is None:
+            device_ids = [0]
+        n_gpu = len(device_ids)
+        print(f"[reg_m_sensitivity] GPU (CUDA) enabled: {n_gpu} device(s) {device_ids}.")
+        if n_gpu == 1 and n_jobs > 1:
+            print("[reg_m_sensitivity] n_jobs forced to 1: single GPU, concurrent CUDA calls unsafe.")
+            n_jobs = 1
+        elif n_gpu > 1 and n_jobs > 1:
+            print(f"[reg_m_sensitivity] multi-GPU parallel: {n_gpu} GPUs x n_jobs={n_jobs}.")
+            aligner = _make_device_aware_aligner(aligner, device_ids)
+    else:
+        device_ids = None
+
     perturb_kwargs = dict(perturb_kwargs or DEFAULT_PERTURB)
 
     # Generate instances once; reuse across all reg_m values
@@ -205,7 +262,7 @@ def run_reg_m_sensitivity(
           f"sweeping {len(reg_m_grid)} reg_m values: {reg_m_grid}")
 
     def _job(reg_m):
-        row = _eval_reg_m(reg_m, instances, align_kwargs, label_key, min_total_mass)
+        row = _eval_reg_m(reg_m, instances, align_kwargs, label_key, min_total_mass, aligner=aligner)
         lta = row.get("lta", float("nan"))
         foscttm = row.get("foscttm", float("nan"))
         expr_corr = row.get("expr_corr", float("nan"))
@@ -236,6 +293,7 @@ def run_reg_m_sensitivity(
             "min_total_mass": min_total_mass,
             "seed": seed,
             "n_jobs": n_jobs,
+            "device_ids": device_ids,
         },
     }
 
@@ -345,7 +403,14 @@ if __name__ == "__main__":
                     help="Minimum total transported mass for a plan to count as "
                          "numerically stable (default: 0.05).")
     ap.add_argument("--n_jobs", type=int, default=1,
-                    help="Parallel threads for reg_m evaluation (default: 1).")
+                    help="Parallel threads for reg_m evaluation (default: 1). "
+                         "Forced to 1 with a single GPU; with --device_ids 0 1 "
+                         "n_jobs=2 routes each thread to a separate GPU.")
+    ap.add_argument("--device_ids", type=int, nargs="+", default=None,
+                    metavar="ID",
+                    help="CUDA device indices to use (e.g. --device_ids 0 1 for two "
+                         "GPUs). Defaults to [0] when use_gpu is True. Multi-GPU "
+                         "requires n_jobs>1.")
     ap.add_argument("--use_gpu", choices=["auto", "true", "false"], default="auto")
     ap.add_argument("--seed", type=int, default=0)
     args = ap.parse_args()
@@ -378,6 +443,7 @@ if __name__ == "__main__":
         align_kwargs={"use_gpu": use_gpu},
         min_total_mass=args.min_total_mass,
         n_jobs=args.n_jobs,
+        device_ids=args.device_ids,
         seed=args.seed,
         outdir=args.outdir,
     )

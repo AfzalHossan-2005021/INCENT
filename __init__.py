@@ -26,6 +26,13 @@ from .src import (
     compute_joint_pca,
 )
 
+from .benchmark import (
+    run_kappa_sensitivity,
+    DEFAULT_KAPPA_GRID,
+    run_reg_m_sensitivity,
+    DEFAULT_REG_M_GRID,
+)
+
 __all__ = [
     # core alignment
     'pairwise_align',
@@ -60,4 +67,9 @@ __all__ = [
     'gpu_available',
     # utils
     'compute_joint_pca',
+    # benchmarking
+    'run_kappa_sensitivity',
+    'DEFAULT_KAPPA_GRID',
+    'run_reg_m_sensitivity',
+    'DEFAULT_REG_M_GRID'
 ]
