@@ -178,6 +178,7 @@ def make_self_alignment_instances(
     *,
     crops=None,
     n_instances: int = 3,
+    perturb: bool = True,
     perturb_kwargs: Optional[dict] = None,
     max_cells: Optional[int] = None,
     seed: int = 0,
@@ -200,6 +201,18 @@ def make_self_alignment_instances(
     and the (copied) reference, so each pair is in a comparable embedding.
     Instances are generated ONCE and reused across all weight candidates (weights
     do not change the PCA) -- the main speed-up of the sweep.
+
+    perturb:
+        If ``False``, skip the (often slow -- warp/collision-resolution scale with
+        cell count) :func:`simulate_adjacent_slice` call entirely: each ``sec_src``
+        is used as-is for ``sim`` (a copy). Use this when ``crops`` already holds
+        pre-perturbed ``(sim, reference)`` pairs -- e.g. cached from an earlier
+        ``perturb=True`` call, or built by your own process -- so repeated ablation/
+        sensitivity runs don't pay the perturbation cost again. Existing
+        ``sim.uns["self_alignment_test"]`` ground truth (if any) is left untouched
+        and still consumed by :func:`_subsample_paired` / FOSCTTM. Requires
+        ``crops`` (raises otherwise): with ``section``+``reference`` there would be
+        nothing to distinguish the ``n_instances`` copies without perturbation.
     """
     perturb_kwargs = dict(perturb_kwargs or {})
     rng = np.random.default_rng(seed)
@@ -211,12 +224,22 @@ def make_self_alignment_instances(
     else:
         raise ValueError("Provide either (`section` and `reference`) or `crops`.")
 
+    if not perturb and crops is None:
+        raise ValueError(
+            "perturb=False requires `crops` (pre-perturbed section/reference "
+            "pairs); with `section`+`reference` there is nothing else to "
+            "distinguish the `n_instances` copies."
+        )
+
     instances = []
     for sec_src, ref_src in sources:
         ref = ref_src.copy()
-        s = int(rng.integers(0, 2**31 - 1))
-        with _quiet(True):
-            sim = simulate_adjacent_slice(sec_src.copy(), reference=ref, seed=s, **perturb_kwargs)
+        if perturb:
+            s = int(rng.integers(0, 2**31 - 1))
+            with _quiet(True):
+                sim = simulate_adjacent_slice(sec_src.copy(), reference=ref, seed=s, **perturb_kwargs)
+        else:
+            sim = sec_src.copy()
         sim, ref = compute_joint_pca(sim, ref)
         instances.append(_subsample_paired(sim, ref, max_cells, rng))
     return instances

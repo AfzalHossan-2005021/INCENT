@@ -56,6 +56,7 @@ or call :func:`run_ablation` directly with in-memory AnnData objects.
 
 from __future__ import annotations
 
+import csv
 import json
 import os
 import concurrent.futures
@@ -281,27 +282,42 @@ def _eval_variant(
     variant: AblationVariant, instances: list, base_weights: dict, base_align_kwargs: dict,
     label_key: str, min_total_mass: float,
     aligner_override: Optional[Callable] = None,
+    keep_pi: bool = False,
 ) -> dict:
-    """Align all instances for one variant; return per-instance metrics + n_ok/n_unstable."""
+    """Align all instances for one variant; return per-instance metrics + n_ok/n_unstable.
+
+    keep_pi: if True, also collect the raw transport plan for every instance
+    (None for failed/unstable ones) under the "pi_list" key, so the caller can
+    persist them for later re-analysis without re-running alignment. Kept out of
+    the return dict by default since a plan is O(n_A * n_B) and JSON-unsafe.
+    """
     per_instance = []
+    pi_list = [] if keep_pi else None
     n_unstable = 0
     for sim, ref in instances:
         pi = _align_one(variant, sim, ref, base_weights, base_align_kwargs, aligner_override=aligner_override)
         if not _is_stable_pi(pi, min_total_mass=min_total_mass):
             n_unstable += 1
             per_instance.append(None)
+            if keep_pi:
+                pi_list.append(None)
             continue
         m = evaluate_alignment(pi, sim, ref, sim_axis=0, label_key=label_key, include_expression=True)
         per_instance.append(m)
+        if keep_pi:
+            pi_list.append(pi)
 
     n_ok = sum(1 for m in per_instance if m is not None)
-    return {
+    row = {
         "variant": variant.name,
         "description": variant.description,
         "n_ok": n_ok,
         "n_unstable": n_unstable,
         "per_instance": per_instance,
     }
+    if keep_pi:
+        row["pi_list"] = pi_list
+    return row
 
 
 # ---------------------------------------------------------------------------
@@ -443,6 +459,7 @@ def run_ablation(
     base_weights: Optional[dict] = None,
     variants: Optional[list] = None,
     n_instances: int = 5,
+    perturb: bool = True,
     perturb_kwargs: Optional[dict] = None,
     align_kwargs: Optional[dict] = None,
     label_key: str = "cell_type_annot",
@@ -452,6 +469,7 @@ def run_ablation(
     device_ids=None,
     seed: int = 0,
     outdir: Optional[str] = "results/ablation",
+    save_transport_plans: bool = False,
     aligner_override: Optional[Callable] = None,
 ) -> dict:
     """
@@ -480,6 +498,14 @@ def run_ablation(
     n_instances:
         Synthetic pairs generated once and reused identically across every variant
         (paired design), when using ``section``+``reference`` mode.
+    perturb:
+        If ``False``, skip :func:`simulate_adjacent_slice` and use each ``crops``
+        pair as-is for ``sim`` (see :func:`src.tuning.make_self_alignment_instances`).
+        Use this when ``crops`` already holds pre-perturbed ``(sim, reference)``
+        pairs (e.g. cached from an earlier ``perturb=True`` run) to skip paying the
+        perturbation cost -- which scales with cell count and can dominate runtime
+        on large slices -- again on every ablation run. Requires ``crops``; ignored
+        when ``real_pairs`` is given (that mode never perturbs).
     align_kwargs:
         Extra kwargs forwarded to every hierarchical variant's aligner (e.g.
         ``use_gpu``). Must not set any per-variant ablation kwarg
@@ -490,15 +516,33 @@ def run_ablation(
         Parallelize across variants (not instances), mirroring
         :func:`benchmark.reg_m_sensitivity.run_reg_m_sensitivity`.
     outdir:
-        If given, writes ``ablation.json`` and ``ablation.png``.
+        If given, writes the full results (``ablation.json``), the figure
+        (``ablation.png``), and two flat tables for direct use in analysis
+        notebooks / paper tables: ``ablation_per_instance.csv`` (every scalar
+        metric, one row per variant x instance) and ``ablation_summary.csv``
+        (the paired-comparison table against Full INCENT: mean/s.e.m./Wilcoxon/
+        BH-q/percent-degradation per variant x metric -- the "Core Ablation
+        Table" for the manuscript).
+    save_transport_plans:
+        If ``True``, also keep every variant's raw per-instance transport plans
+        in the returned ``results["rows"][i]["pi_list"]`` (float64, in-memory),
+        and -- when ``outdir`` is given -- persist them as compressed float32
+        ``.npz`` files under ``<outdir>/transport_plans/`` (one file per
+        variant, keyed by instance index; failed/unstable instances omitted).
+        This lets you compute new metrics later without re-running the (often
+        GPU-bound) OT solvers, at the cost of disk/memory: a single plan is
+        O(n_A * n_B) -- e.g. ~64 MB uncompressed per 4,000 x 4,000-cell pair --
+        multiplied by every (variant, instance). Default ``False`` since most
+        ablation runs only need the scalar metrics already saved above.
     aligner_override:
         Testing hook: replaces every variant's aligner (regardless of
         ``aligner_kind``) with this callable. Not used in normal operation.
 
     Returns
     -------
-    dict with keys ``rows`` (per-variant per-instance metrics), ``paired_stats``
-    (per-metric per-variant paired comparison against Full INCENT), ``config``.
+    dict with keys ``rows`` (per-variant per-instance metrics, plus ``pi_list``
+    when ``save_transport_plans=True``), ``paired_stats`` (per-metric
+    per-variant paired comparison against Full INCENT), ``config``.
     """
     if real_pairs is None and crops is None and (section is None or reference is None):
         raise ValueError("Provide `real_pairs`, `crops`, or both `section` and `reference`.")
@@ -532,9 +576,11 @@ def run_ablation(
         perturb_kwargs = dict(perturb_kwargs or {})
         instances = make_self_alignment_instances(
             section=section, reference=reference, crops=crops,
-            n_instances=n_instances, perturb_kwargs=perturb_kwargs, seed=seed,
+            n_instances=n_instances, perturb=perturb,
+            perturb_kwargs=perturb_kwargs, seed=seed,
         )
-        print(f"[ablation] {len(instances)} instance(s) generated, "
+        skip_note = " (perturb=False: used as-is)" if not perturb else ""
+        print(f"[ablation] {len(instances)} instance(s) generated{skip_note}, "
               f"running {len(variants)} variant(s): {[v.name for v in variants]}")
 
     if align_kwargs["use_gpu"] and device_ids is None:
@@ -543,7 +589,7 @@ def run_ablation(
     def _job(variant):
         row = _eval_variant(
             variant, instances, base_weights, align_kwargs, label_key, min_total_mass,
-            aligner_override=aligner_override,
+            aligner_override=aligner_override, keep_pi=save_transport_plans,
         )
         print(f"  {row['variant']:<32s} n_ok={row['n_ok']}/{len(instances)}  "
               f"({row['description']})")
@@ -571,7 +617,8 @@ def run_ablation(
             "n_instances": len(instances),
             "mode": "real_pairs" if real_pairs is not None
                     else "crops" if crops is not None else "section+reference",
-            "perturb_kwargs": perturb_kwargs if real_pairs is None else None,
+            "perturb": perturb if real_pairs is None else None,
+            "perturb_kwargs": (perturb_kwargs if real_pairs is None and perturb else None),
             "min_total_mass": min_total_mass,
             "seed": seed,
             "n_jobs": n_jobs,
@@ -581,10 +628,27 @@ def run_ablation(
 
     if outdir:
         os.makedirs(outdir, exist_ok=True)
+
+        # Full nested results (pi_list, if any, is float64/large and JSON-unsafe --
+        # stripped here; it stays on the in-memory `results` returned below, and is
+        # separately persisted as compressed .npz when save_transport_plans=True).
+        json_rows = [{k: v for k, v in row.items() if k != "pi_list"} for row in rows]
         json_path = os.path.join(outdir, "ablation.json")
         with open(json_path, "w") as f:
-            json.dump(_json_safe(results), f, indent=2)
+            json.dump(_json_safe({**results, "rows": json_rows}), f, indent=2)
         print(f"[ablation] results written to {json_path}")
+
+        per_instance_csv = os.path.join(outdir, "ablation_per_instance.csv")
+        _write_per_instance_csv(rows, per_instance_csv)
+        print(f"[ablation] per-instance table written to {per_instance_csv}")
+
+        summary_csv = os.path.join(outdir, "ablation_summary.csv")
+        _write_summary_csv(paired_stats, summary_csv)
+        print(f"[ablation] summary table written to {summary_csv}")
+
+        if save_transport_plans:
+            _save_transport_plans(rows, outdir)
+
         try:
             _make_figure(results, outdir)
         except Exception as e:
@@ -604,6 +668,83 @@ def _json_safe(obj):
     if isinstance(obj, np.ndarray):
         return obj.tolist()
     return obj
+
+
+# ---------------------------------------------------------------------------
+# Flat, tidy tables for downstream analysis (pandas/R) and paper tables --
+# complements the full nested ablation.json.
+# ---------------------------------------------------------------------------
+
+_PER_INSTANCE_METRIC_FIELDS = (
+    "lta", "foscttm", "foscttm_A_to_B", "foscttm_B_to_A", "neg_foscttm", "expr_corr",
+)
+
+
+def _write_per_instance_csv(rows: list, path: str) -> None:
+    """One row per (variant, instance): every scalar evaluate_alignment() metric."""
+    with open(path, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow([
+            "variant", "description", "n_ok", "n_unstable", "instance_idx", "failed",
+            *_PER_INSTANCE_METRIC_FIELDS,
+            "lta_n_evaluated", "lta_n_correct", "lta_n_skipped_low_mass",
+        ])
+        for row in rows:
+            for i, m in enumerate(row["per_instance"]):
+                if m is None:
+                    writer.writerow([
+                        row["variant"], row["description"], row["n_ok"], row["n_unstable"],
+                        i, True, *([""] * len(_PER_INSTANCE_METRIC_FIELDS)), "", "", "",
+                    ])
+                    continue
+                d = m.get("lta_detail") or {}
+                writer.writerow([
+                    row["variant"], row["description"], row["n_ok"], row["n_unstable"],
+                    i, False,
+                    *(m.get(k) for k in _PER_INSTANCE_METRIC_FIELDS),
+                    d.get("n_evaluated"), d.get("n_correct"), d.get("n_skipped_low_mass"),
+                ])
+
+
+def _write_summary_csv(paired_stats: dict, path: str) -> None:
+    """One row per (metric, variant): the paired-comparison table against Full
+    INCENT -- ready to paste into a paper table."""
+    with open(path, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow([
+            "metric", "variant", "n", "mean_full", "mean_variant", "mean_delta",
+            "sem_delta", "pct_degradation", "wilcoxon_stat", "wilcoxon_p", "wilcoxon_q",
+        ])
+        for metric, by_variant in paired_stats.items():
+            for variant, s in by_variant.items():
+                writer.writerow([
+                    metric, variant, s.get("n"), s.get("mean_full"), s.get("mean_variant"),
+                    s.get("mean_delta"), s.get("sem_delta"), s.get("pct_degradation"),
+                    s.get("wilcoxon_stat"), s.get("wilcoxon_p"), s.get("wilcoxon_q"),
+                ])
+
+
+def _save_transport_plans(rows: list, outdir: str, dtype=np.float32) -> str:
+    """Persist every variant's raw per-instance transport plans as compressed
+    .npz files (one per variant; keys "instance_<i>"; failed/unstable instances
+    omitted), so later analyses can compute new metrics without re-running the
+    (expensive) OT solvers. Cast to float32 to bound size -- a single plan is
+    O(n_A * n_B); e.g. 4,000 x 4,000 cells is ~64 MB uncompressed."""
+    pi_dir = os.path.join(outdir, "transport_plans")
+    os.makedirs(pi_dir, exist_ok=True)
+    for row in rows:
+        pi_list = row.get("pi_list")
+        if not pi_list:
+            continue
+        arrays = {
+            f"instance_{i}": np.asarray(pi, dtype=dtype)
+            for i, pi in enumerate(pi_list) if pi is not None
+        }
+        if arrays:
+            safe_name = row["variant"].replace("/", "_").replace(" ", "_")
+            np.savez_compressed(os.path.join(pi_dir, f"{safe_name}.npz"), **arrays)
+    print(f"[ablation] transport plans written to {pi_dir}")
+    return pi_dir
 
 
 # ---------------------------------------------------------------------------
@@ -696,6 +837,10 @@ if __name__ == "__main__":
     ap.add_argument("--real_pairs_h5ad", nargs="+", metavar="SLICE_A SLICE_B",
                     help="Genuine real slice pairs to align as-is (no synthetic "
                          "perturbation, no ground truth -- FOSCTTM will be N/A).")
+    ap.add_argument("--no_perturb", action="store_true",
+                    help="Skip simulate_adjacent_slice and use --crops_h5ad pairs as-is "
+                         "(e.g. already perturbed/cached beforehand). Requires --crops_h5ad; "
+                         "ignored with --real_pairs_h5ad (which never perturbs).")
     ap.add_argument("--outdir", default="results/ablation")
     ap.add_argument("--main_only", action="store_true",
                     help="Run only the 7 main-paper variants (skip the 4 supplementary ones).")
@@ -711,6 +856,11 @@ if __name__ == "__main__":
     ap.add_argument("--device_ids", type=int, nargs="+", default=None)
     ap.add_argument("--use_gpu", choices=["auto", "true", "false"], default="auto")
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--save_transport_plans", action="store_true",
+                    help="Also persist every variant's raw per-instance transport plans "
+                         "as compressed float32 .npz files under <outdir>/transport_plans/, "
+                         "so new metrics can be computed later without re-running alignment. "
+                         "Off by default -- can be large (O(n_A * n_B) per plan).")
     args = ap.parse_args()
 
     if args.use_gpu == "auto":
@@ -747,16 +897,21 @@ if __name__ == "__main__":
         section = sc.read_h5ad(args.section_h5ad)
         reference = sc.read_h5ad(args.reference_h5ad)
 
+    if args.no_perturb and crops is None:
+        ap.error("--no_perturb requires --crops_h5ad.")
+
     res = run_ablation(
         section, reference,
         crops=crops, real_pairs=real_pairs,
         variants=selected,
         n_instances=args.n_instances,
+        perturb=not args.no_perturb,
         align_kwargs={"use_gpu": use_gpu},
         min_total_mass=args.min_total_mass,
         n_jobs=args.n_jobs,
         device_ids=args.device_ids,
         seed=args.seed,
         outdir=args.outdir,
+        save_transport_plans=args.save_transport_plans,
     )
     print(f"\nResults written to {args.outdir}")
