@@ -252,9 +252,25 @@ def compute_cluster_structural_matrix(centroids):
     return C_graph
 
 
-def run_coarse_fugw(M_cluster, C_A, C_B, p_A, p_B, alpha=0.5, reg_m=1.0, max_iter=10000, max_iter_ot=5000, use_gpu=False):
+def run_coarse_fugw(
+    M_cluster, C_A, C_B, p_A, p_B, alpha=0.5, reg_m=1.0, balanced=False,
+    max_iter=10000, max_iter_ot=5000, use_gpu=False,
+):
     """
     Solves cluster-level FUGW.
+
+    ``balanced=False`` (default) uses the unbalanced solver
+    (:func:`ot.gromov.fused_unbalanced_gromov_wasserstein`), which may drop
+    mass from non-overlapping mesoregions depending on ``reg_m``. Passing
+    ``balanced=True`` instead calls POT's exact balanced FGW solver
+    (:func:`ot.gromov.fused_gromov_wasserstein`), which enforces the full
+    marginals ``p_A``/``p_B`` (both already sum to 1 -- see
+    ``build_slice_cluster_cache``) with no mass-dropping option; ``reg_m`` is
+    ignored in this mode. This is the "balanced instead of unbalanced"
+    ablation: it tests the value of the fused *unbalanced* GW formulation
+    for handling partial mesoregion overlap, as a discrete alternative to
+    the ``reg_m -> large`` limit already explored in
+    ``benchmark/reg_m_sensitivity.py``.
     """
     scale = max(C_A.max(), C_B.max()) + 1e-8
 
@@ -271,10 +287,16 @@ def run_coarse_fugw(M_cluster, C_A, C_B, p_A, p_B, alpha=0.5, reg_m=1.0, max_ite
     wx = to_backend(p_A,      nx, data_type=np.float64)
     wy = to_backend(p_B,      nx, data_type=np.float64)
 
-    # reg_marginals controls how much marginal relaxation is allowed (lower = more mass can be dropped)
-    pi_samp, pi_feat = fused_unbalanced_gromov_wasserstein(
-        Cx=Cx, Cy=Cy, wx=wx, wy=wy, M=M, alpha=alpha, reg_marginals=reg_m, max_iter=max_iter, max_iter_ot=max_iter_ot
-    )
+    if balanced:
+        from ot.gromov import fused_gromov_wasserstein
+        pi_samp = fused_gromov_wasserstein(
+            M, Cx, Cy, wx, wy, alpha=alpha, max_iter=max_iter,
+        )
+    else:
+        # reg_marginals controls how much marginal relaxation is allowed (lower = more mass can be dropped)
+        pi_samp, pi_feat = fused_unbalanced_gromov_wasserstein(
+            Cx=Cx, Cy=Cy, wx=wx, wy=wy, M=M, alpha=alpha, reg_marginals=reg_m, max_iter=max_iter, max_iter_ot=max_iter_ot
+        )
 
     return nx.to_numpy(pi_samp)
 
@@ -632,6 +654,7 @@ def score_frontier_matches(
     centroids_B,
     mi_contrib,
     transform_scale,
+    use_geometric_admissibility: bool = True,
 ):
     """
     Score the current frontier of admissible cluster-pairs.
@@ -658,6 +681,12 @@ def score_frontier_matches(
     (log-odds = 0); it is therefore fixed entirely by the data -- the ratio of
     the registration-noise scale to the tissue scale -- and introduces no
     tolerance threshold, multiplier, or significance level to tune.
+
+    ``use_geometric_admissibility=False`` disables only this absolute cutoff
+    (the "spatial consistency guard"), for the corresponding ablation: the
+    rank-based rigid-consistency evidence in (3) is still computed and still
+    contributes to ``frontier_scores``, but no candidate is rejected outright
+    for exceeding ``residual_gate``.
     """
     if not frontier_A or not frontier_B or not selected_pairs:
         return [], []
@@ -673,15 +702,18 @@ def score_frontier_matches(
             centroids_B[[v for _, v in selected_pairs]],
             weights=seed_weights
         )
-        residual_gate = geometric_admissibility_radius(
-            selected_pairs=selected_pairs,
-            frontier_B=frontier_B,
-            R_seed=R_seed,
-            t_seed=t_seed,
-            centroids_A=centroids_A,
-            centroids_B=centroids_B,
-            transform_scale=transform_scale,
-        )
+        if use_geometric_admissibility:
+            residual_gate = geometric_admissibility_radius(
+                selected_pairs=selected_pairs,
+                frontier_B=frontier_B,
+                R_seed=R_seed,
+                t_seed=t_seed,
+                centroids_A=centroids_A,
+                centroids_B=centroids_B,
+                transform_scale=transform_scale,
+            )
+        else:
+            residual_gate = np.inf
     else:
         R_seed = None
         t_seed = None
@@ -852,6 +884,7 @@ def expand_macro_match_frontier(
     edge_scale_B,
     centroids_A,
     centroids_B,
+    use_geometric_admissibility: bool = True,
 ):
     """
     Expand the initial seed by one-to-one frontier matching on the pair graph.
@@ -860,6 +893,10 @@ def expand_macro_match_frontier(
     only when it is contiguous in both tissues and beats the private unmatched
     alternative in the assignment problem. This yields a natural stopping rule
     with no target-size hyperparameter.
+
+    ``use_geometric_admissibility`` (see :func:`score_frontier_matches`) gates
+    only the absolute rigid-consistency cutoff; set to ``False`` for the
+    "w/o geometric admissibility" ablation.
     """
     selected_pairs = list(seed_pairs)
     selected_A = {u for u, _ in seed_pairs}
@@ -903,6 +940,7 @@ def expand_macro_match_frontier(
             centroids_B=centroids_B,
             mi_contrib=mi_contrib,
             transform_scale=transform_scale,
+            use_geometric_admissibility=use_geometric_admissibility,
         )
         if not frontier_pairs:
             diagnostics["stop_reason"] = "no_contiguous_frontier_pairs"
@@ -1354,6 +1392,7 @@ def extract_continuous_macro_section(
     cluster_cache_A=None,
     cluster_cache_B=None,
     verbose: bool = False,
+    use_geometric_admissibility: bool = True,
 ):
     """
     Identify a compact, biologically consistent overlap region from the coarse alignment.
@@ -1541,6 +1580,7 @@ def extract_continuous_macro_section(
             edge_scale_B=edge_scale_B,
             centroids_A=centroids_A,
             centroids_B=centroids_B,
+            use_geometric_admissibility=use_geometric_admissibility,
         )
         hypothesis_score = score_macro_hypothesis(
             selected_pairs=selected_pairs,

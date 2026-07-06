@@ -117,6 +117,8 @@ def select_coarsen_length(
     label_key="cell_type_annot",
     multipliers=(0.75, 1.0, 1.25),
     use_gpu=False,
+    mesoregion_method="farthest_point",
+    mesoregion_seed=0,
 ):
     """
     Pick the supercell seed spacing that maximizes cross-slice cluster matchability.
@@ -139,8 +141,14 @@ def select_coarsen_length(
     _, nx = select_backend(use_gpu, gpu_verbose=False)
     scored = []  # (S, mi, resid)
     for S in candidates:
-        labelsA = cluster_cells_spatial(sliceA, spatial_key=spatial_key, coarsen_length=S)
-        labelsB = cluster_cells_spatial(sliceB, spatial_key=spatial_key, coarsen_length=S)
+        labelsA = cluster_cells_spatial(
+            sliceA, spatial_key=spatial_key, coarsen_length=S,
+            method=mesoregion_method, seed=mesoregion_seed,
+        )
+        labelsB = cluster_cells_spatial(
+            sliceB, spatial_key=spatial_key, coarsen_length=S,
+            method=mesoregion_method, seed=mesoregion_seed,
+        )
         if len(np.unique(labelsA)) < 2 or len(np.unique(labelsB)) < 2:
             continue
 
@@ -190,6 +198,100 @@ def select_coarsen_length(
     return float(S_arr[winners[np.argmax(S_arr[winners])]])
 
 
+def _per_cluster_spatial_sigma(coords, centroids, labels, n_clusters):
+    """
+    Per-cluster mean cell-to-centroid distance: the spatial bandwidth used by
+    the Gaussian soft-membership prior that lifts the coarse cluster coupling
+    onto cell-level ``G_init``. Vectorized over all cells of one slice.
+    """
+    labels_int = np.asarray(labels).astype(int)
+    cell_dists = np.linalg.norm(coords - centroids[labels_int], axis=1)
+    clust_sum = np.bincount(labels_int, weights=cell_dists, minlength=n_clusters)
+    clust_cnt = np.bincount(labels_int, minlength=n_clusters).astype(np.float64)
+    return np.maximum(clust_sum / np.maximum(clust_cnt, 1.0), 1e-8)
+
+
+def _gaussian_cluster_membership(coords_target, centroids, sigma_clust, nx, data_type=np.float32):
+    """
+    Row-normalized Gaussian soft membership of each target-slice cell against
+    the (same-slice) mesoregion centroids, on the active backend.
+    """
+    coords_t = to_backend(coords_target, nx, data_type=data_type)
+    centroids_t = to_backend(centroids, nx, data_type=data_type)
+    sigma_t = to_backend(sigma_clust, nx, data_type=data_type)
+
+    diff = coords_t[:, None, :] - centroids_t[None, :, :]
+    d2 = nx.sum(diff ** 2, axis=2)
+    log_S = -0.5 * d2 / (sigma_t[None, :] ** 2)
+    log_S = log_S - nx.max(log_S, axis=1)[:, None]
+    S = nx.exp(log_S)
+    S = S / (nx.sum(S, axis=1)[:, None] + 1e-12)
+    return S
+
+
+def _cluster_lifted_g_init(
+    coords_A_target, coords_B_target, centroidsA, centroidsB,
+    sigma_A_clust, sigma_B_clust, Pi_cluster, nx, data_type=np.float32,
+):
+    """
+    Lift the coarse cluster coupling ``Pi_cluster`` onto a cell-level warm
+    start via Gaussian soft membership: ``G_init = S_A @ Pi_cluster @ S_B.T``.
+    ``coords_A_target``/``coords_B_target`` may be the full cell sets of each
+    slice or a restricted subset (e.g. the detected shared-region shadow).
+    """
+    S_A = _gaussian_cluster_membership(coords_A_target, centroidsA, sigma_A_clust, nx, data_type=data_type)
+    S_B = _gaussian_cluster_membership(coords_B_target, centroidsB, sigma_B_clust, nx, data_type=data_type)
+    Pi_cluster_t = to_backend(Pi_cluster, nx, data_type=data_type)
+    return nx.to_numpy(S_A @ Pi_cluster_t @ S_B.T)
+
+
+def _align_full_slices_with_cluster_prior(
+    sliceA, sliceB, labelsA, labelsB, Pi_cluster, centroidsA, centroidsB,
+    *, alpha, beta, gamma, numItermax, use_gpu, spatial_key, verbose, **kwargs
+):
+    """
+    "w/o shared-region detection" ablation path.
+
+    Skips mesoregion-pair selection, macro-overlap extraction, rigid
+    pre-registration, and overlap-shadow rasterization entirely (the
+    ``extract_continuous_macro_section`` / Step 5-7 machinery in
+    :func:`hierarchical_pairwise_align`). The coarse cluster coupling
+    ``Pi_cluster`` still informs a Gaussian soft-membership warm start
+    (``G_init``, via :func:`_cluster_lifted_g_init`), but it is built over the
+    *full* cell sets of both slices rather than a detected shared region, and
+    the final cell-level FGW uses uniform marginals (no confidence weighting
+    from proximity to a trusted core, since no core was ever selected).
+    """
+    _, nx_coarse = select_backend(use_gpu, gpu_verbose=False)
+
+    coords_A_orig = np.asarray(sliceA.obsm[spatial_key])
+    coords_B_orig = np.asarray(sliceB.obsm[spatial_key])
+
+    sigma_A_clust = _per_cluster_spatial_sigma(coords_A_orig, centroidsA, labelsA, Pi_cluster.shape[0])
+    sigma_B_clust = _per_cluster_spatial_sigma(coords_B_orig, centroidsB, labelsB, Pi_cluster.shape[1])
+
+    G_init_full = _cluster_lifted_g_init(
+        coords_A_orig, coords_B_orig, centroidsA, centroidsB,
+        sigma_A_clust, sigma_B_clust, Pi_cluster, nx_coarse,
+    )
+
+    if verbose:
+        print(f"--- [HOT] Executing Final Base OT on Full Slices (A: {sliceA.shape[0]}, B: {sliceB.shape[0]}) ---")
+
+    return pairwise_align(
+        sliceA=sliceA,
+        sliceB=sliceB,
+        alpha=alpha,
+        beta=beta,
+        gamma=gamma,
+        G_init=G_init_full,
+        numItermax=numItermax,
+        use_gpu=use_gpu,
+        verbose=verbose,
+        **kwargs
+    )
+
+
 def hierarchical_pairwise_align(
     sliceA: AnnData,
     sliceB: AnnData,
@@ -199,10 +301,15 @@ def hierarchical_pairwise_align(
     alpha_cluster: float = 0.5,
     delta: float = 0.5,
     reg_m: float = DEFAULT_REG_M,
+    balanced: bool = False,
     numItermax: int = 100000,
     use_gpu: bool = True,
     coarsen_scale: Optional[float] = None,
     auto_coarsen_scale: bool = False,
+    mesoregion_method: str = "farthest_point",
+    mesoregion_seed: int = 0,
+    use_geometric_admissibility: bool = True,
+    skip_shared_region_detection: bool = False,
     spatial_key: str = "spatial",
     use_rep: str = "X_pca",
     label_key: str = "cell_type_annot",
@@ -238,6 +345,28 @@ def hierarchical_pairwise_align(
         auto_coarsen_scale: When ``True`` (and ``coarsen_scale`` is ``None``),
             select the scale by sweeping candidates and maximizing cross-slice
             cluster matchability instead of using the intrinsic default. Slower.
+        balanced: Use POT's exact balanced FGW solver for the coarse mesoregion
+            alignment instead of the unbalanced solver (``reg_m`` is ignored
+            when ``True``). See :func:`hierarchical.run_coarse_fugw`. Ablation:
+            "balanced instead of unbalanced".
+        mesoregion_method: Mesoregion seeding strategy passed to
+            :func:`clustering.cluster_cells_spatial`: ``"farthest_point"``
+            (default), ``"grid"``, or ``"random"``. Ablation:
+            "random or grid mesoregions".
+        mesoregion_seed: Random seed forwarded to ``cluster_cells_spatial``
+            (only used by ``mesoregion_method="random"``).
+        use_geometric_admissibility: When ``False``, disables the absolute
+            rigid-consistency cutoff in the macro-overlap frontier expansion
+            (see :func:`hierarchical.score_frontier_matches`), while keeping
+            the rank-based rigid-consistency evidence. Ablation:
+            "w/o geometric admissibility".
+        skip_shared_region_detection: When ``True``, skips mesoregion-pair
+            selection / macro-overlap extraction / overlap-shadow rasterization
+            (Steps 5-7 below) entirely. The coarse cluster coupling still
+            informs a Gaussian soft-membership prior (``G_init``), but the
+            final cell-level FGW is solved over the *full* cell sets of both
+            slices with uniform marginals, instead of the detected shared
+            region. Ablation: "w/o shared-region detection".
 
     Returns the cell-level alignment pi.
     """
@@ -252,6 +381,7 @@ def hierarchical_pairwise_align(
             sliceA, sliceB,
             spatial_key=spatial_key, use_rep=use_rep, label_key=label_key,
             alpha=alpha_cluster, delta=delta, use_gpu=use_gpu,
+            mesoregion_method=mesoregion_method, mesoregion_seed=mesoregion_seed,
         )
         if verbose:
             print(f"Coarsening scale (auto, matchability sweep): S={S:.4g}")
@@ -260,8 +390,14 @@ def hierarchical_pairwise_align(
         if verbose:
             print(f"Coarsening scale (intrinsic): S={S:.4g} (characteristic spacing s={s:.4g})")
 
-    labelsA = cluster_cells_spatial(sliceA, spatial_key=spatial_key, coarsen_length=S)
-    labelsB = cluster_cells_spatial(sliceB, spatial_key=spatial_key, coarsen_length=S)
+    labelsA = cluster_cells_spatial(
+        sliceA, spatial_key=spatial_key, coarsen_length=S,
+        method=mesoregion_method, seed=mesoregion_seed,
+    )
+    labelsB = cluster_cells_spatial(
+        sliceB, spatial_key=spatial_key, coarsen_length=S,
+        method=mesoregion_method, seed=mesoregion_seed,
+    )
 
     # Pre-cache global cell types for cluster structure alignment
     all_types = np.array(sorted(set(sliceA.obs[label_key].astype(str)) | set(sliceB.obs[label_key].astype(str))), dtype=str)
@@ -313,10 +449,23 @@ def hierarchical_pairwise_align(
     
     if verbose:
         print("--- [HOT] Step 4: Run Coarse FUGW ---")
-    Pi_cluster = run_coarse_fugw(M_cluster, C_A, C_B, p_A, p_B, alpha=alpha_cluster, reg_m=reg_m, use_gpu=use_gpu)
-    
+    Pi_cluster = run_coarse_fugw(
+        M_cluster, C_A, C_B, p_A, p_B, alpha=alpha_cluster, reg_m=reg_m,
+        balanced=balanced, use_gpu=use_gpu,
+    )
+
     if visualize_clusters:
         visualize_cluster_mapping(centroidsA, centroidsB, Pi_cluster)
+
+    if skip_shared_region_detection:
+        if verbose:
+            print("--- [HOT] Skipping shared-region detection (ablation): "
+                  "solving cell-level FGW over the full cell sets ---")
+        return _align_full_slices_with_cluster_prior(
+            sliceA, sliceB, labelsA, labelsB, Pi_cluster, centroidsA, centroidsB,
+            alpha=alpha, beta=beta, gamma=gamma, numItermax=numItermax,
+            use_gpu=use_gpu, spatial_key=spatial_key, verbose=verbose, **kwargs
+        )
 
     # We now prepare the injection into standard cell-level pairwise_align
     if verbose:
@@ -332,6 +481,7 @@ def hierarchical_pairwise_align(
         cluster_cache_A=cache_A,
         cluster_cache_B=cache_B,
         verbose=verbose,
+        use_geometric_admissibility=use_geometric_admissibility,
     )
     if not macro_section.ok:
         raise ValueError(
@@ -477,44 +627,17 @@ def hierarchical_pairwise_align(
         coords_A_orig = np.asarray(sliceA.obsm[spatial_key])
         coords_B_orig = np.asarray(sliceB.obsm[spatial_key])
 
-        # Vectorized per-cluster spatial bandwidth (replaces per-cluster Python loop)
-        cell_dists_A = np.linalg.norm(coords_A_orig - centroidsA[labelsA], axis=1)
-        clust_sum_A = np.bincount(labelsA.astype(int), weights=cell_dists_A, minlength=Pi_cluster.shape[0])
-        clust_cnt_A = np.bincount(labelsA.astype(int), minlength=Pi_cluster.shape[0]).astype(np.float64)
-        sigma_A_clust = np.maximum(clust_sum_A / np.maximum(clust_cnt_A, 1.0), 1e-8)
-
-        cell_dists_B = np.linalg.norm(coords_B_orig - centroidsB[labelsB], axis=1)
-        clust_sum_B = np.bincount(labelsB.astype(int), weights=cell_dists_B, minlength=Pi_cluster.shape[1])
-        clust_cnt_B = np.bincount(labelsB.astype(int), minlength=Pi_cluster.shape[1]).astype(np.float64)
-        sigma_B_clust = np.maximum(clust_sum_B / np.maximum(clust_cnt_B, 1.0), 1e-8)
+        sigma_A_clust = _per_cluster_spatial_sigma(coords_A_orig, centroidsA, labelsA, Pi_cluster.shape[0])
+        sigma_B_clust = _per_cluster_spatial_sigma(coords_B_orig, centroidsB, labelsB, Pi_cluster.shape[1])
 
         coords_As = coords_A_orig[idx_A_shadow]   # (nA_shadow, 2)
         coords_Bs = coords_B_orig[idx_B_shadow]   # (nB_shadow, 2)
 
         # GPU-accelerated Gaussian soft memberships and G_init_shadow
-        coords_As_t = to_backend(coords_As, nx_coarse, data_type=np.float32)
-        coords_Bs_t = to_backend(coords_Bs, nx_coarse, data_type=np.float32)
-        centroids_A_t = to_backend(centroidsA, nx_coarse, data_type=np.float32)
-        centroids_B_t = to_backend(centroidsB, nx_coarse, data_type=np.float32)
-        sigma_A_t = to_backend(sigma_A_clust, nx_coarse, data_type=np.float32)
-        sigma_B_t = to_backend(sigma_B_clust, nx_coarse, data_type=np.float32)
-        Pi_cluster_t = to_backend(Pi_cluster, nx_coarse, data_type=np.float32)
-
-        diff_A = coords_As_t[:, None, :] - centroids_A_t[None, :, :]
-        dA2 = nx_coarse.sum(diff_A ** 2, axis=2)
-        log_SA = -0.5 * dA2 / (sigma_A_t[None, :] ** 2)
-        log_SA = log_SA - nx_coarse.max(log_SA, axis=1)[:, None]
-        S_A = nx_coarse.exp(log_SA)
-        S_A = S_A / (nx_coarse.sum(S_A, axis=1)[:, None] + 1e-12)
-
-        diff_B = coords_Bs_t[:, None, :] - centroids_B_t[None, :, :]
-        dB2 = nx_coarse.sum(diff_B ** 2, axis=2)
-        log_SB = -0.5 * dB2 / (sigma_B_t[None, :] ** 2)
-        log_SB = log_SB - nx_coarse.max(log_SB, axis=1)[:, None]
-        S_B = nx_coarse.exp(log_SB)
-        S_B = S_B / (nx_coarse.sum(S_B, axis=1)[:, None] + 1e-12)
-
-        G_init_shadow = nx_coarse.to_numpy(S_A @ Pi_cluster_t @ S_B.T)
+        G_init_shadow = _cluster_lifted_g_init(
+            coords_As, coords_Bs, centroidsA, centroidsB,
+            sigma_A_clust, sigma_B_clust, Pi_cluster, nx_coarse,
+        )
 
         # ── Confidence-weighted marginals ─────────────────────────────────────────
         # Encode proximity to the trusted biological core as the FGW marginals rather

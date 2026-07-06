@@ -31,6 +31,12 @@ from .benchmark import (
     DEFAULT_KAPPA_GRID,
     run_reg_m_sensitivity,
     DEFAULT_REG_M_GRID,
+    run_ablation,
+    AblationVariant,
+    MAIN_VARIANTS,
+    SUPPLEMENTARY_VARIANTS,
+    ALL_VARIANTS,
+    VARIANTS_BY_NAME,
 )
 
 __all__ = [
@@ -71,5 +77,11 @@ __all__ = [
     'run_kappa_sensitivity',
     'DEFAULT_KAPPA_GRID',
     'run_reg_m_sensitivity',
-    'DEFAULT_REG_M_GRID'
+    'DEFAULT_REG_M_GRID',
+    'run_ablation',
+    'AblationVariant',
+    'MAIN_VARIANTS',
+    'SUPPLEMENTARY_VARIANTS',
+    'ALL_VARIANTS',
+    'VARIANTS_BY_NAME',
 ]
